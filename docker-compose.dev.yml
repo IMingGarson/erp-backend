@@ -18,27 +18,25 @@ services:
     image: adminer
     container_name: dev_pg_adminer
     restart: always
-    ports:
-      - "8080:8080"
     depends_on:
       - postgres
 
-  # nginx:
-  #   image: nginx:alpine
-  #   container_name: dev_nginx
-  #   restart: always
-  #   ports:
-  #     - "80:80"
-  #   environment:
-  #     - BACKEND_HOST=${BACKEND_HOST}
-  #     - BACKEND_PORT=${BACKEND_PORT}
-  #   extra_hosts:
-  #     - "host.docker.internal:host-gateway"
-  #   volumes:
-  #     - ${FRONTEND_PATH}:/usr/share/nginx/html:ro
-  #     - ./nginx/default.dev.conf.template:/etc/nginx/templates/default.conf.template:ro
-  #   depends_on:
-  #     - adminer
+  nginx:
+    image: nginx:alpine
+    container_name: dev_nginx
+    restart: always
+    ports:
+      - "80:80"
+    environment:
+      - BACKEND_HOST=${BACKEND_HOST}
+      - BACKEND_PORT=${BACKEND_PORT}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ${FRONTEND_PATH}:/usr/share/nginx/html:ro
+      - ./nginx/default.dev.conf.template:/etc/nginx/templates/default.conf.template:ro
+    depends_on:
+      - adminer
 
 volumes:
   postgres_data:
