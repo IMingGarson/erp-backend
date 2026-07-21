@@ -1,0 +1,65 @@
+# =========================
+# 環境變數與機密資訊 (重要)
+# =========================
+.env
+.env.*
+*.pem
+secrets.json
+
+# =========================
+# Python 編譯檔與快取
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# =========================
+# 虛擬環境 (Virtual Environments)
+# =========================
+venv/
+env/
+.venv/
+Pipfile.lock
+
+# =========================
+# Django 專案相關
+# =========================
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+# 使用者上傳的媒體檔案目錄
+media/
+# 收集後的靜態檔案目錄 (視專案設定而定，若 static/ 包含原始碼則不要解開這行)
+# staticfiles/ 
+# static/
+
+# =========================
+# VS Code 編輯器
+# =========================
+.vscode/*
+# 保留我們剛剛設定好的 workspace settings，讓團隊或其他裝置也能套用
+.vscode/settings.json
+.vscode/extensions.json
+.history/
+*.code-workspace
+
+# =========================
+# Ruff 與程式碼檢查工具快取
+# =========================
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.python-version
+
+# =========================
+# 作業系統產生檔案 (Mac / Windows)
+# =========================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
