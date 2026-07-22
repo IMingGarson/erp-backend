@@ -18,6 +18,8 @@ services:
     image: adminer
     container_name: pg_adminer
     restart: always
+    ports:
+      - "8080:8080"
     depends_on:
       - postgres
 
