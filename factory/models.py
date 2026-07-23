@@ -1,8 +1,3 @@
-# TODO: 請購單：需要價格（系統會有，但不需要show）、建置進貨單
-# 銷貨單: 下100，出20 * 5; 銷貨單上的價格不一定會show
-# TODO: 衛生署跟客戶面向的追蹤追溯 (產品回收通知單、銷貨單)
-# TODO: 新增物料：需要各種備註，如：過敏原標籤、營養成分、添加物許可證、許可證效期、產品登錄號、產地、保存期限
-# TODO: 成品檢測內容，如：水分、糖分、微生物檢驗
 from datetime import timedelta
 
 from django.contrib.auth.models import User
