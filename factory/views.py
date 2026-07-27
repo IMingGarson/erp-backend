@@ -1,4 +1,3 @@
-import json
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
@@ -13,10 +12,8 @@ from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotAuthenticated, ValidationError
 from rest_framework.filters import SearchFilter
-from rest_framework.parsers import MultiPartParser
-from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
-from rest_framework.views import APIView
 
 from .models import (
     BOM,
@@ -39,7 +36,7 @@ from .models import (
     Vendor,
     VendorLog,
 )
-from .permissions import IsAdminOrEmployerOrReadOnly
+from .permissions import IsAdminOrEmployerOrReadOnly, IsRDOrReadOnly
 from .serializers import (
     BatchInventorySerializer,
     BOMSerializer,
@@ -51,7 +48,6 @@ from .serializers import (
     PurchaseRequisitionSerializer,
     VendorSerializer,
 )
-from .services import ExcelImportService
 
 
 class CRUDAuditMixin:
@@ -82,6 +78,22 @@ class CRUDAuditMixin:
 
         raise NotAuthenticated("無法識別使用者身分，拒絕操作。")
 
+    def _get_field_display_value(self, instance, field, value):
+        if value is None or value == "":
+            return "空值"
+
+        if isinstance(value, bool):
+            return "是" if value else "否"
+
+        if isinstance(field, models.ForeignKey) or hasattr(value, "pk"):
+            return str(value)
+
+        if getattr(field, "choices", None):
+            choice_dict = dict(field.choices)
+            return str(choice_dict.get(value, value))
+
+        return str(value)
+
     def _record_db_log(self, instance, user, action_detail):
         model_class = type(instance)
 
@@ -97,54 +109,150 @@ class CRUDAuditMixin:
 
     def perform_create(self, serializer):
         user = self.get_valid_user()
+        full_username = f"{user.last_name}{user.first_name}"
 
         save_kwargs = {}
         if hasattr(serializer.Meta.model, "created_by"):
             save_kwargs["created_by"] = user
 
         instance = serializer.save(**save_kwargs)
+        model_name = instance.__class__.__name__
+        action_detail = ""
 
-        self._record_db_log(instance, user, f"{user.username} 建立了此筆資料")
+        if model_name == "MaterialRequirementPlan":
+            action_detail = f"{full_username} 建立了物料需求單 #{instance.mrp_id}"
+
+        elif model_name == "Vendor":
+            action_detail = f"{full_username} 建立了客戶資料 {instance.name}"
+
+        elif model_name == "ProductionOrder":
+            action_detail = f"{full_username} 建立了生產單 #{instance.order_number}"
+
+        elif model_name == "DeliveryNote":
+            action_detail = f"{full_username} 建立了銷貨單 #{instance.note_number}"
+
+        elif model_name == "CustomerOrder":
+            action_detail = f"{full_username} 建立了客戶訂單 #{instance.order_number}"
+
+        elif model_name == "PurchaseRequisition":
+            action_detail = f"{full_username} 建立了請購單 #{instance.id}"
+
+        elif model_name == "Material":
+            action_detail = (
+                f"{full_username} 建立了物料 {instance.name} #{instance.code}"
+            )
+
+        elif model_name == "BatchInventory":
+            action_detail = f"{full_username} 建立了批號庫存 {instance.material.name} #{instance.batch_number}"
+
+        elif model_name == "BOM":
+            action_detail = f"{full_username} 建立了配方 ({instance.parent.name} #{instance.parent.code} -> {instance.child.name} #{instance.child.code})"
+
+        else:
+            action_detail = f"{full_username} 建立了此筆資料 (ID: {instance.pk})"
+
+        self._record_db_log(instance, user, action_detail)
 
     def perform_update(self, serializer):
         user = self.get_valid_user()
+        old_instance = serializer.instance
+
+        changes = []
+        for field_name, new_val in serializer.validated_data.items():
+            if field_name in ["updated_at", "updated_by", "created_at", "created_by"]:
+                continue
+
+            try:
+                field = old_instance._meta.get_field(field_name)
+                old_val = getattr(old_instance, field_name)
+
+                if old_val != new_val:
+                    verbose_name = getattr(field, "verbose_name", field_name)
+                    old_display = self._get_field_display_value(
+                        old_instance, field, old_val
+                    )
+                    new_display = self._get_field_display_value(
+                        old_instance, field, new_val
+                    )
+
+                    changes.append(
+                        f"「{verbose_name}」由 '{old_display}' 改為 '{new_display}'"
+                    )
+            except Exception:
+                pass
 
         save_kwargs = {}
         if hasattr(serializer.Meta.model, "updated_by"):
             save_kwargs["updated_by"] = user
 
         instance = serializer.save(**save_kwargs)
+        full_username = f"{user.last_name}{user.first_name}"
 
-        self._record_db_log(instance, user, f"{user.username} 更新資料內容")
+        # Log Example: 徐研發 更新了: 「狀態」由 '草稿' 改為 '已完成'，「需求數量」由 '10' 改為 '20'
+        if changes:
+            action_detail = f"{full_username} 更新了: " + "，".join(changes)
+        else:
+            action_detail = f"{full_username} 查看了單據，但無內容異動"
+
+        self._record_db_log(instance, user, action_detail)
 
     def perform_destroy(self, instance):
         user = self.get_valid_user()
+        full_username = f"{user.last_name}{user.first_name}"
         model_name = instance.__class__.__name__
-
         action_detail = ""
-        if hasattr(instance, "is_active"):
-            instance.is_active = False
-            instance.save(update_fields=["is_active"])
-            action_detail = f"{user.username} 停用此筆資料"
 
-        elif hasattr(instance, "is_deleted"):
+        if model_name == "Vendor":
             instance.is_deleted = True
             instance.save(update_fields=["is_deleted"])
-            action_detail = f"{user.username} 作廢此筆資料"
+            action_detail = f"{full_username} 刪除了客戶資料 {instance.name}"
 
-        elif hasattr(instance, "status") and model_name == "MaterialRequirementPlan":
-            instance.status = "DELETED"
-            instance.save(update_fields=["status"])
-
-            children_mrps = instance.__class__.objects.filter(
-                parent_id=instance.mrp_id, status="PENDING"
+        elif model_name == "MaterialRequirementPlan":
+            instance.is_active = False
+            instance.save(update_fields=["is_active"])
+            instance.__class__.objects.filter(parent_id=instance.mrp_id).update(
+                is_active=False
             )
-            children_mrps.update(status="DELETED")
+            action_detail = f"{full_username} 刪除了物料需求單 #{instance.mrp_id}"
 
-            action_detail = f"{user.username} 刪除此物料需求單"
+        elif model_name == "ProductionOrder":
+            instance.is_active = False
+            instance.save(update_fields=["is_active"])
+            action_detail = f"{full_username} 刪除了生產單 #{instance.order_number}"
 
+        elif model_name == "DeliveryNote":
+            instance.is_active = False
+            instance.save(update_fields=["is_active"])
+            action_detail = f"{full_username} 刪除了銷貨單 #{instance.note_number}"
+
+        elif model_name == "CustomerOrder":
+            instance.is_active = False
+            instance.save(update_fields=["is_active"])
+            action_detail = f"{full_username} 刪除了客戶訂單 #{instance.order_number}"
+
+        elif model_name == "PurchaseRequisition":
+            instance.is_active = False
+            instance.save(update_fields=["is_active"])
+            action_detail = f"{full_username} 刪除了請購單 #{instance.id}"
+
+        elif model_name == "Material":
+            instance.is_active = False
+            instance.save(update_fields=["is_active"])
+            action_detail = (
+                f"{full_username} 停用了物料 {instance.name} #{instance.code}"
+            )
+
+        elif model_name == "BatchInventory":
+            instance.is_active = False
+            instance.save(update_fields=["is_active"])
+            action_detail = f"{full_username} 停用了批號庫存 {instance.material.name} #{instance.batch_number}"
+
+        elif model_name == "BOM":
+            instance.is_active = False
+            instance.save(update_fields=["is_active"])
+            action_detail = f"{full_username} 停用了配方 ({instance.parent.name} #{instance.parent.code} -> {instance.child.name} #{instance.child.code})"
         else:
-            pass
+            action_detail = f"{full_username} 停用此筆資料 (ID: {instance.pk})"
 
         if user and action_detail:
             self._record_db_log(instance, user, action_detail)
@@ -210,15 +318,13 @@ class ProductionOrderViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
 class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     queryset = (
-        MaterialRequirementPlan.objects.filter(status="PENDING")
+        MaterialRequirementPlan.objects.filter(is_active=True)
         .prefetch_related("customer_orders")
         .order_by("-created_at")
     )
     serializer_class = MaterialRequirementPlanSerializer
 
     def get_permissions(self):
-        if settings.DEBUG:
-            return [AllowAny()]
         return [IsAuthenticated(), IsAdminOrEmployerOrReadOnly()]
 
     @action(detail=False, methods=["get"])
@@ -285,11 +391,19 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 batch_inventory_info=list(batch_info),
                 product_id=mrp_data.get("productId"),
                 required_qty=mrp_data.get("qty"),
-                status="PENDING",
                 created_by=user,
             )
 
-            created_mrps.append({"id": new_mrp.id, "parent_id": parent_id})
+            created_mrps.append(
+                {
+                    "id": new_mrp.id,
+                    "parent_id": parent_id,
+                    "product_id": mrp_data.get("productId"),
+                }
+            )
+            self._record_db_log(
+                new_mrp, user, f"{user.last_name}{user.first_name} 建立此需求單草稿"
+            )
 
             children = mrp_data.get("children_mrp", [])
             for child in children:
@@ -301,22 +415,6 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
             save_mrp_recursive(r)
 
         return Response(created_mrps, status=status.HTTP_201_CREATED)
-
-    @action(detail=False, methods=["post"])
-    @transaction.atomic
-    def bulk_update_vendor_info(self, request):
-        ids = request.data.get("ids", [])
-        new_vendor_data = request.data.get("vendor_data")
-
-        if not ids or not new_vendor_data:
-            return Response({"error": "缺少參數"}, status=400)
-
-        v_info_json = json.dumps(new_vendor_data, ensure_ascii=False)
-        updated = MaterialRequirementPlan.objects.filter(
-            id__in=ids, status="PENDING"
-        ).update(vendor_info=v_info_json)
-
-        return Response({"data": f"已更新 {updated} 筆草稿的廠商資訊"})
 
     @action(detail=False, methods=["post"])
     @transaction.atomic
@@ -370,8 +468,12 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                     except BatchInventory.DoesNotExist:
                         raise ValidationError(f"找不到批次庫存 ID: {batch_id}")
 
-                    # 修正：將 inventory.qty 改為 inventory.remaining_qty
                     if inventory.remaining_qty < used_qty:
+                        self._record_db_log(
+                            inventory,
+                            user,
+                            f"{user.last_name}{user.first_name} 執行從物料單號：{mrp.mrp_id} 轉單失敗，庫存不足！批次 {batch.get('batch_number')} 僅剩 {inventory.remaining_qty}，但需要扣除 {used_qty}",
+                        )
                         raise ValidationError(
                             f"庫存不足！批次 {batch.get('batch_number')} 僅剩 {inventory.remaining_qty}，但需要扣除 {used_qty}"
                         )
@@ -379,6 +481,11 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                     # 修正：真實扣除庫存，並將 update_fields 改為 remaining_qty
                     inventory.remaining_qty -= used_qty
                     inventory.save(update_fields=["remaining_qty"])
+                    self._record_db_log(
+                        inventory,
+                        user,
+                        f"{user.last_name}{user.first_name} 執行從物料單號：{mrp.mrp_id} 轉單，自動扣除庫存數量 {used_qty}",
+                    )
 
         # 4. 準備產生生產單
         created_pos = []
@@ -386,7 +493,6 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
         # 先建立子單的生產單
         for child_mrp in children_mrps:
-            # 依照該物料的 requiredQty 由大到小排序
             sorted_materials = sorted(
                 child_mrp.batch_inventory_info,
                 key=lambda x: float(x.get("requiredQty", 0)),
@@ -403,16 +509,18 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 created_by=user,
             )
             child_po_map[child_mrp.id] = child_po
+            self._record_db_log(
+                child_po,
+                user,
+                f"{user.last_name}{user.first_name} 將單號：{child_mrp.mrp_id} 轉成子生產單",
+            )
             created_pos.append(child_po)
 
-        # 5. 處理母單：將子單名稱放最上方，其他原物料依用量排序
         parent_materials_info = []
-
-        # 第一步：把子單塞進母單的材料清單最前方 (依照你前方的 JSON 結構概念組裝)
         for child_mrp in children_mrps:
             parent_materials_info.append(
                 {
-                    "type": "CHILD_PRODUCT",  # 標示為子單成品
+                    "type": "CHILD_PRODUCT",
                     "code": getattr(child_mrp.product, "code", ""),
                     "unit": getattr(child_mrp.product, "unit", ""),
                     "materialName": child_mrp.product.name,
@@ -423,7 +531,6 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 }
             )
 
-        # 第二步：將原本母單的其他原物料依據 requiredQty 大到小排序後加入
         other_materials = sorted(
             parent_mrp.batch_inventory_info,
             key=lambda x: float(x.get("requiredQty", 0)),
@@ -442,17 +549,15 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
             created_by=user,
         )
         created_pos.append(parent_po)
+        self._record_db_log(
+            parent_po,
+            user,
+            f"{user.last_name}{user.first_name} 將單號：{parent_mrp.mrp_id} 轉成主生產單",
+        )
 
-        # 第三步：把剛剛建立的子生產單的 parent_id 更新為母生產單的 order_number
         for child_po in child_po_map.values():
             child_po.parent_id = parent_po.order_number
             child_po.save(update_fields=["parent_id"])
-
-        # 6. 更新 MRP 狀態為 CONVERTED 並寫入 Log
-        for mrp in all_mrps:
-            mrp.status = "CONVERTED"
-            mrp.save(update_fields=["status"])
-            self._record_db_log(mrp, user, f"{user.username} 將此物料需求單轉成生產單")
 
         return Response(
             {
@@ -476,8 +581,7 @@ class VendorViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     serializer_class = VendorSerializer
 
     def get_permissions(self):
-        return [AllowAny()]
-        # return [IsAuthenticated(), IsRDOrReadOnly()]
+        return [IsAuthenticated(), IsRDOrReadOnly()]
 
     @action(detail=False, methods=["get"], url_path="search")
     def get_vendor_by_code(self, request):
@@ -497,12 +601,12 @@ class BatchInventoryViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     serializer_class = BatchInventorySerializer
 
     def get_permissions(self):
-        return [AllowAny()]
         return [IsAuthenticated(), IsAdminOrEmployerOrReadOnly()]
 
     @action(detail=False, methods=["post"], url_path="adjustment")
     @transaction.atomic
     def inventory_adjustment(self, request):
+        user = self.get_valid_user()
         payload = request.data
         valid_choices = [choice[0] for choice in BatchInventory.ADJUSTMENT_CHOICES]
         updated_inventories = []
@@ -521,9 +625,25 @@ class BatchInventoryViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
             try:
                 inventory = BatchInventory.objects.get(batch_number=batch_number)
+                old_type = (
+                    inventory.get_adjustment_type_display()
+                    if inventory.get_adjustment_type_display()
+                    else "無指定"
+                )
+
                 inventory.adjustment_type = adjustment_code
                 inventory.adjustment_qty = adjustment_qty
                 inventory.save(update_fields=["adjustment_type", "adjustment_qty"])
+
+                new_type_name = dict(BatchInventory.ADJUSTMENT_CHOICES).get(
+                    adjustment_code
+                )
+                self._record_db_log(
+                    inventory,
+                    user,
+                    f"{user.last_name}{user.first_name} 執行盤點: 狀態由 '{old_type}' 改為 '{new_type_name}'，數量為 {adjustment_qty}",
+                )
+
                 updated_inventories.append(inventory)
             except BatchInventory.DoesNotExist:
                 return Response(
@@ -646,7 +766,6 @@ class BatchInventoryViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                             "unit": unit,
                             "actual_qty": float(po.actual_qty) if po.actual_qty else 0,
                             "target_qty": float(po.target_qty) if po.target_qty else 0,
-                            "status": po.status,
                             "po_vendor_info": {
                                 "code": po_vendor.get("code", ""),
                                 "name": po_vendor.get("name", ""),
@@ -725,7 +844,7 @@ class BatchInventoryViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
 
 class BOMViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = BOM.objects.all().order_by("-id")
+    queryset = BOM.objects.filter(is_active=True).order_by("-id")
     serializer_class = BOMSerializer
 
     def get_permissions(self):
@@ -734,6 +853,9 @@ class BOMViewSet(viewsets.ReadOnlyModelViewSet):
 
 class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     serializer_class = PurchaseRequisitionSerializer
+
+    def get_permissions(self):
+        return [IsAuthenticated(), IsAdminOrEmployerOrReadOnly()]
 
     @action(detail=False, methods=["get"], url_path="prev_purchase_price")
     def get_latest_price(self, request):
@@ -765,9 +887,6 @@ class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
             )
 
         return Response({"latest_price": None}, status=status.HTTP_200_OK)
-
-    def get_permissions(self):
-        return [IsAuthenticated(), IsAdminOrEmployerOrReadOnly()]
 
     def get_queryset(self):
         active_items_prefetch = Prefetch(
@@ -827,6 +946,7 @@ class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
             PurchaseRequisitionItem.objects.create(requisition=instance, **item_data)
 
     def perform_update(self, serializer):
+        user = self.get_valid_user()
         items_data = serializer.validated_data.pop("items", None)
 
         super().perform_update(serializer)
@@ -843,6 +963,11 @@ class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
                 if item_id and item_id in existing_items:
                     item_instance = existing_items[item_id]
+                    self._record_db_log(
+                        instance,
+                        user,
+                        f"{user.last_name}{user.first_name} 更新了請購明細: {item_instance.material.name}",
+                    )
                     for attr, value in item_data.items():
                         setattr(item_instance, attr, value)
                     item_instance.save()
@@ -852,38 +977,22 @@ class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                     new_item = PurchaseRequisitionItem.objects.create(
                         requisition=instance, **item_data
                     )
+                    self._record_db_log(
+                        instance,
+                        user,
+                        f"{user.last_name}{user.first_name} 新增了請購明細: {new_item.material.name}",
+                    )
                     incoming_item_ids.append(new_item.id)
 
             for item_id, item_instance in existing_items.items():
                 if item_id not in incoming_item_ids:
                     item_instance.is_active = False
                     item_instance.save(update_fields=["is_active"])
-
-
-class BulkImportMockDataView(APIView):
-    parser_classes = [MultiPartParser]
-    permission_classes = [AllowAny]
-    authentication_classes = []
-
-    def post(self, request, *args, **kwargs):
-        files = request.FILES.getlist("files")
-        if not files:
-            return Response({"error": "請提供檔案"}, status=status.HTTP_400_BAD_REQUEST)
-
-        results = []
-        errors = []
-
-        for excel_file in files:
-            try:
-                product = ExcelImportService.import_bom_from_excel(excel_file)
-                results.append(f"成功導入: {product.code} - {product.name}")
-            except Exception as e:
-                errors.append(f"檔案 {excel_file.name} 失敗: {str(e)}")
-
-        return Response(
-            {"imported_count": len(results), "details": results, "errors": errors},
-            status=status.HTTP_200_OK if not errors else status.HTTP_207_MULTI_STATUS,
-        )
+                    self._record_db_log(
+                        instance,
+                        user,
+                        f"{user.last_name}{user.first_name} 刪除了請購明細: {item_instance.material.name}",
+                    )
 
 
 class DeliveryNoteFilter(filters.FilterSet):
@@ -937,7 +1046,10 @@ class DeliveryNoteViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
         new_note_number = f"{today_str}{sequence:04d}"
 
-        serializer.save(created_by=user, note_number=new_note_number)
+        instance = serializer.save(created_by=user, note_number=new_note_number)
+        self._record_db_log(
+            instance, user, f"{user.last_name}{user.first_name} 建立了此銷貨單"
+        )
 
 
 class CustomerOrderViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
@@ -950,7 +1062,30 @@ class CustomerOrderViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     @transaction.atomic
     def perform_create(self, serializer):
         user = self.get_valid_user()
-        serializer.save(created_by=user)
+        instance = serializer.save(created_by=user)
+        self._record_db_log(
+            instance, user, f"{user.last_name}{user.first_name} 建立了客戶訂貨單"
+        )
+
+    @action(detail=False, methods=["get"])
+    def daily_sequence(self, request):
+        """取得今日 訂購單 流水號的下一個可用號碼"""
+        today_str = timezone.localtime(timezone.now()).strftime("%Y%m%d")
+        prefix = f"CO{today_str}"
+
+        ons = CustomerOrder.objects.filter(order_number__startswith=prefix).values_list(
+            "order_number", flat=True
+        )
+
+        max_seq = 0
+        for oid in ons:
+            suffix = oid[len(prefix) :]
+            seq_str = suffix.split("-")[0]
+
+            if seq_str.isdigit():
+                max_seq = max(max_seq, int(seq_str))
+
+        return Response({"sequence": max_seq + 1, "prefix": prefix})
 
     def list(self, request, *args, **kwargs):
         queryset = self.get_queryset()

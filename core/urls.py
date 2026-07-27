@@ -12,11 +12,9 @@ from factory.auth.views import (
     UserProfileViewSet,
 )
 from factory.mock import InitMockDataAPIView
-from factory.mock_api import generate_mock_data
 from factory.views import (
     BatchInventoryViewSet,
     BOMViewSet,
-    BulkImportMockDataView,
     CustomerOrderViewSet,
     DeliveryNoteViewSet,
     MaterialRequirementPlanViewSet,
@@ -54,12 +52,6 @@ urlpatterns = [
 
 
 dev_urlpatterns = [
-    path("api/mock-data", generate_mock_data, name="generate_mock_data"),
-    path(
-        "api/import-mock-data",
-        BulkImportMockDataView.as_view(),
-        name="import-mock-data",
-    ),
     path(
         "api/add-employer-account",
         AddMockUserView.as_view(),

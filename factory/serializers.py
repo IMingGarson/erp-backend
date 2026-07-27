@@ -211,12 +211,12 @@ class BOMSerializer(serializers.ModelSerializer):
             "child_code",
             "child_name",
             "child_type",
+            "is_active",
             "quantity_required",
         ]
         read_only_fields = ["id"]
 
 
-# 🌟 關鍵：CustomerOrderSerializer 必須在 MRP Serializer 前面，這樣 MRP 才能巢狀呼叫它
 class CustomerOrderSerializer(serializers.ModelSerializer):
     product_id = serializers.PrimaryKeyRelatedField(
         queryset=Material.objects.all(), source="product", write_only=True
@@ -226,14 +226,13 @@ class CustomerOrderSerializer(serializers.ModelSerializer):
         queryset=MaterialRequirementPlan.objects.all(),
         source="mrp",
         write_only=True,
-        required=False,  # 允許沒有 MRP ID
-        allow_null=True,  # 允許傳入 null
+        required=False,
+        allow_null=True,
     )
 
     class Meta:
         model = CustomerOrder
         fields = "__all__"
-        # 關聯物件設為 read_only，讓系統自動透過 ID 對應
         read_only_fields = ["created_by", "product", "mrp"]
 
 
@@ -244,7 +243,6 @@ class MaterialRequirementPlanSerializer(serializers.ModelSerializer):
     unit = serializers.ReadOnlyField(source="product.unit")
     created_at = serializers.DateTimeField(format="%Y-%m-%d %H:%M:%S", read_only=True)
 
-    # 🌟 透過 related_name 直接帶出底下的客戶訂單
     customer_orders = CustomerOrderSerializer(many=True, read_only=True)
 
     class Meta:
@@ -255,19 +253,19 @@ class MaterialRequirementPlanSerializer(serializers.ModelSerializer):
             "parent_id",
             "vendor_info",
             "batch_inventory_info",
-            "customer_orders",  # 新增到 fields 內
+            "customer_orders",
             "product_id",
             "product_name",
             "product_code",
             "used_batch_number",
             "unit",
+            "is_active",
             "required_qty",
             "created_by",
-            "status",
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["status", "created_at", "updated_at"]
+        read_only_fields = ["created_at", "updated_at"]
 
     def validate_required_qty(self, value):
         if value <= 0:
@@ -367,7 +365,6 @@ class ProductionOrderSerializer(serializers.ModelSerializer):
             "vendor_info",
             "is_fully_delivered",
             "remaining_qty",
-            "status",
             "delivery_notes",
             "created_by",
             "creator_name",

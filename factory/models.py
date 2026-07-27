@@ -26,9 +26,16 @@ class UserProfile(models.Model):
     user = models.OneToOneField(
         User, on_delete=models.DO_NOTHING, related_name="profile"
     )
-    department = models.CharField(max_length=20, choices=DEPARTMENTS)
-    is_active = models.BooleanField(default=True, db_index=True)
-    onboarding_date = models.DateTimeField(default=get_default_onboarding_date)
+    department = models.CharField(
+        max_length=20, choices=DEPARTMENTS, verbose_name="所屬部門"
+    )
+    is_active = models.BooleanField(
+        default=True, db_index=True, verbose_name="帳號狀態"
+    )
+    onboarding_date = models.DateTimeField(
+        default=get_default_onboarding_date, verbose_name="到職日"
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -40,18 +47,23 @@ class Material(models.Model):
     TYPE_CHOICES = (
         ("RAW", "原物料"),
         ("SEMI", "半成品"),
-        ("PRODUCT", "最終產品"),
+        ("PRODUCT", "成品"),
         ("PACK", "包材"),
     )
-    id = models.AutoField(primary_key=True)
-    code = models.CharField(max_length=30, db_index=True, unique=True)
-    name = models.CharField(max_length=100)
-    type = models.CharField(max_length=10, choices=TYPE_CHOICES)
-    unit = models.CharField(max_length=20)
-    unit_price = models.DecimalField(
-        max_digits=10, decimal_places=2, null=True, blank=True
+    code = models.CharField(
+        max_length=30, db_index=True, unique=True, verbose_name="物料代號"
     )
-    is_active = models.BooleanField(default=True, db_index=True)
+    name = models.CharField(max_length=100, verbose_name="物料名稱")
+    type = models.CharField(
+        max_length=10, choices=TYPE_CHOICES, verbose_name="物料類型"
+    )
+    unit = models.CharField(max_length=20, verbose_name="單位")
+    unit_price = models.DecimalField(
+        max_digits=10, decimal_places=2, null=True, blank=True, verbose_name="單價"
+    )
+    is_active = models.BooleanField(
+        default=True, db_index=True, verbose_name="是否啟用"
+    )
     created_by = models.ForeignKey(User, on_delete=models.DO_NOTHING)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -70,19 +82,30 @@ class Material(models.Model):
 class BOM(models.Model):
     id = models.AutoField(primary_key=True)
     parent = models.ForeignKey(
-        Material, related_name="main_product", on_delete=models.DO_NOTHING
+        Material,
+        related_name="main_product",
+        on_delete=models.DO_NOTHING,
+        verbose_name="成品",
     )
     child = models.ForeignKey(
-        Material, related_name="sub_material", on_delete=models.DO_NOTHING
+        Material,
+        related_name="sub_material",
+        on_delete=models.DO_NOTHING,
+        verbose_name="半成品",
     )
-    quantity_required = models.DecimalField(max_digits=15, decimal_places=4)
+    quantity_required = models.DecimalField(
+        max_digits=15, decimal_places=4, verbose_name="需求數量"
+    )
     created_by = models.ForeignKey(User, on_delete=models.DO_NOTHING)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    is_active = models.BooleanField(
+        default=True, db_index=True, verbose_name="是否啟用"
+    )
 
     class Meta:
         db_table = "boms"
-        unique_together = ("parent", "child")
+        verbose_name = "配方清單"
 
 
 class MaterialRequirementPlan(models.Model):
@@ -93,12 +116,17 @@ class MaterialRequirementPlan(models.Model):
     parent_id = models.CharField(
         max_length=50, blank=True, null=True, verbose_name="母單號"
     )
-    vendor_info = models.JSONField()
-    batch_inventory_info = models.JSONField()
-    product = models.ForeignKey(Material, on_delete=models.DO_NOTHING)
-    required_qty = models.DecimalField(max_digits=15, decimal_places=4)
-    status = models.CharField(max_length=20, default="PENDING", db_index=True)
     created_by = models.ForeignKey(User, on_delete=models.DO_NOTHING)
+
+    vendor_info = models.JSONField(verbose_name="客戶資訊")
+    batch_inventory_info = models.JSONField(verbose_name="批號資訊")
+    product = models.ForeignKey(
+        Material, on_delete=models.DO_NOTHING, verbose_name="需求物料"
+    )
+    required_qty = models.DecimalField(
+        max_digits=15, decimal_places=4, verbose_name="需求數量"
+    )
+    is_active = models.BooleanField(default=True, verbose_name="是否啟用")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -112,13 +140,17 @@ class MaterialRequirementPlan(models.Model):
 
 class PurchaseOrder(models.Model):
     id = models.AutoField(primary_key=True)
-    material = models.ForeignKey(Material, on_delete=models.DO_NOTHING)
-    order_qty = models.DecimalField(max_digits=15, decimal_places=4)
-    expected_date = models.DateField(null=True, blank=True)
-    status = models.CharField(max_length=20, default="DRAFT", db_index=True)
+    material = models.ForeignKey(
+        Material, on_delete=models.DO_NOTHING, verbose_name="採購物料"
+    )
+    order_qty = models.DecimalField(
+        max_digits=15, decimal_places=4, verbose_name="採購數量"
+    )
+    expected_date = models.DateField(null=True, blank=True, verbose_name="預計到貨日期")
     created_by = models.ForeignKey(User, on_delete=models.DO_NOTHING)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    is_active = models.BooleanField(default=True, verbose_name="是否啟用")
 
     class Meta:
         db_table = "purchase_orders"
@@ -128,12 +160,20 @@ class PurchaseOrder(models.Model):
 class BatchInventory(models.Model):
     ADJUSTMENT_CHOICES = (("NONE", "無調整"), ("PROFIT", "盤盈"), ("LOSS", "盤虧"))
     id = models.AutoField(primary_key=True)
-    material = models.ForeignKey(Material, on_delete=models.DO_NOTHING)
-    batch_number = models.CharField(max_length=50, unique=True)
-    original_qty = models.DecimalField(max_digits=15, decimal_places=4)
-    remaining_qty = models.DecimalField(max_digits=15, decimal_places=4)
-    received_date = models.DateField()
-    expiration_date = models.DateField(default=get_default_expiration_date)
+    material = models.ForeignKey(
+        Material, on_delete=models.DO_NOTHING, verbose_name="物料"
+    )
+    batch_number = models.CharField(max_length=50, verbose_name="批號")
+    original_qty = models.DecimalField(
+        max_digits=15, decimal_places=4, verbose_name="初始數量"
+    )
+    remaining_qty = models.DecimalField(
+        max_digits=15, decimal_places=4, verbose_name="剩餘數量"
+    )
+    received_date = models.DateField(verbose_name="入庫日期")
+    expiration_date = models.DateField(
+        default=get_default_expiration_date, verbose_name="有效期限"
+    )
     adjustment_type = models.CharField(
         max_length=10,
         choices=ADJUSTMENT_CHOICES,
@@ -143,7 +183,9 @@ class BatchInventory(models.Model):
     adjustment_qty = models.DecimalField(
         max_digits=15, decimal_places=4, default=0, verbose_name="盈虧數量"
     )
-    is_active = models.BooleanField(default=True, db_index=True)
+    is_active = models.BooleanField(
+        default=True, db_index=True, verbose_name="是否啟用"
+    )
     created_by = models.ForeignKey(User, on_delete=models.DO_NOTHING)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -153,6 +195,11 @@ class BatchInventory(models.Model):
 
     class Meta:
         db_table = "batch_inventories"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["material", "batch_number"], name="unique_material_batch"
+            )
+        ]
         verbose_name = "批號庫存"
 
 
@@ -166,19 +213,26 @@ class ProductionOrder(models.Model):
         max_length=50, blank=True, null=True, verbose_name="母生產單號", db_index=True
     )
     vendor_info = models.JSONField(verbose_name="客戶與物流資訊", default=None)
-    product = models.ForeignKey(Material, on_delete=models.DO_NOTHING)
-    target_qty = models.DecimalField(max_digits=15, decimal_places=4)
-    actual_qty = models.DecimalField(
-        max_digits=15, decimal_places=4, null=True, blank=True
-    )
     materials_info = models.JSONField(verbose_name="原物料與用量資訊", default=list)
-    status = models.CharField(
-        max_length=20, choices=STATUS_CHOICES, default="DRAFT", db_index=True
+
+    product = models.ForeignKey(
+        Material, on_delete=models.DO_NOTHING, verbose_name="生產產品"
     )
+    target_qty = models.DecimalField(
+        max_digits=15, decimal_places=4, verbose_name="預計生產量"
+    )
+    actual_qty = models.DecimalField(
+        max_digits=15,
+        decimal_places=4,
+        null=True,
+        blank=True,
+        verbose_name="實際生產量",
+    )
+    is_active = models.BooleanField(default=True, verbose_name="是否啟用")
+
     created_by = models.ForeignKey(User, on_delete=models.DO_NOTHING)
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
     updated_at = models.DateTimeField(auto_now=True)
-    is_active = models.BooleanField(default=True)
 
     class Meta:
         db_table = "production_orders"
@@ -208,17 +262,18 @@ class ProductionOrder(models.Model):
 
 class LogisticsOrder(models.Model):
     id = models.AutoField(primary_key=True)
-    production_order = models.ForeignKey(ProductionOrder, on_delete=models.DO_NOTHING)
-    logistics_provider = models.CharField(max_length=100)
-    vendor_name = models.CharField(max_length=100)
-    details = models.TextField()
+    production_order = models.ForeignKey(
+        ProductionOrder, on_delete=models.DO_NOTHING, verbose_name="關聯生產單"
+    )
+    logistics_provider = models.CharField(max_length=100, verbose_name="物流商")
+    vendor_name = models.CharField(max_length=100, verbose_name="客戶名稱")
+    details = models.TextField(verbose_name="物流詳情")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         db_table = "logistics_orders"
         verbose_name = "物流單"
-        verbose_name_plural = "物流單"
 
 
 class Vendor(models.Model):
@@ -243,7 +298,7 @@ class Vendor(models.Model):
     contact_person = models.CharField(
         max_length=100, blank=True, null=True, verbose_name="負責人名稱"
     )
-    is_deleted = models.BooleanField(default=False)
+    is_deleted = models.BooleanField(default=False, verbose_name="是否移除")
     created_at = models.DateTimeField(auto_now_add=True)
     created_by = models.ForeignKey(User, on_delete=models.DO_NOTHING, default=None)
     updated_at = models.DateTimeField(auto_now=True)
@@ -336,19 +391,15 @@ class RequisitionStatus(models.TextChoices):
 
 
 class PurchaseRequisition(models.Model):
-    request_date = models.DateField()
-    applicant = models.CharField(max_length=50)
-    status = models.CharField(
-        max_length=20,
-        choices=RequisitionStatus.choices,
-        default=RequisitionStatus.WAITING,
-    )
-    is_active = models.BooleanField(default=True)
+    request_date = models.DateField(verbose_name="申請日期")
+    applicant = models.CharField(max_length=50, verbose_name="申請人")
+    is_active = models.BooleanField(default=True, verbose_name="是否啟用")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         db_table = "purchase_requests"
+        verbose_name = "請購單"
 
     def __str__(self):
         return f"PR #{self.id} - {self.status}"
@@ -356,21 +407,34 @@ class PurchaseRequisition(models.Model):
 
 class PurchaseRequisitionItem(models.Model):
     requisition = models.ForeignKey(
-        PurchaseRequisition, related_name="items", on_delete=models.DO_NOTHING
+        PurchaseRequisition,
+        related_name="items",
+        on_delete=models.DO_NOTHING,
+        verbose_name="請購單",
     )
-
     material = models.ForeignKey(
-        Material, on_delete=models.DO_NOTHING, related_name="purchase_items"
+        Material,
+        on_delete=models.DO_NOTHING,
+        related_name="purchase_items",
+        verbose_name="請購物料",
     )
-    quantity = models.DecimalField(max_digits=10, decimal_places=2)
-    unit = models.CharField(max_length=10, default="Kg")
+    quantity = models.DecimalField(max_digits=10, decimal_places=2, verbose_name="數量")
+    unit = models.CharField(max_length=10, default="Kg", verbose_name="單位")
     purchased_price = models.DecimalField(
-        max_digits=10, decimal_places=2, null=False, blank=False
+        max_digits=10,
+        decimal_places=2,
+        null=False,
+        blank=False,
+        verbose_name="採購單價",
     )
-    expected_delivery_date = models.DateField(null=True, blank=True)
-    supplier = models.CharField(max_length=100, null=True, blank=True)
-    remark = models.TextField(null=True, blank=True)
-    is_active = models.BooleanField(default=True)
+    expected_delivery_date = models.DateField(
+        null=True, blank=True, verbose_name="預計到貨日期"
+    )
+    supplier = models.CharField(
+        max_length=100, null=True, blank=True, verbose_name="供應商"
+    )
+    remark = models.TextField(null=True, blank=True, verbose_name="備註")
+    is_active = models.BooleanField(default=True, verbose_name="是否啟用")
 
     @property
     def material_name(self):
@@ -430,7 +494,7 @@ class DeliveryNote(models.Model):
     created_by = models.ForeignKey(User, on_delete=models.DO_NOTHING)
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
     updated_at = models.DateTimeField(auto_now=True)
-    is_active = models.BooleanField(default=True)
+    is_active = models.BooleanField(default=True, verbose_name="是否啟用")
 
     class Meta:
         db_table = "delivery_notes"
