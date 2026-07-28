@@ -271,10 +271,6 @@ class ProductionOrderViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         """
         queryset = self.get_queryset()
 
-        status_param = request.query_params.get("status")
-        if status_param:
-            queryset = queryset.filter(status=status_param)
-
         search_keyword = request.query_params.get("search")
         if search_keyword:
             queryset = queryset.filter(
@@ -366,6 +362,7 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
             "address": vendor_data.get("address"),
             "phone": vendor_data.get("phone"),
             "notes": vendor_data.get("notes"),
+            "code": vendor_data.get("code"),
         }
 
         created_mrps = []
@@ -431,13 +428,13 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
             parent_mrp = self.get_queryset().get(id=mrp_id)
         except MaterialRequirementPlan.DoesNotExist:
             return Response(
-                {"error": "找不到此 MRP 母單或狀態非 PENDING"},
+                {"error": "找不到此 MRP 母單"},
                 status=status.HTTP_404_NOT_FOUND,
             )
 
         # 2. 撈出對應的所有子單
         children_mrps = MaterialRequirementPlan.objects.filter(
-            parent_id=parent_mrp.mrp_id, status="PENDING"
+            parent_id=parent_mrp.mrp_id
         )
 
         all_mrps = [parent_mrp] + list(children_mrps)
@@ -505,7 +502,6 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 target_qty=child_mrp.required_qty,
                 materials_info=sorted_materials,
                 vendor_info=child_mrp.vendor_info,
-                status="DRAFT",
                 created_by=user,
             )
             child_po_map[child_mrp.id] = child_po
@@ -545,7 +541,6 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
             target_qty=parent_mrp.required_qty,
             materials_info=parent_materials_info,
             vendor_info=parent_mrp.vendor_info,
-            status="DRAFT",
             created_by=user,
         )
         created_pos.append(parent_po)
@@ -780,7 +775,7 @@ class BatchInventoryViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
             # ---------------------------------------------------------
             candidate_mrps = MaterialRequirementPlan.objects.annotate(
                 batch_text=Cast("batch_inventory_info", output_field=CharField())
-            ).filter(batch_text__icontains=batch_num, status="PENDING")
+            ).filter(batch_text__icontains=batch_num, is_active=True)
 
             mrps = []
             for mrp in candidate_mrps:
@@ -834,13 +829,13 @@ class BatchInventoryViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                     "remaining_qty": float(batch.remaining_qty),
                     "received_date": batch.received_date,
                     "trace_details": {
-                        "mrps": mrps,
+                        # "mrps": mrps,
                         "orders": orders,
                     },
                 }
             )
 
-        return Response({"data": results}, status=status.HTTP_200_OK)
+        return Response(results, status=status.HTTP_200_OK)
 
 
 class BOMViewSet(viewsets.ReadOnlyModelViewSet):
@@ -916,8 +911,7 @@ class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 if end_date_str:
                     try:
                         end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
-                        if end_date > today:
-                            end_date = today
+                        end_date = min(end_date, today)
                         queryset = queryset.filter(request_date__lte=end_date)
                     except ValueError:
                         pass
