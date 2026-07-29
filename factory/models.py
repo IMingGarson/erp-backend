@@ -109,6 +109,10 @@ class BOM(models.Model):
 
 
 class MaterialRequirementPlan(models.Model):
+    STATUS_CHOICES = [
+        ("pending", "待處理"),
+        ("converted", "已轉換"),
+    ]
     id = models.AutoField(primary_key=True)
     mrp_id = models.CharField(
         max_length=50, unique=True, default="TEMP-00000000", verbose_name="MRP單號"
@@ -127,6 +131,9 @@ class MaterialRequirementPlan(models.Model):
         max_digits=15, decimal_places=4, verbose_name="需求數量"
     )
     is_active = models.BooleanField(default=True, verbose_name="是否啟用")
+    status = models.CharField(
+        max_length=20, choices=STATUS_CHOICES, default="pending", verbose_name="狀態"
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -204,7 +211,6 @@ class BatchInventory(models.Model):
 
 
 class ProductionOrder(models.Model):
-    STATUS_CHOICES = (("DRAFT", "草稿"), ("IN_PROGRESS", "生產中"), ("DONE", "已完成"))
     id = models.AutoField(primary_key=True)
     order_number = models.CharField(
         max_length=50, unique=True, null=True, verbose_name="生產單號"
@@ -317,7 +323,7 @@ class ProductionLog(models.Model):
         ProductionOrder, related_name="logs", on_delete=models.DO_NOTHING
     )
     user = models.ForeignKey(User, on_delete=models.DO_NOTHING)
-    action_detail = models.CharField(max_length=255)
+    action_detail = models.TextField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -330,7 +336,7 @@ class MaterialLog(models.Model):
         Material, related_name="logs", on_delete=models.DO_NOTHING
     )
     user = models.ForeignKey(User, on_delete=models.DO_NOTHING)
-    action_detail = models.CharField(max_length=255)
+    action_detail = models.TextField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -341,7 +347,7 @@ class VendorLog(models.Model):
     id = models.AutoField(primary_key=True)
     vendor = models.ForeignKey(Vendor, related_name="logs", on_delete=models.DO_NOTHING)
     user = models.ForeignKey(User, on_delete=models.DO_NOTHING)
-    action_detail = models.CharField(max_length=255)
+    action_detail = models.TextField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -352,7 +358,7 @@ class BOMLog(models.Model):
     id = models.AutoField(primary_key=True)
     bom = models.ForeignKey(BOM, related_name="logs", on_delete=models.DO_NOTHING)
     user = models.ForeignKey(User, on_delete=models.DO_NOTHING)
-    action_detail = models.CharField(max_length=255)
+    action_detail = models.TextField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -365,7 +371,7 @@ class MaterialRequirementPlanLog(models.Model):
         MaterialRequirementPlan, related_name="logs", on_delete=models.DO_NOTHING
     )
     user = models.ForeignKey(User, on_delete=models.DO_NOTHING)
-    action_detail = models.CharField(max_length=255)
+    action_detail = models.TextField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -378,7 +384,7 @@ class BatchInventoryLog(models.Model):
         BatchInventory, related_name="logs", on_delete=models.DO_NOTHING
     )
     user = models.ForeignKey(User, on_delete=models.DO_NOTHING)
-    action_detail = models.CharField(max_length=255)
+    action_detail = models.TextField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -449,7 +455,7 @@ class PurchaseRequisitionLog(models.Model):
         PurchaseRequisition, on_delete=models.DO_NOTHING, related_name="logs"
     )
     user = models.ForeignKey(User, on_delete=models.DO_NOTHING, null=True)
-    action_detail = models.CharField(max_length=255)
+    action_detail = models.TextField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
 
@@ -507,7 +513,7 @@ class DeliveryNoteLog(models.Model):
         DeliveryNote, related_name="logs", on_delete=models.DO_NOTHING
     )
     user = models.ForeignKey(User, on_delete=models.DO_NOTHING)
-    action_detail = models.CharField(max_length=255)
+    action_detail = models.TextField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -578,7 +584,7 @@ class CustomerOrderLog(models.Model):
         CustomerOrder, related_name="logs", on_delete=models.DO_NOTHING
     )
     user = models.ForeignKey(User, on_delete=models.DO_NOTHING)
-    action_detail = models.CharField(max_length=255)
+    action_detail = models.TextField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

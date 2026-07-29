@@ -165,6 +165,17 @@ class CRUDAuditMixin:
             try:
                 field = old_instance._meta.get_field(field_name)
                 old_val = getattr(old_instance, field_name)
+                if isinstance(field, models.JSONField) or isinstance(
+                    old_val, (dict, list)
+                ):
+                    verbose_name = getattr(field, "verbose_name", field_name)
+                    json_diffs = self.get_json_diff(old_val or {}, new_val or {})
+
+                    if json_diffs:
+                        diff_str = "，".join(json_diffs)
+                        changes.append(f"「{verbose_name}」細節異動: {diff_str}")
+
+                    continue
 
                 if old_val != new_val:
                     verbose_name = getattr(field, "verbose_name", field_name)
@@ -188,11 +199,8 @@ class CRUDAuditMixin:
         instance = serializer.save(**save_kwargs)
         full_username = f"{user.last_name}{user.first_name}"
 
-        # Log Example: 徐研發 更新了: 「狀態」由 '草稿' 改為 '已完成'，「需求數量」由 '10' 改為 '20'
         if changes:
             action_detail = f"{full_username} 更新了: " + "，".join(changes)
-        else:
-            action_detail = f"{full_username} 查看了單據，但無內容異動"
 
         self._record_db_log(instance, user, action_detail)
 
@@ -257,6 +265,41 @@ class CRUDAuditMixin:
         if user and action_detail:
             self._record_db_log(instance, user, action_detail)
 
+    def get_json_diff(self, old_obj, new_obj, path=""):
+        local_changes = []
+
+        if isinstance(old_obj, dict) and isinstance(new_obj, dict):
+            all_keys = set(old_obj.keys()).union(set(new_obj.keys()))
+            for k in all_keys:
+                current_path = f"{path}.{k}" if path else str(k)
+                if k not in old_obj:
+                    local_changes.append(f"新增了 '{current_path}': '{new_obj[k]}'")
+                elif k not in new_obj:
+                    local_changes.append(f"移除了 '{current_path}'")
+                else:
+                    local_changes.extend(
+                        self.get_json_diff(old_obj[k], new_obj[k], current_path)
+                    )
+
+        elif isinstance(old_obj, list) and isinstance(new_obj, list):
+            max_len = max(len(old_obj), len(new_obj))
+            for i in range(max_len):
+                current_path = f"{path}[{i}]"
+                if i >= len(old_obj):
+                    local_changes.append(f"新增了 '{current_path}': '{new_obj[i]}'")
+                elif i >= len(new_obj):
+                    local_changes.append(f"移除了 '{current_path}'")
+                else:
+                    local_changes.extend(
+                        self.get_json_diff(old_obj[i], new_obj[i], current_path)
+                    )
+
+        else:
+            if str(old_obj or "") != str(new_obj or ""):
+                local_changes.append(f"'{path}' 由 '{old_obj}' 改為 '{new_obj}'")
+
+        return local_changes
+
 
 class ProductionOrderViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     queryset = ProductionOrder.objects.filter(is_active=True).order_by("-created_at")
@@ -314,7 +357,10 @@ class ProductionOrderViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
 class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     queryset = (
-        MaterialRequirementPlan.objects.filter(is_active=True)
+        MaterialRequirementPlan.objects.filter(
+            is_active=True,
+            status=MaterialRequirementPlan.STATUS_CHOICES[0][0],  # pending
+        )
         .prefetch_related("customer_orders")
         .order_by("-created_at")
     )
@@ -553,6 +599,10 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         for child_po in child_po_map.values():
             child_po.parent_id = parent_po.order_number
             child_po.save(update_fields=["parent_id"])
+
+        for mrp in all_mrps:
+            mrp.status = MaterialRequirementPlan.STATUS_CHOICES[1][0]  # conveted
+            mrp.save(update_fields=["status"])
 
         return Response(
             {
