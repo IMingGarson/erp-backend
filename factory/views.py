@@ -889,8 +889,17 @@ class BatchInventoryViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
 
 class BOMViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = BOM.objects.filter(is_active=True).order_by("-id")
+    queryset = (
+        BOM.objects.filter(is_active=True)
+        .select_related("parent", "parent__product_profile", "child")
+        .order_by("-id")
+    )
+
     serializer_class = BOMSerializer
+
+    filter_backends = [filters.DjangoFilterBackend, SearchFilter]
+    filterset_fields = ["parent__code", "parent__type", "child__code", "child__type"]
+    search_fields = ["parent__name", "parent__code", "child__name", "child__code"]
 
     def get_permissions(self):
         return [IsAuthenticated(), IsAdminOrEmployerOrReadOnly()]

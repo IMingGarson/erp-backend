@@ -79,6 +79,42 @@ class Material(models.Model):
         db_table = "materials"
 
 
+class ProductProfile(models.Model):
+    id = models.AutoField(primary_key=True)
+
+    material = models.OneToOneField(
+        Material,
+        on_delete=models.DO_NOTHING,
+        related_name="product_profile",
+        verbose_name="關聯成品",
+    )
+
+    spec = models.TextField(
+        blank=True,
+        null=True,
+        verbose_name="產品規格",
+        help_text="如: 1KG*25包/箱",
+    )
+    sales_unit = models.CharField(max_length=20, default="箱", verbose_name="銷售單位")
+    sales_price = models.DecimalField(
+        max_digits=15, decimal_places=2, null=True, blank=True, verbose_name="銷售單價"
+    )
+
+    label_info = models.JSONField(verbose_name="標籤資訊", default=dict, blank=True)
+    is_active = models.BooleanField(
+        default=True, db_index=True, verbose_name="是否啟用"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "product_profiles"
+        verbose_name = "成品專屬資訊"
+
+    def __str__(self):
+        return f"{self.material.name} - {self.spec}"
+
+
 class BOM(models.Model):
     id = models.AutoField(primary_key=True)
     parent = models.ForeignKey(
@@ -92,6 +128,9 @@ class BOM(models.Model):
         related_name="sub_material",
         on_delete=models.DO_NOTHING,
         verbose_name="半成品",
+    )
+    base_quantity = models.DecimalField(
+        max_digits=15, decimal_places=4, default=1, verbose_name="配方基數"
     )
     quantity_required = models.DecimalField(
         max_digits=15, decimal_places=4, verbose_name="需求數量"

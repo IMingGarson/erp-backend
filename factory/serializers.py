@@ -12,6 +12,7 @@ from .models import (
     MaterialRequirementPlan,
     ProductionLog,
     ProductionOrder,
+    ProductProfile,
     PurchaseRequisition,
     PurchaseRequisitionItem,
     UserProfile,
@@ -141,9 +142,16 @@ class UserUpdateSerializer(serializers.ModelSerializer):
         }
 
 
+class ProductProfileSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProductProfile
+        fields = ["spec", "sales_unit", "sales_price", "label_info"]
+
+
 class MaterialSerializer(serializers.ModelSerializer):
     is_raw_material = serializers.ReadOnlyField()
     creator_name = serializers.SerializerMethodField()
+    product_profile = ProductProfileSerializer(read_only=True)
 
     class Meta:
         model = Material
@@ -154,6 +162,7 @@ class MaterialSerializer(serializers.ModelSerializer):
             "type",
             "unit",
             "unit_price",
+            "product_profile",
             "is_active",
             "is_raw_material",
             "created_by",
@@ -196,25 +205,41 @@ class BatchInventorySerializer(serializers.ModelSerializer):
 
 
 class BOMSerializer(serializers.ModelSerializer):
-    parent_name = serializers.CharField(source="parent.name", read_only=True)
-    child_name = serializers.CharField(source="child.name", read_only=True)
-    child_code = serializers.CharField(source="child.code", read_only=True)
-    child_type = serializers.CharField(source="child.type", read_only=True)
+    parent = MaterialSerializer(read_only=True)
+    child = MaterialSerializer(read_only=True)
 
     class Meta:
         model = BOM
         fields = [
             "id",
             "parent",
-            "parent_name",
             "child",
-            "child_code",
-            "child_name",
-            "child_type",
-            "is_active",
             "quantity_required",
+            "base_quantity",
+            "is_active",
         ]
-        read_only_fields = ["id"]
+
+
+# class BOMSerializer(serializers.ModelSerializer):
+#     parent_name = serializers.CharField(source="parent.name", read_only=True)
+#     child_name = serializers.CharField(source="child.name", read_only=True)
+#     child_code = serializers.CharField(source="child.code", read_only=True)
+#     child_type = serializers.CharField(source="child.type", read_only=True)
+
+#     class Meta:
+#         model = BOM
+#         fields = [
+#             "id",
+#             "parent",
+#             "parent_name",
+#             "child",
+#             "child_code",
+#             "child_name",
+#             "child_type",
+#             "is_active",
+#             "quantity_required",
+#         ]
+#         read_only_fields = ["id"]
 
 
 class CustomerOrderSerializer(serializers.ModelSerializer):
