@@ -1,10 +1,9 @@
 from datetime import datetime, timedelta
-from decimal import Decimal, InvalidOperation
-
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.db import models, transaction
-from django.db.models import CharField, Prefetch, Q
+from django.db.models import CharField, Prefetch, Q, Sum
 from django.db.models.functions import Cast
 from django.utils import timezone
 from django_filters import rest_framework as filters
@@ -47,6 +46,7 @@ from .serializers import (
     ProductionOrderSerializer,
     PurchaseRequisitionSerializer,
     VendorSerializer,
+    RecallReportSerializer
 )
 
 
@@ -1144,3 +1144,123 @@ class CustomerOrderViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         queryset = self.get_queryset()
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
+
+def to_decimal4(value):
+    """轉換為精準的四位小數 Decimal"""
+    FOUR_DECIMALS = Decimal('0.0000')
+    if value is None or value == "":
+        return FOUR_DECIMALS
+    try:
+        return Decimal(str(value)).quantize(FOUR_DECIMALS, rounding=ROUND_HALF_UP)
+    except (ValueError, TypeError, InvalidOperation):
+        return FOUR_DECIMALS
+
+class TraceViewSet(viewsets.ViewSet):
+    """
+        取得特定異常物料的回收計畫書核心指標
+        
+        此 API 對應政府「產品回收計畫書」要求的各項指標，以傳入之異常物料 ID 為追溯源頭。
+        指標定義與系統取值邏輯對應如下：
+
+        1. 回收原料總量 (異常原料進貨總量/已投入量)
+           - 定義：投入生產的異常原料總和(kg)。
+           - 實作：遍歷所有啟用中的生產單 (ProductionOrder.materials_info)，進入 batches 陣列加總該異常物料的實際使用量 (used)。
+
+        2. 尚未使用原料總量 (異常原料在庫總量)
+           - 定義：尚未投入生產、仍在廠內的異常原料總量(kg)。
+           - 實作：查詢批號庫存 (BatchInventory) 中該物料的 remaining_qty 總和。
+
+        3. 產品生產總量 (各品項產品之總量)
+           - 定義：所有「有使用到該異常原料」的產品生產總重量(kg)。
+           - 實作：篩選出受污染的生產單，加總其 actual_qty (若無則取 target_qty)。
+
+        4. 尚未出貨產品總量 (各品項在庫總量)
+           - 定義：受污染的產品中，仍在廠內未出貨的總重量(kg)。
+           - 實作：針對受污染的生產單，取其 remaining_qty (總生產量扣除該生產單的總銷貨量)。
+
+        5. 下游總出貨總量 (已出貨至下游廠商之總量)
+           - 定義：受污染的產品中，已經隨著銷貨單流出廠外的總重量(kg)。
+           - 實作：針對受污染的生產單，加總其關聯之銷貨單 (DeliveryNote) 的 quantity。
+
+        備註：
+        - 第 6、7、8、9 項指標 (實際回收總量、回收率、處置方式、銷毀總量) 需由人員事後實體點交與勾選，不由此 API 直接計算。
+        - 採用 Decimal 計算到小數點下四位，以避免浮點數誤差。
+    """
+    def get_permissions(self):
+        return [IsAuthenticated()]
+
+    @action(detail=False, methods=['get'])
+    def recall_report(self, request):
+        """
+        取得特定異常物料的回收計畫書 5 大指標
+        Endpoint: /api/abnormality_trace/recall_report?material_id=XXX
+        """
+        material_id = request.query_params.get('material_id')
+
+        if not material_id:
+            return Response({"error": "必須提供 material_id"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            material = Material.objects.get(id=material_id)
+        except Material.DoesNotExist:
+            return Response({"error": "找不到該物料"}, status=status.HTTP_404_NOT_FOUND)
+
+        unused_raw_agg = BatchInventory.objects.filter(
+            material=material, 
+            is_active=True
+        ).aggregate(total=Sum('remaining_qty'))['total']
+    
+        used_raw_total = Decimal('0.0000')              # 指標 1
+        unused_raw_total = to_decimal4(unused_raw_agg)  # 指標 2
+        total_produced_product = Decimal('0.0000')      # 指標 3
+        total_in_stock_product = Decimal('0.0000')      # 指標 4
+        total_shipped_product = Decimal('0.0000')       # 指標 5
+
+        all_pos = ProductionOrder.objects.filter(is_active=True).prefetch_related('delivery_notes')
+        
+        tainted_pos = []
+        for po in all_pos:
+            is_tainted = False
+            materials_info = po.materials_info if isinstance(po.materials_info, list) else []
+            
+            for mat_info in materials_info:
+                if str(mat_info.get("code")) == material.code:
+                    is_tainted = True
+                    
+                    # 計算指標 1: 加總實際使用的原料
+                    batches = mat_info.get("batches", [])
+                    for b in batches:
+                        used_qty = to_decimal4(b.get("used", 0))
+                        used_raw_total += used_qty
+            
+            if is_tainted:
+                tainted_pos.append(po)
+
+        # ---------------------------------------------------------
+        # 計算指標 3, 4, 5 (基於受污染的生產單)
+        # ---------------------------------------------------------
+        for po in tainted_pos:
+            # 3. 產品生產總量 (優先看實際產出，若無則看目標產出)
+            product_qty_val = po.actual_qty if po.actual_qty is not None else po.target_qty
+            total_produced_product += to_decimal4(product_qty_val)
+
+            # 4. 尚未出貨產品總量 (直接讀取既有 property)
+            total_in_stock_product += to_decimal4(po.remaining_qty)
+
+            # 5. 下游總出貨總量 (直接加總所有出貨紀錄)
+            delivered_agg = po.delivery_notes.filter(is_active=True).aggregate(total=Sum('quantity'))['total']
+            total_shipped_product += to_decimal4(delivered_agg)
+
+        data = {
+            "material_id": material.id,
+            "material_name": material.name,
+            "material_code": material.code,
+            "used_raw_total": used_raw_total,
+            "unused_raw_total": unused_raw_total,
+            "total_produced_product": total_produced_product,
+            "total_in_stock_product": total_in_stock_product,
+            "total_shipped_product": total_shipped_product,
+        }
+
+        serializer = RecallReportSerializer(data)
+        return Response(serializer.data, status=status.HTTP_200_OK)

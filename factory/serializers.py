@@ -512,3 +512,20 @@ class DeliveryNoteSerializer(serializers.ModelSerializer):
             ).data
 
         return response
+
+# 追蹤追溯主要 API
+class RecallReportSerializer(serializers.Serializer):
+    material_id = serializers.IntegerField()
+    material_name = serializers.CharField()
+    material_code = serializers.CharField()
+    
+    # 1. 回收原料總量 (異常原料進貨總量/已投入量)
+    used_raw_total = serializers.DecimalField(max_digits=15, decimal_places=4)
+    # 2. 尚未使用原料總量 (異常原料在庫總量)
+    unused_raw_total = serializers.DecimalField(max_digits=15, decimal_places=4)
+    # 3. 產品生產總量 (牽涉到的成品總重量)
+    total_produced_product = serializers.DecimalField(max_digits=15, decimal_places=4)
+    # 4. 尚未出貨產品總量 (各品項在庫總量)
+    total_in_stock_product = serializers.DecimalField(max_digits=15, decimal_places=4)
+    # 5. 下游總出貨總量 (已出貨至下游廠商之總量)
+    total_shipped_product = serializers.DecimalField(max_digits=15, decimal_places=4)

@@ -22,6 +22,7 @@ from factory.views import (
     ProductionOrderViewSet,
     PurchaseRequisitionViewSet,
     VendorViewSet,
+    TraceViewSet
 )
 
 router = DefaultRouter(trailing_slash=False)
@@ -39,7 +40,7 @@ router.register(
 router.register(r"users", UserProfileViewSet, basename="users")
 router.register(r"delivery_notes", DeliveryNoteViewSet, basename="delivery-notes")
 router.register(r"customer_orders", CustomerOrderViewSet, basename="customer-orders")
-
+router.register(r'abnormality_trace', TraceViewSet, basename='abnormality-trace')
 
 urlpatterns = [
     path("admin/", admin.site.urls),
