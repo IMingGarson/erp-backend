@@ -29,7 +29,8 @@ class CurrentUserView(APIView):
             {
                 "id": user.id,
                 "username": user.username,
-                "department": user.profile.department
+                "department": user.profile.department,
+                "full_name": f"{user.last_name}{user.first_name}"
                 if hasattr(user, "profile")
                 else None,
                 "is_active": user.is_active,
