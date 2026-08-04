@@ -301,18 +301,18 @@ class MaterialRequirementPlanSerializer(serializers.ModelSerializer):
         if not value:
             return value
 
-        if not isinstance(value, dict):
-            raise serializers.ValidationError("批號分配資訊必須是 JSON 物件格式。")
+        if isinstance(value, dict):
+            value = list(value.values())
+        elif not isinstance(value, list):
+            raise serializers.ValidationError("批號分配資訊必須是 JSON 陣列格式。")
 
-        for mat_id_str, mat_info in value.items():
+        for mat_info in value:
             if not isinstance(mat_info, dict):
-                raise serializers.ValidationError(f"物料 {mat_id_str} 的資料結構錯誤。")
+                raise serializers.ValidationError("物料的資料結構錯誤。")
 
             batches = mat_info.get("batches", [])
             if not isinstance(batches, list):
-                raise serializers.ValidationError(
-                    f"物料 {mat_id_str} 的批號資料必須是陣列格式。"
-                )
+                raise serializers.ValidationError("物料的批號資料必須是陣列格式。")
 
             for batch in batches:
                 used = batch.get("used", 0)
