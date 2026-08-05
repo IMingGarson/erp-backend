@@ -219,29 +219,6 @@ class BOMSerializer(serializers.ModelSerializer):
             "is_active",
         ]
 
-
-# class BOMSerializer(serializers.ModelSerializer):
-#     parent_name = serializers.CharField(source="parent.name", read_only=True)
-#     child_name = serializers.CharField(source="child.name", read_only=True)
-#     child_code = serializers.CharField(source="child.code", read_only=True)
-#     child_type = serializers.CharField(source="child.type", read_only=True)
-
-#     class Meta:
-#         model = BOM
-#         fields = [
-#             "id",
-#             "parent",
-#             "parent_name",
-#             "child",
-#             "child_code",
-#             "child_name",
-#             "child_type",
-#             "is_active",
-#             "quantity_required",
-#         ]
-#         read_only_fields = ["id"]
-
-
 class CustomerOrderSerializer(serializers.ModelSerializer):
     product_id = serializers.PrimaryKeyRelatedField(
         queryset=Material.objects.all(), source="product", write_only=True
@@ -284,6 +261,7 @@ class MaterialRequirementPlanSerializer(serializers.ModelSerializer):
             "product_code",
             "used_batch_number",
             "unit",
+            "status",
             "is_active",
             "required_qty",
             "created_by",
@@ -360,12 +338,17 @@ class ProductionLogSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "created_at"]
 
 
+class SimpleProductSerializer(serializers.ModelSerializer):
+    spec = serializers.CharField(source="product_profile.spec", read_only=True)
+    sales_price = serializers.CharField(source="product_profile.sales_price", read_only=True)
+
+    class Meta:
+        model = Material
+        fields = ["id", "code", "name", "type", "unit", "sales_price", "spec"]
+
 class ProductionOrderSerializer(serializers.ModelSerializer):
+    product_profile = SimpleProductSerializer(source="product", read_only=True)
     used_batch_number = serializers.SerializerMethodField()
-    product_code = serializers.CharField(source="product.code", read_only=True)
-    product_name = serializers.CharField(source="product.name", read_only=True)
-    product_type = serializers.CharField(source="product.type", read_only=True)
-    product_unit = serializers.CharField(source="product.unit", read_only=True)
     creator_name = serializers.SerializerMethodField()
     is_fully_delivered = serializers.BooleanField(read_only=True)
     remaining_qty = serializers.DecimalField(
@@ -380,10 +363,7 @@ class ProductionOrderSerializer(serializers.ModelSerializer):
             "parent_id",
             "used_batch_number",
             "product_id",
-            "product_code",
-            "product_name",
-            "product_type",
-            "product_unit",
+            "product_profile",
             "target_qty",
             "actual_qty",
             "materials_info",

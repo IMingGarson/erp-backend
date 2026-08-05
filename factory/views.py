@@ -359,7 +359,6 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     queryset = (
         MaterialRequirementPlan.objects.filter(
             is_active=True,
-            status=MaterialRequirementPlan.STATUS_CHOICES[0][0],  # pending
         )
         .prefetch_related("customer_orders")
         .order_by("-created_at")
@@ -471,7 +470,7 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
         # 1. 撈出母單 (當前 PK 指定的 MRP)
         try:
-            parent_mrp = self.get_queryset().get(id=mrp_id)
+            parent_mrp = self.get_queryset().get(id=mrp_id, status=MaterialRequirementPlan.STATUS_CHOICES[0][0])
         except MaterialRequirementPlan.DoesNotExist:
             return Response(
                 {"error": "找不到此 MRP 母單"},
@@ -480,7 +479,8 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
         # 2. 撈出對應的所有子單
         children_mrps = MaterialRequirementPlan.objects.filter(
-            parent_id=parent_mrp.mrp_id
+            parent_id=parent_mrp.mrp_id,
+            status=MaterialRequirementPlan.STATUS_CHOICES[0][0]
         )
 
         all_mrps = [parent_mrp] + list(children_mrps)

@@ -287,22 +287,21 @@ class ProductionOrder(models.Model):
         ]
 
     @property
+    def active_delivered_qty(self):
+        """計算當前有效的累計出貨量"""
+        return self.delivery_notes.filter(is_active=True).aggregate(
+            total=Sum("quantity")
+        )["total"] or 0
+
+    @property
     def is_fully_delivered(self):
         """檢查該生產單的累計出貨量是否已經達到 target_qty"""
-        delivered_qty = (
-            self.delivery_notes.aggregate(total=Sum("quantity"))["total"] or 0
-        )
-
-        return delivered_qty >= self.target_qty
+        return self.active_delivered_qty >= self.target_qty
 
     @property
     def remaining_qty(self):
         """計算還剩下多少數量未出貨"""
-        delivered_qty = (
-            self.delivery_notes.aggregate(total=Sum("quantity"))["total"] or 0
-        )
-
-        return max(self.target_qty - delivered_qty, 0)
+        return max(self.target_qty - self.active_delivered_qty, 0)
 
 
 class LogisticsOrder(models.Model):
@@ -436,12 +435,23 @@ class RequisitionStatus(models.TextChoices):
 
 
 class PurchaseRequisition(models.Model):
+    STATUS_CHOICES = (
+        ("waiting", "待進貨"),
+        ("stocked", "已入庫"),
+    )
     request_date = models.DateField(verbose_name="申請日期")
     applicant = models.CharField(max_length=50, verbose_name="申請人")
     is_active = models.BooleanField(default=True, verbose_name="是否啟用")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    status = models.CharField(
+        max_length=20, 
+        choices=STATUS_CHOICES, 
+        default="waiting", 
+        verbose_name="單據狀態"
+    )
+    
     class Meta:
         db_table = "purchase_requests"
         verbose_name = "請購單"
@@ -516,7 +526,7 @@ class DeliveryNote(models.Model):
     )
     unit = models.CharField(max_length=20, blank=True, null=True, verbose_name="單位")
     spec = models.CharField(max_length=100, blank=True, null=True, verbose_name="規格")
-    unit_price = models.DecimalField(
+    sales_price = models.DecimalField(
         max_digits=15, decimal_places=2, null=True, blank=True, verbose_name="單價"
     )
     batch_number = models.CharField(
