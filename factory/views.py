@@ -631,7 +631,7 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     serializer_class = MaterialSerializer
 
     def get_permissions(self):
-        return [IsAuthenticated(), IsAdminOrEmployerOrReadOnly()]
+        return [IsAuthenticated(), IsRDOrReadOnly()]
 
     def get_queryset(self):
         queryset = Material.objects.filter(is_active=True).order_by("-id")
