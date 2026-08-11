@@ -2,8 +2,15 @@ from datetime import timedelta
 
 from django.contrib.auth.models import User
 from django.db import models
-from django.db.models import Sum
+from django.db.models import DecimalField, ExpressionWrapper, F, Sum
 from django.utils import timezone
+
+TYPE_CHOICES = (
+    ("RAW", "原物料"),
+    ("SEMI", "半成品"),
+    ("PRODUCT", "成品"),
+    ("PACK", "包材"),
+)
 
 
 def get_default_expiration_date():
@@ -43,26 +50,139 @@ class UserProfile(models.Model):
         db_table = "user_profiles"
 
 
-class Material(models.Model):
-    TYPE_CHOICES = (
-        ("RAW", "原物料"),
-        ("SEMI", "半成品"),
-        ("PRODUCT", "成品"),
-        ("PACK", "包材"),
+class Vendor(models.Model):
+    id = models.AutoField(primary_key=True)
+    name = models.CharField(max_length=255, verbose_name="客戶名稱")
+    code = models.CharField(
+        max_length=64,
+        verbose_name="客戶代號",
+        default="PLACEHOLDER",
+        null=False,
+        blank=False,
     )
+    tax_id = models.CharField(
+        max_length=8, blank=True, null=True, verbose_name="統一編號"
+    )
+    address = models.CharField(
+        max_length=255, blank=True, null=True, verbose_name="地址"
+    )
+    phone = models.CharField(
+        max_length=50, blank=True, null=True, verbose_name="聯絡電話"
+    )
+    contact_person = models.CharField(
+        max_length=100, blank=True, null=True, verbose_name="負責人名稱"
+    )
+    is_deleted = models.BooleanField(default=False, verbose_name="是否移除")
+    created_at = models.DateTimeField(auto_now_add=True)
+    created_by = models.ForeignKey(User, on_delete=models.DO_NOTHING, default=None)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "vendors"
+        verbose_name = "客戶"
+
+    def __str__(self):
+        return self.name
+
+
+class MaterialProvider(models.Model):
+    id = models.AutoField(primary_key=True)
+    name = models.CharField(max_length=255, verbose_name="供應商名稱")
+    code = models.CharField(
+        max_length=64,
+        verbose_name="供應商代號",
+        default="PLACEHOLDER",
+        null=False,
+        blank=False,
+    )
+    fax = models.CharField(
+        max_length=10, blank=True, null=True, verbose_name="傳真號碼"
+    )
+    tax_id = models.CharField(
+        max_length=10, blank=True, null=True, verbose_name="統一編號"
+    )
+    address = models.CharField(
+        max_length=255, blank=True, null=True, verbose_name="公司地址"
+    )
+    invoice_address = models.CharField(
+        max_length=255, blank=True, null=True, verbose_name="發票地址"
+    )
+    delivery_address = models.CharField(
+        max_length=255, blank=True, null=True, verbose_name="送貨地址"
+    )
+    phone = models.CharField(
+        max_length=50, blank=True, null=True, verbose_name="聯絡電話"
+    )
+    contact_person = models.CharField(
+        max_length=100, blank=True, null=True, verbose_name="負責人名稱"
+    )
+    contact_email = models.CharField(
+        max_length=100, blank=True, null=True, verbose_name="聯絡 Email"
+    )
+    bank_name = models.CharField(
+        max_length=100, blank=True, null=True, verbose_name="銀行名稱"
+    )
+    bank_account = models.CharField(
+        max_length=100, blank=True, null=True, verbose_name="銀行帳號"
+    )
+    note = models.TextField(verbose_name="備註")
+    is_active = models.BooleanField(default=True, verbose_name="是否啟用")
+    created_at = models.DateTimeField(auto_now_add=True)
+    created_by = models.ForeignKey(User, on_delete=models.DO_NOTHING, default=None)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "material_providers"
+        verbose_name = "原物料供應商"
+
+    def __str__(self):
+        return self.name
+
+
+class Material(models.Model):
+    PHASE_CHOICE = (("IN_DEV", "開發"), ("IN_PROD", "正式"))
     code = models.CharField(
         max_length=30, db_index=True, unique=True, verbose_name="物料代號"
     )
-    name = models.CharField(max_length=100, verbose_name="物料名稱")
+    name = models.CharField(
+        max_length=100, default="未命名物料", verbose_name="物料名稱"
+    )
+    english_name = models.CharField(
+        max_length=100, null=True, verbose_name="物料英文名稱"
+    )
     type = models.CharField(
         max_length=10, choices=TYPE_CHOICES, verbose_name="物料類型"
     )
-    unit = models.CharField(max_length=20, verbose_name="單位")
-    unit_price = models.DecimalField(
-        max_digits=10, decimal_places=2, null=True, blank=True, verbose_name="單價"
+    unit = models.CharField(max_length=10, default="KG", verbose_name="單位")
+    allergen_info = models.CharField(
+        max_length=100, blank=True, null=True, verbose_name="過敏原資訊"
     )
+    storage_life = models.CharField(
+        max_length=50, blank=True, null=True, verbose_name="保存期限"
+    )
+    description = models.TextField(
+        blank=True, null=True, verbose_name="描述 (成分來源)"
+    )
+
+    additive_license_no = models.CharField(
+        max_length=100, blank=True, null=True, verbose_name="添加物許可證號"
+    )
+    license_valid_date = models.DateField(
+        blank=True, null=True, verbose_name="許可證效期"
+    )
+    product_registration_no = models.CharField(
+        max_length=100, blank=True, null=True, verbose_name="產品登錄號"
+    )
+    origin = models.CharField(max_length=50, blank=True, null=True, verbose_name="產地")
+
     is_active = models.BooleanField(
         default=True, db_index=True, verbose_name="是否啟用"
+    )
+    phase = models.CharField(
+        max_length=10,
+        choices=PHASE_CHOICE,
+        default="IN_PROD",
+        verbose_name="物料使用階段",
     )
     created_by = models.ForeignKey(User, on_delete=models.DO_NOTHING)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -71,6 +191,52 @@ class Material(models.Model):
     @property
     def is_raw_material(self):
         return self.type == "RAW" or self.code.startswith("R")
+
+    @property
+    def estimated_cost(self):
+        """
+        計算預估成本 (過去三個月的加權平均成本)：
+        公式 = (Σ(數量 * 採購單價)) / Σ總數量
+        若過去三個月無採購紀錄，則取歷史最新一次的單價；若完全無紀錄則回傳 0。
+        """
+        three_months_ago = timezone.now().date() - timedelta(days=90)
+
+        recent_purchases = self.purchase_items.filter(
+            is_active=True,
+            requisition__is_active=True,
+            requisition__status="stocked",
+            requisition__request_date__gte=three_months_ago,
+        )
+
+        aggregates = recent_purchases.aggregate(
+            total_quantity=Sum("quantity"),
+            total_value=Sum(
+                ExpressionWrapper(
+                    F("quantity") * F("purchased_price"), output_field=DecimalField()
+                )
+            ),
+        )
+
+        total_qty = aggregates.get("total_quantity")
+        total_val = aggregates.get("total_value")
+
+        if total_qty and total_qty > 0 and total_val is not None:
+            return round(total_val / total_qty, 2)
+
+        latest_purchase = (
+            self.purchase_items.filter(
+                is_active=True,
+                requisition__status="stocked",
+                requisition__is_active=True,
+            )
+            .order_by("-requisition__request_date", "-id")
+            .first()
+        )
+
+        if latest_purchase:
+            return latest_purchase.purchased_price
+
+        return 0
 
     def __str__(self):
         return f"{self.code} - {self.name}"
@@ -82,10 +248,10 @@ class Material(models.Model):
 class ProductProfile(models.Model):
     id = models.AutoField(primary_key=True)
 
-    material = models.OneToOneField(
+    material = models.ForeignKey(
         Material,
         on_delete=models.DO_NOTHING,
-        related_name="product_profile",
+        related_name="product_profiles",
         verbose_name="關聯成品",
     )
 
@@ -95,9 +261,20 @@ class ProductProfile(models.Model):
         verbose_name="產品規格",
         help_text="如: 1KG*25包/箱",
     )
-    sales_unit = models.CharField(max_length=20, default="箱", verbose_name="銷售單位")
+    sales_unit = models.CharField(max_length=10, default="箱", verbose_name="銷售單位")
+    sales_pack_unit = models.CharField(
+        max_length=10, default="包", verbose_name="銷售輔助單位"
+    )
     sales_price = models.DecimalField(
         max_digits=15, decimal_places=2, null=True, blank=True, verbose_name="銷售單價"
+    )
+    vendor = models.ForeignKey(
+        Vendor,
+        on_delete=models.DO_NOTHING,
+        related_name="clients",
+        verbose_name="購買客戶",
+        null=True,
+        blank=True,
     )
 
     label_info = models.JSONField(verbose_name="標籤資訊", default=dict, blank=True)
@@ -289,9 +466,12 @@ class ProductionOrder(models.Model):
     @property
     def active_delivered_qty(self):
         """計算當前有效的累計出貨量"""
-        return self.delivery_notes.filter(is_active=True).aggregate(
-            total=Sum("quantity")
-        )["total"] or 0
+        return (
+            self.delivery_notes.filter(is_active=True).aggregate(total=Sum("quantity"))[
+                "total"
+            ]
+            or 0
+        )
 
     @property
     def is_fully_delivered(self):
@@ -318,41 +498,6 @@ class LogisticsOrder(models.Model):
     class Meta:
         db_table = "logistics_orders"
         verbose_name = "物流單"
-
-
-class Vendor(models.Model):
-    id = models.AutoField(primary_key=True)
-    name = models.CharField(max_length=255, verbose_name="客戶名稱")
-    code = models.CharField(
-        max_length=64,
-        verbose_name="客戶代號",
-        default="PLACEHOLDER",
-        null=False,
-        blank=False,
-    )
-    tax_id = models.CharField(
-        max_length=8, blank=True, null=True, verbose_name="統一編號"
-    )
-    address = models.CharField(
-        max_length=255, blank=True, null=True, verbose_name="地址"
-    )
-    phone = models.CharField(
-        max_length=50, blank=True, null=True, verbose_name="聯絡電話"
-    )
-    contact_person = models.CharField(
-        max_length=100, blank=True, null=True, verbose_name="負責人名稱"
-    )
-    is_deleted = models.BooleanField(default=False, verbose_name="是否移除")
-    created_at = models.DateTimeField(auto_now_add=True)
-    created_by = models.ForeignKey(User, on_delete=models.DO_NOTHING, default=None)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        db_table = "vendors"
-        verbose_name = "客戶"
-
-    def __str__(self):
-        return self.name
 
 
 class ProductionLog(models.Model):
@@ -446,12 +591,12 @@ class PurchaseRequisition(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     status = models.CharField(
-        max_length=20, 
-        choices=STATUS_CHOICES, 
-        default="waiting", 
-        verbose_name="單據狀態"
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default="waiting",
+        verbose_name="單據狀態",
     )
-    
+
     class Meta:
         db_table = "purchase_requests"
         verbose_name = "請購單"
@@ -473,6 +618,13 @@ class PurchaseRequisitionItem(models.Model):
         related_name="purchase_items",
         verbose_name="請購物料",
     )
+    material_provider = models.ForeignKey(
+        MaterialProvider,
+        on_delete=models.DO_NOTHING,
+        null=True,
+        blank=True,
+        verbose_name="供應商",
+    )
     quantity = models.DecimalField(max_digits=10, decimal_places=2, verbose_name="數量")
     unit = models.CharField(max_length=10, default="Kg", verbose_name="單位")
     purchased_price = models.DecimalField(
@@ -484,9 +636,6 @@ class PurchaseRequisitionItem(models.Model):
     )
     expected_delivery_date = models.DateField(
         null=True, blank=True, verbose_name="預計到貨日期"
-    )
-    supplier = models.CharField(
-        max_length=100, null=True, blank=True, verbose_name="供應商"
     )
     remark = models.TextField(null=True, blank=True, verbose_name="備註")
     is_active = models.BooleanField(default=True, verbose_name="是否啟用")

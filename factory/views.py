@@ -1,10 +1,21 @@
 from datetime import datetime, timedelta
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.db import models, transaction
-from django.db.models import CharField, Prefetch, Q, Sum
-from django.db.models.functions import Cast
+from django.db.models import (
+    CharField,
+    ExpressionWrapper,
+    F,
+    FloatField,
+    OuterRef,
+    Prefetch,
+    Q,
+    Subquery,
+    Sum,
+)
+from django.db.models.functions import Cast, Coalesce
 from django.utils import timezone
 from django_filters import rest_framework as filters
 from rest_framework import status, viewsets
@@ -25,6 +36,7 @@ from .models import (
     DeliveryNoteLog,
     Material,
     MaterialLog,
+    MaterialProvider,
     MaterialRequirementPlan,
     MaterialRequirementPlanLog,
     ProductionLog,
@@ -41,12 +53,13 @@ from .serializers import (
     BOMSerializer,
     CustomerOrderSerializer,
     DeliveryNoteSerializer,
+    MaterialProviderSerializer,
     MaterialRequirementPlanSerializer,
     MaterialSerializer,
     ProductionOrderSerializer,
     PurchaseRequisitionSerializer,
+    RecallReportSerializer,
     VendorSerializer,
-    RecallReportSerializer
 )
 
 
@@ -201,8 +214,7 @@ class CRUDAuditMixin:
 
         if changes:
             action_detail = f"{full_username} 更新了: " + "，".join(changes)
-
-        self._record_db_log(instance, user, action_detail)
+            self._record_db_log(instance, user, action_detail)
 
     def perform_destroy(self, instance):
         user = self.get_valid_user()
@@ -470,7 +482,9 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
         # 1. 撈出母單 (當前 PK 指定的 MRP)
         try:
-            parent_mrp = self.get_queryset().get(id=mrp_id, status=MaterialRequirementPlan.STATUS_CHOICES[0][0])
+            parent_mrp = self.get_queryset().get(
+                id=mrp_id, status=MaterialRequirementPlan.STATUS_CHOICES[0][0]
+            )
         except MaterialRequirementPlan.DoesNotExist:
             return Response(
                 {"error": "找不到此 MRP 母單"},
@@ -480,7 +494,7 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         # 2. 撈出對應的所有子單
         children_mrps = MaterialRequirementPlan.objects.filter(
             parent_id=parent_mrp.mrp_id,
-            status=MaterialRequirementPlan.STATUS_CHOICES[0][0]
+            status=MaterialRequirementPlan.STATUS_CHOICES[0][0],
         )
 
         all_mrps = [parent_mrp] + list(children_mrps)
@@ -614,11 +628,70 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
 
 class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
-    queryset = Material.objects.filter(is_active=True).order_by("-id")
     serializer_class = MaterialSerializer
 
     def get_permissions(self):
         return [IsAuthenticated(), IsAdminOrEmployerOrReadOnly()]
+
+    def get_queryset(self):
+        queryset = Material.objects.filter(is_active=True).order_by("-id")
+
+        user = self.request.user
+        is_rd = (
+            user.is_authenticated
+            and hasattr(user, "profile")
+            and user.profile.department.upper() == "RD"
+        )
+        # 只有研發才會 access 到開發中的原物料
+        if not is_rd:
+            queryset = queryset.filter(phase="IN_PROD")
+
+        # 處理 list 可能碰到的 N+1 問題
+        if self.action == "list":
+            three_months_ago = timezone.now().date() - timedelta(days=90)
+
+            recent_items = PurchaseRequisitionItem.objects.filter(
+                material=OuterRef("pk"),
+                is_active=True,
+                requisition__is_active=True,
+                requisition__status="stocked",
+                requisition__request_date__gte=three_months_ago,
+            ).values("material")
+
+            recent_avg_cost = recent_items.annotate(
+                total_qty=Sum("quantity"),
+                total_val=Sum(
+                    ExpressionWrapper(
+                        F("quantity") * F("purchased_price"), output_field=FloatField()
+                    )
+                ),
+            ).values(
+                avg_cost=ExpressionWrapper(
+                    F("total_val") / F("total_qty"), output_field=FloatField()
+                )
+            )[:1]
+
+            fallback_latest_cost = (
+                PurchaseRequisitionItem.objects.filter(
+                    material=OuterRef("pk"),
+                    is_active=True,
+                    requisition__is_active=True,
+                    requisition__status="stocked",
+                )
+                .order_by("-requisition__request_date", "-id")
+                .values("purchased_price")[:1]
+            )
+
+            queryset = queryset.annotate(
+                annotated_estimated_cost=Coalesce(
+                    Subquery(recent_avg_cost, output_field=FloatField()),
+                    Subquery(fallback_latest_cost, output_field=FloatField()),
+                    0.0,
+                    output_field=FloatField(),
+                )
+            )
+
+        return queryset
 
 
 class VendorViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
@@ -639,6 +712,14 @@ class VendorViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
             return Response({"message": "no data"}, status=status.HTTP_200_OK)
 
         return Response(self.serializer_class(vendor).data, status=status.HTTP_200_OK)
+
+
+class MaterialProviderViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
+    queryset = MaterialProvider.objects.filter(is_active=True).order_by("-id")
+    serializer_class = MaterialProviderSerializer
+
+    def get_permissions(self):
+        return [IsAuthenticated(), IsRDOrReadOnly()]
 
 
 class BatchInventoryViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
@@ -891,7 +972,8 @@ class BatchInventoryViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 class BOMViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = (
         BOM.objects.filter(is_active=True)
-        .select_related("parent", "parent__product_profile", "child")
+        .select_related("parent", "child")
+        .prefetch_related("parent__product_profiles", "child__product_profiles")
         .order_by("-id")
     )
 
@@ -1145,9 +1227,10 @@ class CustomerOrderViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
 
+
 def to_decimal4(value):
     """轉換為精準的四位小數 Decimal"""
-    FOUR_DECIMALS = Decimal('0.0000')
+    FOUR_DECIMALS = Decimal("0.0000")
     if value is None or value == "":
         return FOUR_DECIMALS
     try:
@@ -1155,50 +1238,54 @@ def to_decimal4(value):
     except (ValueError, TypeError, InvalidOperation):
         return FOUR_DECIMALS
 
+
 class TraceViewSet(viewsets.ViewSet):
     """
-        取得特定異常物料的回收計畫書核心指標
-        
-        此 API 對應政府「產品回收計畫書」要求的各項指標，以傳入之異常物料 ID 為追溯源頭。
-        指標定義與系統取值邏輯對應如下：
+    取得特定異常物料的回收計畫書核心指標
 
-        1. 回收原料總量 (異常原料進貨總量/已投入量)
-           - 定義：投入生產的異常原料總和(kg)。
-           - 實作：遍歷所有啟用中的生產單 (ProductionOrder.materials_info)，進入 batches 陣列加總該異常物料的實際使用量 (used)。
+    此 API 對應政府「產品回收計畫書」要求的各項指標，以傳入之異常物料 ID 為追溯源頭。
+    指標定義與系統取值邏輯對應如下：
 
-        2. 尚未使用原料總量 (異常原料在庫總量)
-           - 定義：尚未投入生產、仍在廠內的異常原料總量(kg)。
-           - 實作：查詢批號庫存 (BatchInventory) 中該物料的 remaining_qty 總和。
+    1. 回收原料總量 (異常原料進貨總量/已投入量)
+       - 定義：投入生產的異常原料總和(kg)。
+       - 實作：遍歷所有啟用中的生產單 (ProductionOrder.materials_info)，進入 batches 陣列加總該異常物料的實際使用量 (used)。
 
-        3. 產品生產總量 (各品項產品之總量)
-           - 定義：所有「有使用到該異常原料」的產品生產總重量(kg)。
-           - 實作：篩選出受污染的生產單，加總其 actual_qty (若無則取 target_qty)。
+    2. 尚未使用原料總量 (異常原料在庫總量)
+       - 定義：尚未投入生產、仍在廠內的異常原料總量(kg)。
+       - 實作：查詢批號庫存 (BatchInventory) 中該物料的 remaining_qty 總和。
 
-        4. 尚未出貨產品總量 (各品項在庫總量)
-           - 定義：受污染的產品中，仍在廠內未出貨的總重量(kg)。
-           - 實作：針對受污染的生產單，取其 remaining_qty (總生產量扣除該生產單的總銷貨量)。
+    3. 產品生產總量 (各品項產品之總量)
+       - 定義：所有「有使用到該異常原料」的產品生產總重量(kg)。
+       - 實作：篩選出受污染的生產單，加總其 actual_qty (若無則取 target_qty)。
 
-        5. 下游總出貨總量 (已出貨至下游廠商之總量)
-           - 定義：受污染的產品中，已經隨著銷貨單流出廠外的總重量(kg)。
-           - 實作：針對受污染的生產單，加總其關聯之銷貨單 (DeliveryNote) 的 quantity。
+    4. 尚未出貨產品總量 (各品項在庫總量)
+       - 定義：受污染的產品中，仍在廠內未出貨的總重量(kg)。
+       - 實作：針對受污染的生產單，取其 remaining_qty (總生產量扣除該生產單的總銷貨量)。
 
-        備註：
-        - 第 6、7、8、9 項指標 (實際回收總量、回收率、處置方式、銷毀總量) 需由人員事後實體點交與勾選，不由此 API 直接計算。
-        - 採用 Decimal 計算到小數點下四位，以避免浮點數誤差。
+    5. 下游總出貨總量 (已出貨至下游廠商之總量)
+       - 定義：受污染的產品中，已經隨著銷貨單流出廠外的總重量(kg)。
+       - 實作：針對受污染的生產單，加總其關聯之銷貨單 (DeliveryNote) 的 quantity。
+
+    備註：
+    - 第 6、7、8、9 項指標 (實際回收總量、回收率、處置方式、銷毀總量) 需由人員事後實體點交與勾選，不由此 API 直接計算。
+    - 採用 Decimal 計算到小數點下四位，以避免浮點數誤差。
     """
+
     def get_permissions(self):
         return [IsAuthenticated()]
 
-    @action(detail=False, methods=['get'])
+    @action(detail=False, methods=["get"])
     def recall_report(self, request):
         """
         取得特定異常物料的回收計畫書 5 大指標
         Endpoint: /api/abnormality_trace/recall_report?material_id=XXX
         """
-        material_id = request.query_params.get('material_id')
+        material_id = request.query_params.get("material_id")
 
         if not material_id:
-            return Response({"error": "必須提供 material_id"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"error": "必須提供 material_id"}, status=status.HTTP_400_BAD_REQUEST
+            )
 
         try:
             material = Material.objects.get(id=material_id)
@@ -1206,33 +1293,36 @@ class TraceViewSet(viewsets.ViewSet):
             return Response({"error": "找不到該物料"}, status=status.HTTP_404_NOT_FOUND)
 
         unused_raw_agg = BatchInventory.objects.filter(
-            material=material, 
-            is_active=True
-        ).aggregate(total=Sum('remaining_qty'))['total']
-    
-        used_raw_total = Decimal('0.0000')              # 指標 1
-        unused_raw_total = to_decimal4(unused_raw_agg)  # 指標 2
-        total_produced_product = Decimal('0.0000')      # 指標 3
-        total_in_stock_product = Decimal('0.0000')      # 指標 4
-        total_shipped_product = Decimal('0.0000')       # 指標 5
+            material=material, is_active=True
+        ).aggregate(total=Sum("remaining_qty"))["total"]
 
-        all_pos = ProductionOrder.objects.filter(is_active=True).prefetch_related('delivery_notes')
-        
+        used_raw_total = Decimal("0.0000")  # 指標 1
+        unused_raw_total = to_decimal4(unused_raw_agg)  # 指標 2
+        total_produced_product = Decimal("0.0000")  # 指標 3
+        total_in_stock_product = Decimal("0.0000")  # 指標 4
+        total_shipped_product = Decimal("0.0000")  # 指標 5
+
+        all_pos = ProductionOrder.objects.filter(is_active=True).prefetch_related(
+            "delivery_notes"
+        )
+
         tainted_pos = []
         for po in all_pos:
             is_tainted = False
-            materials_info = po.materials_info if isinstance(po.materials_info, list) else []
-            
+            materials_info = (
+                po.materials_info if isinstance(po.materials_info, list) else []
+            )
+
             for mat_info in materials_info:
                 if str(mat_info.get("code")) == material.code:
                     is_tainted = True
-                    
+
                     # 計算指標 1: 加總實際使用的原料
                     batches = mat_info.get("batches", [])
                     for b in batches:
                         used_qty = to_decimal4(b.get("used", 0))
                         used_raw_total += used_qty
-            
+
             if is_tainted:
                 tainted_pos.append(po)
 
@@ -1241,14 +1331,18 @@ class TraceViewSet(viewsets.ViewSet):
         # ---------------------------------------------------------
         for po in tainted_pos:
             # 3. 產品生產總量 (優先看實際產出，若無則看目標產出)
-            product_qty_val = po.actual_qty if po.actual_qty is not None else po.target_qty
+            product_qty_val = (
+                po.actual_qty if po.actual_qty is not None else po.target_qty
+            )
             total_produced_product += to_decimal4(product_qty_val)
 
             # 4. 尚未出貨產品總量 (直接讀取既有 property)
             total_in_stock_product += to_decimal4(po.remaining_qty)
 
             # 5. 下游總出貨總量 (直接加總所有出貨紀錄)
-            delivered_agg = po.delivery_notes.filter(is_active=True).aggregate(total=Sum('quantity'))['total']
+            delivered_agg = po.delivery_notes.filter(is_active=True).aggregate(
+                total=Sum("quantity")
+            )["total"]
             total_shipped_product += to_decimal4(delivered_agg)
 
         data = {
