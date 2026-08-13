@@ -225,6 +225,14 @@ class MaterialSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ["id", "created_by", "created_at", "updated_at"]
 
+    def to_internal_value(self, data):
+        mutable_data = data.copy()
+
+        if mutable_data.get("license_valid_date") == "":
+            mutable_data["license_valid_date"] = None
+
+        return super().to_internal_value(mutable_data)
+
     def get_creator_name(self, obj):
         if obj.created_by:
             return f"{obj.created_by.last_name}{obj.created_by.first_name}"
@@ -265,16 +273,26 @@ class BatchInventorySerializer(serializers.ModelSerializer):
 class BOMSerializer(serializers.ModelSerializer):
     parent = MaterialSerializer(read_only=True)
     child = MaterialSerializer(read_only=True)
+    parent_id = serializers.PrimaryKeyRelatedField(
+        queryset=Material.objects.all(), source="parent", write_only=True
+    )
+    child_id = serializers.PrimaryKeyRelatedField(
+        queryset=Material.objects.all(), source="child", write_only=True
+    )
 
     class Meta:
         model = BOM
         fields = [
             "id",
             "parent",
-            "child",
-            "quantity_required",
+            "child",  # For GET method
+            "parent_id",
+            "child_id",  # For POST/PUT method
             "base_quantity",
+            "quantity_required",
             "is_active",
+            "created_at",
+            "updated_at",
         ]
 
 
@@ -508,7 +526,18 @@ class PurchaseRequisitionItemSerializer(serializers.ModelSerializer):
     material_id = serializers.PrimaryKeyRelatedField(
         queryset=Material.objects.all(), source="material"
     )
-    purchased_price = serializers.IntegerField(required=True, allow_null=False)
+    material_provider_id = serializers.PrimaryKeyRelatedField(
+        queryset=MaterialProvider.objects.all(),
+        source="material_provider",
+        required=False,
+        allow_null=True,
+    )
+    purchased_price = serializers.DecimalField(
+        max_digits=10, decimal_places=2, required=True
+    )
+
+    material_name = serializers.ReadOnlyField()
+    provider_name = serializers.SerializerMethodField()
 
     class Meta:
         model = PurchaseRequisitionItem
@@ -518,11 +547,17 @@ class PurchaseRequisitionItemSerializer(serializers.ModelSerializer):
             "quantity",
             "unit",
             "expected_delivery_date",
-            "material_provider",
+            "material_provider_id",
+            "provider_name",
             "remark",
             "purchased_price",
             "material_name",
         ]
+
+    def get_provider_name(self, obj):
+        if obj.material_provider:
+            return obj.material_provider.name
+        return ""
 
 
 class PurchaseRequisitionSerializer(serializers.ModelSerializer):

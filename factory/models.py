@@ -148,7 +148,7 @@ class Material(models.Model):
         max_length=100, default="未命名物料", verbose_name="物料名稱"
     )
     english_name = models.CharField(
-        max_length=100, null=True, verbose_name="物料英文名稱"
+        max_length=100, blank=True, null=True, verbose_name="物料英文名稱"
     )
     type = models.CharField(
         max_length=10, choices=TYPE_CHOICES, verbose_name="物料類型"
@@ -195,10 +195,30 @@ class Material(models.Model):
     @property
     def estimated_cost(self):
         """
-        計算預估成本 (過去三個月的加權平均成本)：
-        公式 = (Σ(數量 * 採購單價)) / Σ總數量
-        若過去三個月無採購紀錄，則取歷史最新一次的單價；若完全無紀錄則回傳 0。
+        計算預估成本：
+        - 若為 PRODUCT 或 SEMI：依據 BOM 展開，計算 (Σ(子物料成本 * 需求量)) / 配方基數。
+        - 若為 RAW：取過去三個月的加權平均採購成本，或歷史最新單價。
         """
+        if self.type in {"PRODUCT", "SEMI"}:
+            boms = [bom for bom in self.main_product.all() if bom.is_active]
+
+            if not boms:
+                return 0.0
+
+            total_cost = sum(
+                float(bom.child.estimated_cost if bom.child else 0)
+                * float(bom.quantity_required)
+                for bom in boms
+            )
+
+            base_qty = float(boms[0].base_quantity)
+
+            return round(total_cost / base_qty, 2) if base_qty > 0 else 0.0
+
+        annotated_cost = getattr(self, "annotated_estimated_cost", None)
+        if annotated_cost is not None:
+            return round(annotated_cost, 2)
+
         three_months_ago = timezone.now().date() - timedelta(days=90)
 
         recent_purchases = self.purchase_items.filter(
@@ -233,10 +253,7 @@ class Material(models.Model):
             .first()
         )
 
-        if latest_purchase:
-            return latest_purchase.purchased_price
-
-        return 0
+        return latest_purchase.purchased_price if latest_purchase else 0.0
 
     def __str__(self):
         return f"{self.code} - {self.name}"

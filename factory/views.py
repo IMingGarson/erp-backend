@@ -1,8 +1,6 @@
 from datetime import datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
-from django.conf import settings
-from django.contrib.auth.models import User
 from django.db import models, transaction
 from django.db.models import (
     CharField,
@@ -78,13 +76,6 @@ class CRUDAuditMixin:
 
     def get_valid_user(self):
         """獲取並驗證當前使用者"""
-        if getattr(settings, "ENV", "dev") == "dev" and getattr(
-            settings, "DEBUG", False
-        ):
-            user = User.objects.first()
-            if user:
-                return user
-
         user = self.request.user
         if user and user.is_authenticated:
             return user
@@ -253,6 +244,7 @@ class CRUDAuditMixin:
         elif model_name == "PurchaseRequisition":
             instance.is_active = False
             instance.save(update_fields=["is_active"])
+            instance.items.update(is_active=False)
             action_detail = f"{full_username} 刪除了請購單 #{instance.id}"
 
         elif model_name == "Material":
@@ -646,7 +638,7 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         if not is_rd:
             queryset = queryset.filter(phase="IN_PROD")
 
-        # 處理 list 可能碰到的 N+1 問題
+        # 處理 N+1
         if self.action == "list":
             three_months_ago = timezone.now().date() - timedelta(days=90)
 
@@ -682,13 +674,25 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 .values("purchased_price")[:1]
             )
 
-            queryset = queryset.annotate(
-                annotated_estimated_cost=Coalesce(
-                    Subquery(recent_avg_cost, output_field=FloatField()),
-                    Subquery(fallback_latest_cost, output_field=FloatField()),
-                    0.0,
-                    output_field=FloatField(),
-                )
+            cost_annotation = Coalesce(
+                Subquery(recent_avg_cost, output_field=FloatField()),
+                Subquery(fallback_latest_cost, output_field=FloatField()),
+                0.0,
+                output_field=FloatField(),
+            )
+
+            queryset = queryset.annotate(annotated_estimated_cost=cost_annotation)
+
+            annotated_material_qs = Material.objects.filter(is_active=True).annotate(
+                annotated_estimated_cost=cost_annotation
+            )
+
+            queryset = queryset.prefetch_related(
+                Prefetch("main_product__child", queryset=annotated_material_qs),
+                Prefetch(
+                    "main_product__child__main_product__child",
+                    queryset=annotated_material_qs,
+                ),
             )
 
         return queryset
@@ -969,7 +973,7 @@ class BatchInventoryViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         return Response(results, status=status.HTTP_200_OK)
 
 
-class BOMViewSet(viewsets.ReadOnlyModelViewSet):
+class BOMViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     queryset = (
         BOM.objects.filter(is_active=True)
         .select_related("parent", "child")
@@ -984,14 +988,16 @@ class BOMViewSet(viewsets.ReadOnlyModelViewSet):
     search_fields = ["parent__name", "parent__code", "child__name", "child__code"]
 
     def get_permissions(self):
-        return [IsAuthenticated(), IsAdminOrEmployerOrReadOnly()]
+        return [IsAuthenticated()]
+        # return [IsAuthenticated(), IsAdminOrEmployerOrReadOnly()]
 
 
 class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     serializer_class = PurchaseRequisitionSerializer
 
     def get_permissions(self):
-        return [IsAuthenticated(), IsAdminOrEmployerOrReadOnly()]
+        return [IsAuthenticated()]
+        # return [IsAuthenticated(), IsAdminOrEmployerOrReadOnly()]
 
     @action(detail=False, methods=["get"], url_path="prev_purchase_price")
     def get_latest_price(self, request):
@@ -1010,13 +1016,15 @@ class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         latest_item = (
             PurchaseRequisitionItem.objects.filter(
                 material_id=material_id,
+                is_active=True,
                 purchased_price__isnull=False,
+                requisition__status="stocked",
+                requisition__is_active=True,
             )
             .select_related("requisition")
             .order_by("-requisition__request_date", "-id")
             .first()
         )
-
         if latest_item:
             return Response(
                 {"latest_price": latest_item.purchased_price}, status=status.HTTP_200_OK
