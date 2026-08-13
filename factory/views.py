@@ -621,6 +621,10 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
 class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     serializer_class = MaterialSerializer
+    filter_backends = [filters.DjangoFilterBackend, SearchFilter]
+
+    filterset_fields = ["code", "type", "phase", "is_active"]
+    search_fields = ["name", "code", "english_name"]
 
     def get_permissions(self):
         return [IsAuthenticated(), IsRDOrReadOnly()]
