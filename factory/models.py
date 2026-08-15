@@ -1,4 +1,5 @@
 from datetime import timedelta
+from decimal import Decimal
 
 from django.contrib.auth.models import User
 from django.db import models
@@ -804,3 +805,122 @@ class CustomerOrderLog(models.Model):
 
     class Meta:
         db_table = "customer_order_logs"
+
+
+class CustomerQuotation(models.Model):
+    quotation_number = models.CharField(
+        max_length=50, unique=True, verbose_name="單據編號"
+    )
+    issue_date = models.DateField(auto_now_add=True, verbose_name="單據日期")
+
+    customer = models.ForeignKey(
+        "Vendor",
+        on_delete=models.CASCADE,
+        related_name="quotations",
+        verbose_name="客戶",
+    )
+
+    status = models.CharField(
+        max_length=20,
+        choices=[
+            ("DRAFT", "草稿"),
+            ("CONFIRMED", "已確認/成立"),
+        ],
+        default="DRAFT",
+        verbose_name="狀態",
+    )
+
+    created_by = models.ForeignKey(
+        User,
+        on_delete=models.DO_NOTHING,
+        null=True,
+        verbose_name="經辦人",
+    )
+    is_active = models.BooleanField(default=True, verbose_name="是否啟用")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "customer_quotations"
+
+    def __str__(self):
+        return f"{self.quotation_number} - {self.customer.name}"
+
+
+class CustomerQuotationItem(models.Model):
+    quotation = models.ForeignKey(
+        CustomerQuotation, on_delete=models.CASCADE, related_name="items"
+    )
+    product = models.ForeignKey(
+        "Material", on_delete=models.CASCADE, verbose_name="報價產品"
+    )
+
+    # 採用 JSONField 儲存動態成本結構
+    # 格式範例：
+    # {
+    #   "material_cost": {"name": "純料成本", "value": 120.50},
+    #   "packaging_cost": {"name": "包材成本", "value": 15.00},
+    #   "manual_cost": {"name": "其他製造費", "value": 5.00}
+    # }
+    costs_breakdown = models.JSONField(
+        default=dict,
+        verbose_name="成本明細結構",
+    )
+
+    pricing_multiplier = models.DecimalField(
+        max_digits=6, decimal_places=3, default=1.000, verbose_name="客戶報價常數"
+    )
+
+    final_price_per_kg = models.DecimalField(
+        max_digits=10, decimal_places=2, default=0, verbose_name="最終報價單價/KG"
+    )
+
+    is_active = models.BooleanField(default=True, verbose_name="是否啟用")
+
+    class Meta:
+        db_table = "customer_quotation_items"
+
+    def __str__(self):
+        return f"{self.quotation.quotation_number} - {self.product.name}"
+
+    @property
+    def total_cost_per_kg(self):
+        """加總所有成本項目的 value"""
+        total = Decimal(0)
+        if isinstance(self.costs_breakdown, dict):
+            for cost_item in self.costs_breakdown.values():
+                if isinstance(cost_item, dict) and "value" in cost_item:
+                    try:
+                        total += Decimal(str(cost_item["value"]))
+                    except (ValueError, TypeError):
+                        pass
+        return total
+
+    @property
+    def calculated_price(self):
+        """依據常數算出的理論報價 (四捨五入)"""
+        exact = self.total_cost_per_kg * (self.pricing_multiplier or Decimal("1.000"))
+        return int(Decimal(str(exact)).quantize(Decimal(1), rounding="ROUND_HALF_UP"))
+
+
+class CustomerQuotationLog(models.Model):
+    quotation = models.ForeignKey(
+        CustomerQuotation,
+        on_delete=models.CASCADE,
+        related_name="logs",
+        verbose_name="報價單",
+    )
+    user = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        verbose_name="操作人員",
+    )
+    action_detail = models.TextField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "customer_quotation_logs"
+
+    def __str__(self):
+        return f"{self.quotation.quotation_number} - {self.action} at {self.timestamp}"

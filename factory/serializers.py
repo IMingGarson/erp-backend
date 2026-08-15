@@ -15,6 +15,8 @@ from .models import (
     BOM,
     BatchInventory,
     CustomerOrder,
+    CustomerQuotation,
+    CustomerQuotationItem,
     DeliveryNote,
     Material,
     MaterialProvider,
@@ -270,9 +272,15 @@ class BatchInventorySerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "created_at", "updated_at"]
 
 
+class BOMMaterialMinimalSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Material
+        fields = ["id", "code", "name", "type", "unit"]
+
+
 class BOMSerializer(serializers.ModelSerializer):
-    parent = MaterialSerializer(read_only=True)
-    child = MaterialSerializer(read_only=True)
+    parent = BOMMaterialMinimalSerializer(read_only=True)
+    child = BOMMaterialMinimalSerializer(read_only=True)
     parent_id = serializers.PrimaryKeyRelatedField(
         queryset=Material.objects.all(), source="parent", write_only=True
     )
@@ -607,3 +615,122 @@ class RecallReportSerializer(serializers.Serializer):
     total_in_stock_product = serializers.DecimalField(max_digits=15, decimal_places=4)
     # 5. 下游總出貨總量 (已出貨至下游廠商之總量)
     total_shipped_product = serializers.DecimalField(max_digits=15, decimal_places=4)
+
+
+class MaterialMinimalSerializer(serializers.ModelSerializer):
+    """輕量級物料 Serializer，供報價單明細展開使用"""
+
+    class Meta:
+        model = Material
+        fields = ["id", "code", "name", "type", "unit"]
+
+
+class CustomerQuotationItemSerializer(serializers.ModelSerializer):
+    id = serializers.IntegerField(required=False, allow_null=True)
+
+    product_detail = MaterialMinimalSerializer(source="product", read_only=True)
+    total_cost_per_kg = serializers.DecimalField(
+        max_digits=10, decimal_places=2, read_only=True
+    )
+    calculated_price = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = CustomerQuotationItem
+        fields = [
+            "id",
+            "product",
+            "product_detail",
+            "costs_breakdown",
+            "pricing_multiplier",
+            "final_price_per_kg",
+            "total_cost_per_kg",
+            "calculated_price",
+            "is_active",
+        ]
+        extra_kwargs = {"product": {"write_only": True}}
+
+
+class CustomerQuotationSerializer(serializers.ModelSerializer):
+    customer_name = serializers.CharField(source="customer.name", read_only=True)
+    items = CustomerQuotationItemSerializer(many=True)
+    created_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = CustomerQuotation
+        fields = [
+            "id",
+            "quotation_number",
+            "issue_date",
+            "customer",
+            "customer_name",
+            "status",
+            "created_by",
+            "created_by_name",
+            "created_at",
+            "updated_at",
+            "items",
+        ]
+        read_only_fields = [
+            "quotation_number",
+            "issue_date",
+            "created_by",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_created_by_name(self, obj):
+        if obj.created_by:
+            return f"{obj.created_by.last_name}{obj.created_by.first_name}"
+        return ""
+
+    def create(self, validated_data):
+        items_data = validated_data.pop("items", [])
+
+        quotation = super().create(validated_data)
+
+        for item_data in items_data:
+            item_data.pop("id", None)
+            CustomerQuotationItem.objects.create(quotation=quotation, **item_data)
+
+        return quotation
+
+    def update(self, instance, validated_data):
+        items_data = validated_data.pop("items", None)
+
+        instance = super().update(instance, validated_data)
+
+        if items_data is not None:
+            # 建立一個資料庫裡「現有且有效」的明細對照表：{ id: item_object }
+            existing_items = {
+                item.id: item for item in instance.items.filter(is_active=True)
+            }
+
+            # 用來記錄這次被更新到的明細 ID
+            incoming_ids = set()
+
+            for item_data in items_data:
+                item_id = item_data.get("id")
+
+                if item_id and item_id in existing_items:
+                    # ✅ 狀況 A：明細原本就在資料庫裡 ➔ 更新欄位
+                    incoming_ids.add(item_id)
+                    existing_item = existing_items[item_id]
+
+                    for attr, value in item_data.items():
+                        setattr(existing_item, attr, value)
+                    existing_item.save()
+
+                else:
+                    # ✅ 狀況 B：前端傳來新的明細 (沒有 ID 或是找不到) ➔ 新增
+                    item_data.pop("id", None)
+                    CustomerQuotationItem.objects.create(
+                        quotation=instance, **item_data
+                    )
+
+            # ✅ 狀況 C：資料庫裡有，但前端傳來的清單裡沒有 ➔ 執行軟刪除
+            for existing_id, existing_item in existing_items.items():
+                if existing_id not in incoming_ids:
+                    existing_item.is_active = False
+                    existing_item.save(update_fields=["is_active"])
+
+        return instance

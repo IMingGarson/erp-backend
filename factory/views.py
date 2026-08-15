@@ -30,6 +30,8 @@ from .models import (
     BOMLog,
     CustomerOrder,
     CustomerOrderLog,
+    CustomerQuotation,
+    CustomerQuotationLog,
     DeliveryNote,
     DeliveryNoteLog,
     Material,
@@ -50,6 +52,7 @@ from .serializers import (
     BatchInventorySerializer,
     BOMSerializer,
     CustomerOrderSerializer,
+    CustomerQuotationSerializer,
     DeliveryNoteSerializer,
     MaterialProviderSerializer,
     MaterialRequirementPlanSerializer,
@@ -72,6 +75,7 @@ class CRUDAuditMixin:
         PurchaseRequisition: (PurchaseRequisitionLog, "purchase_requisition"),
         DeliveryNote: (DeliveryNoteLog, "delivery_notes"),
         CustomerOrder: (CustomerOrderLog, "customer_order"),
+        CustomerQuotation: (CustomerQuotationLog, "quotation"),
     }
 
     def get_valid_user(self):
@@ -151,6 +155,9 @@ class CRUDAuditMixin:
 
         elif model_name == "BOM":
             action_detail = f"{full_username} 建立了配方 ({instance.parent.name} #{instance.parent.code} -> {instance.child.name} #{instance.child.code})"
+
+        elif model_name == "CustomerQuotation":
+            action_detail = f"{full_username} 建立了報價單 #{instance.quotation_number} (客戶: {instance.customer.name})"
 
         else:
             action_detail = f"{full_username} 建立了此筆資料 (ID: {instance.pk})"
@@ -981,7 +988,6 @@ class BOMViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     queryset = (
         BOM.objects.filter(is_active=True)
         .select_related("parent", "child")
-        .prefetch_related("parent__product_profiles", "child__product_profiles")
         .order_by("-id")
     )
 
@@ -1370,3 +1376,83 @@ class TraceViewSet(viewsets.ViewSet):
 
         serializer = RecallReportSerializer(data)
         return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class CustomerQuotationViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
+    queryset = CustomerQuotation.objects.prefetch_related(
+        "items__product", "customer"
+    ).order_by("-issue_date", "-id")
+
+    serializer_class = CustomerQuotationSerializer
+    filter_backends = [filters.DjangoFilterBackend, SearchFilter]
+    filterset_fields = ["status", "customer"]
+    search_fields = ["quotation_number", "customer__name"]
+
+    def get_permissions(self):
+        return [IsAuthenticated(), IsRDOrReadOnly]
+
+    @transaction.atomic
+    def perform_create(self, serializer):
+        today_str = timezone.localtime(timezone.now()).strftime("%Y%m%d")
+        last_q = (
+            CustomerQuotation.objects.filter(
+                quotation_number__startswith=f"Q{today_str}"
+            )
+            .order_by("-quotation_number")
+            .first()
+        )
+
+        seq = int(last_q.quotation_number.split("-")[1]) + 1 if last_q else 1
+        new_q_number = f"Q{today_str}-{seq:03d}"
+
+        serializer.validated_data["quotation_number"] = new_q_number
+        super().perform_create(serializer)
+
+        instance = serializer.instance
+        if instance.status == "CONFIRMED":
+            self._promote_materials_to_prod(instance)
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        old_status = self.get_object().status
+        new_status = serializer.validated_data.get("status", old_status)
+
+        super().perform_update(serializer)
+
+        instance = serializer.instance
+        if old_status != "CONFIRMED" and new_status == "CONFIRMED":
+            self._promote_materials_to_prod(instance)
+
+    def _promote_materials_to_prod(self, quotation):
+        """推進 BOM 狀態的邏輯"""
+        product_ids = [item.product_id for item in quotation.items.all()]
+        if not product_ids:
+            return
+
+        materials_to_update = set()
+        queue = list(product_ids)
+        visited = set(product_ids)
+
+        while queue:
+            current_id = queue.pop(0)
+            materials_to_update.add(current_id)
+
+            child_boms = BOM.objects.filter(
+                parent_id=current_id, is_active=True
+            ).values_list("child_id", flat=True)
+            for child_id in child_boms:
+                if child_id not in visited:
+                    visited.add(child_id)
+                    queue.append(child_id)
+
+        updated_count = Material.objects.filter(
+            id__in=materials_to_update, phase="IN_DEV"
+        ).update(phase="IN_PROD")
+
+        if updated_count > 0:
+            user = self.get_valid_user()
+            self._record_db_log(
+                quotation,
+                user,
+                f"系統自動動作：已將 {updated_count} 筆關聯的 IN_DEV 物料推進至 IN_PROD 狀態 單據 #{quotation}",
+            )
