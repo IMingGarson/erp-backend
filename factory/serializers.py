@@ -618,8 +618,6 @@ class RecallReportSerializer(serializers.Serializer):
 
 
 class MaterialMinimalSerializer(serializers.ModelSerializer):
-    """輕量級物料 Serializer，供報價單明細展開使用"""
-
     class Meta:
         model = Material
         fields = ["id", "code", "name", "type", "unit"]
@@ -641,6 +639,7 @@ class CustomerQuotationItemSerializer(serializers.ModelSerializer):
             "product",
             "product_detail",
             "costs_breakdown",
+            "spec",
             "pricing_multiplier",
             "final_price_per_kg",
             "total_cost_per_kg",
@@ -700,37 +699,51 @@ class CustomerQuotationSerializer(serializers.ModelSerializer):
         instance = super().update(instance, validated_data)
 
         if items_data is not None:
-            # 建立一個資料庫裡「現有且有效」的明細對照表：{ id: item_object }
             existing_items = {
                 item.id: item for item in instance.items.filter(is_active=True)
             }
 
-            # 用來記錄這次被更新到的明細 ID
             incoming_ids = set()
+
+            items_to_update = []
+            items_to_delete = []
 
             for item_data in items_data:
                 item_id = item_data.get("id")
 
                 if item_id and item_id in existing_items:
-                    # ✅ 狀況 A：明細原本就在資料庫裡 ➔ 更新欄位
                     incoming_ids.add(item_id)
                     existing_item = existing_items[item_id]
 
                     for attr, value in item_data.items():
                         setattr(existing_item, attr, value)
-                    existing_item.save()
+
+                    items_to_update.append(existing_item)
 
                 else:
-                    # ✅ 狀況 B：前端傳來新的明細 (沒有 ID 或是找不到) ➔ 新增
                     item_data.pop("id", None)
                     CustomerQuotationItem.objects.create(
                         quotation=instance, **item_data
                     )
 
-            # ✅ 狀況 C：資料庫裡有，但前端傳來的清單裡沒有 ➔ 執行軟刪除
             for existing_id, existing_item in existing_items.items():
                 if existing_id not in incoming_ids:
                     existing_item.is_active = False
-                    existing_item.save(update_fields=["is_active"])
+                    items_to_delete.append(existing_item)
+
+            if items_to_delete:
+                CustomerQuotationItem.objects.bulk_update(
+                    items_to_delete, ["is_active"]
+                )
+
+            if items_to_update:
+                update_fields = [
+                    "costs_breakdown",
+                    "pricing_multiplier",
+                    "final_price_per_kg",
+                ]
+                CustomerQuotationItem.objects.bulk_update(
+                    items_to_update, update_fields
+                )
 
         return instance

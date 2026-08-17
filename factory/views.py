@@ -31,6 +31,7 @@ from .models import (
     CustomerOrder,
     CustomerOrderLog,
     CustomerQuotation,
+    CustomerQuotationItem,
     CustomerQuotationLog,
     DeliveryNote,
     DeliveryNoteLog,
@@ -1380,7 +1381,13 @@ class TraceViewSet(viewsets.ViewSet):
 
 class CustomerQuotationViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     queryset = CustomerQuotation.objects.prefetch_related(
-        "items__product", "customer"
+        Prefetch(
+            "items",
+            queryset=CustomerQuotationItem.objects.filter(
+                is_active=True
+            ).select_related("product"),
+        ),
+        "customer",
     ).order_by("-issue_date", "-id")
 
     serializer_class = CustomerQuotationSerializer
@@ -1389,7 +1396,7 @@ class CustomerQuotationViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     search_fields = ["quotation_number", "customer__name"]
 
     def get_permissions(self):
-        return [IsAuthenticated(), IsRDOrReadOnly]
+        return [IsAuthenticated(), IsRDOrReadOnly()]
 
     @transaction.atomic
     def perform_create(self, serializer):
@@ -1407,10 +1414,6 @@ class CustomerQuotationViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
         serializer.validated_data["quotation_number"] = new_q_number
         super().perform_create(serializer)
-
-        instance = serializer.instance
-        if instance.status == "CONFIRMED":
-            self._promote_materials_to_prod(instance)
 
     @transaction.atomic
     def perform_update(self, serializer):

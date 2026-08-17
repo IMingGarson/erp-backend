@@ -16,6 +16,7 @@ from factory.views import (
     BatchInventoryViewSet,
     BOMViewSet,
     CustomerOrderViewSet,
+    CustomerQuotationViewSet,
     DeliveryNoteViewSet,
     MaterialProviderViewSet,
     MaterialRequirementPlanViewSet,
@@ -45,6 +46,7 @@ router.register(r"abnormality_trace", TraceViewSet, basename="abnormality-trace"
 router.register(
     r"material_providers", MaterialProviderViewSet, basename="material-providers"
 )
+router.register(r"quotations", CustomerQuotationViewSet, basename="quotations")
 
 urlpatterns = [
     path("admin/", admin.site.urls),

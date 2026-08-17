@@ -867,6 +867,14 @@ class CustomerQuotationItem(models.Model):
         verbose_name="成本明細結構",
     )
 
+    spec = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True,
+        verbose_name="包裝規格",
+        help_text="如：0.10KG*110包/箱",
+    )
+
     pricing_multiplier = models.DecimalField(
         max_digits=6, decimal_places=3, default=1.000, verbose_name="客戶報價常數"
     )
@@ -923,4 +931,4 @@ class CustomerQuotationLog(models.Model):
         db_table = "customer_quotation_logs"
 
     def __str__(self):
-        return f"{self.quotation.quotation_number} - {self.action} at {self.timestamp}"
+        return f"{self.quotation.quotation_number} - {self.action_detail} at {self.created_at}"
