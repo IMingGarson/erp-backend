@@ -280,9 +280,24 @@ class ProductProfile(models.Model):
         help_text="如: 1KG*25包/箱",
     )
     sales_unit = models.CharField(max_length=10, default="箱", verbose_name="銷售單位")
+    sales_unit_quantity = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=1,
+        verbose_name="銷售單位數量",
+        help_text="如: 1KG*25包/箱，則填1(箱)",
+    )
     sales_pack_unit = models.CharField(
         max_length=10, default="包", verbose_name="銷售輔助單位"
     )
+    sales_pack_quantity = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=1,
+        verbose_name="銷售輔助單位數量",
+        help_text="如: 1KG*25包/箱，則填25(包)",
+    )
+
     sales_price = models.DecimalField(
         max_digits=15, decimal_places=2, null=True, blank=True, verbose_name="銷售單價"
     )

@@ -156,7 +156,14 @@ class UserUpdateSerializer(serializers.ModelSerializer):
 class ProductProfileSerializer(serializers.ModelSerializer):
     class Meta:
         model = ProductProfile
-        fields = ["spec", "sales_unit", "sales_price", "label_info"]
+        fields = [
+            "spec",
+            "sales_unit",
+            "sales_price",
+            "label_info",
+            "sales_unit_quantity",
+            "sales_pack_quantity",
+        ]
 
 
 class MaterialProviderSerializer(serializers.ModelSerializer):

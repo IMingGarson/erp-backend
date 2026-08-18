@@ -896,10 +896,10 @@ class BatchInventoryViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                         )
 
                     po_vendor = po.vendor_info or {}
-
                     orders.append(
                         {
                             "order_number": po.order_number,
+                            "order_created_at": po.created_at.strftime("%Y-%m-%d"),
                             "parent_id": po.parent_id,
                             "product_code": po.product.code,
                             "product_name": po.product.name,
@@ -911,6 +911,8 @@ class BatchInventoryViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                             "po_vendor_info": {
                                 "code": po_vendor.get("code", ""),
                                 "name": po_vendor.get("name", ""),
+                                "phone": po_vendor.get("phone", ""),
+                                "address": po_vendor.get("address", ""),
                             },
                             "used_batch_numbers": used_batch_numbers,  # 🌟 將收集到的批號陣列放入
                             "delivery_notes": delivery_notes_data,
@@ -974,7 +976,12 @@ class BatchInventoryViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                     "material_code": batch.material.code,
                     "material_name": batch.material.name,
                     "remaining_qty": float(batch.remaining_qty),
-                    "received_date": batch.received_date,
+                    "received_date": batch.received_date.strftime("%Y-%m-%d")
+                    if batch.received_date
+                    else None,
+                    "expiration_date": batch.expiration_date.strftime("%Y-%m-%d")
+                    if batch.expiration_date
+                    else None,
                     "trace_details": {
                         # "mrps": mrps,
                         "orders": orders,
@@ -1063,14 +1070,16 @@ class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                     try:
                         start_date = datetime.strptime(
                             start_date_str, "%Y-%m-%d"
-                        ).date()
+                        ).replace(tzinfo=timezone.utc)
                         queryset = queryset.filter(request_date__gte=start_date)
                     except ValueError:
                         pass
 
                 if end_date_str:
                     try:
-                        end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+                        end_date = datetime.strptime(end_date_str, "%Y-%m-%d").replace(
+                            tzinfo=timezone.utc
+                        )
                         end_date = min(end_date, today)
                         queryset = queryset.filter(request_date__lte=end_date)
                     except ValueError:
@@ -1262,32 +1271,16 @@ class TraceViewSet(viewsets.ViewSet):
     """
     取得特定異常物料的回收計畫書核心指標
 
-    此 API 對應政府「產品回收計畫書」要求的各項指標，以傳入之異常物料 ID 為追溯源頭。
-    指標定義與系統取值邏輯對應如下：
-
     1. 回收原料總量 (異常原料進貨總量/已投入量)
-       - 定義：投入生產的異常原料總和(kg)。
-       - 實作：遍歷所有啟用中的生產單 (ProductionOrder.materials_info)，進入 batches 陣列加總該異常物料的實際使用量 (used)。
-
+       - 實作：遍歷所有啟用中的生產單加總異常物料的實際使用量。
     2. 尚未使用原料總量 (異常原料在庫總量)
-       - 定義：尚未投入生產、仍在廠內的異常原料總量(kg)。
        - 實作：查詢批號庫存 (BatchInventory) 中該物料的 remaining_qty 總和。
-
     3. 產品生產總量 (各品項產品之總量)
-       - 定義：所有「有使用到該異常原料」的產品生產總重量(kg)。
-       - 實作：篩選出受污染的生產單，加總其 actual_qty (若無則取 target_qty)。
-
+       - 實作：受污染的生產單產量 × 該產品 BOM 的 base_quantity。
     4. 尚未出貨產品總量 (各品項在庫總量)
-       - 定義：受污染的產品中，仍在廠內未出貨的總重量(kg)。
-       - 實作：針對受污染的生產單，取其 remaining_qty (總生產量扣除該生產單的總銷貨量)。
-
+       - 實作：受污染的生產單剩餘庫存 × 該產品 BOM 的 base_quantity。
     5. 下游總出貨總量 (已出貨至下游廠商之總量)
-       - 定義：受污染的產品中，已經隨著銷貨單流出廠外的總重量(kg)。
-       - 實作：針對受污染的生產單，加總其關聯之銷貨單 (DeliveryNote) 的 quantity。
-
-    備註：
-    - 第 6、7、8、9 項指標 (實際回收總量、回收率、處置方式、銷毀總量) 需由人員事後實體點交與勾選，不由此 API 直接計算。
-    - 採用 Decimal 計算到小數點下四位，以避免浮點數誤差。
+       - 實作：受污染生產單的銷貨量 × 該產品 BOM 的 base_quantity。
     """
 
     def get_permissions(self):
@@ -1295,10 +1288,6 @@ class TraceViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["get"])
     def recall_report(self, request):
-        """
-        取得特定異常物料的回收計畫書 5 大指標
-        Endpoint: /api/abnormality_trace/recall_report?material_id=XXX
-        """
         material_id = request.query_params.get("material_id")
 
         if not material_id:
@@ -1311,18 +1300,27 @@ class TraceViewSet(viewsets.ViewSet):
         except Material.DoesNotExist:
             return Response({"error": "找不到該物料"}, status=status.HTTP_404_NOT_FOUND)
 
+        # ---------------------------------------------------------
+        # 1. 取得「尚未使用的原料總量」(指標 2)
+        # ---------------------------------------------------------
         unused_raw_agg = BatchInventory.objects.filter(
             material=material, is_active=True
         ).aggregate(total=Sum("remaining_qty"))["total"]
 
-        used_raw_total = Decimal("0.0000")  # 指標 1
-        unused_raw_total = to_decimal4(unused_raw_agg)  # 指標 2
-        total_produced_product = Decimal("0.0000")  # 指標 3
-        total_in_stock_product = Decimal("0.0000")  # 指標 4
-        total_shipped_product = Decimal("0.0000")  # 指標 5
+        used_raw_total = Decimal("0.0000")  # 指標 1 (異常原料已投入量)
+        unused_raw_total = to_decimal4(unused_raw_agg or 0)  # 指標 2 (異常原料在庫量)
+        total_produced_product = Decimal("0.0000")  # 指標 3 (產品生產總量)
+        total_in_stock_product = Decimal("0.0000")  # 指標 4 (尚未出貨產品總量)
+        total_shipped_product = Decimal("0.0000")  # 指標 5 (下游總出貨總量)
 
-        all_pos = ProductionOrder.objects.filter(is_active=True).prefetch_related(
-            "delivery_notes"
+        # ---------------------------------------------------------
+        # 2. 篩選受污染的生產單，並計算「已使用的原料總量」(指標 1)
+        # ---------------------------------------------------------
+        # 🚀 效能優化：加入 select_related("product")
+        all_pos = (
+            ProductionOrder.objects.filter(is_active=True)
+            .select_related("product")
+            .prefetch_related("delivery_notes")
         )
 
         tainted_pos = []
@@ -1333,10 +1331,11 @@ class TraceViewSet(viewsets.ViewSet):
             )
 
             for mat_info in materials_info:
+                # 這裡對齊 JSON 裡面的結構，假設 JSON 裡有存 material.code
                 if str(mat_info.get("code")) == material.code:
                     is_tainted = True
 
-                    # 計算指標 1: 加總實際使用的原料
+                    # 計算指標 1: 加總實際使用的異常原料
                     batches = mat_info.get("batches", [])
                     for b in batches:
                         used_qty = to_decimal4(b.get("used", 0))
@@ -1345,25 +1344,58 @@ class TraceViewSet(viewsets.ViewSet):
             if is_tainted:
                 tainted_pos.append(po)
 
-        # ---------------------------------------------------------
-        # 計算指標 3, 4, 5 (基於受污染的生產單)
-        # ---------------------------------------------------------
-        for po in tainted_pos:
-            # 3. 產品生產總量 (優先看實際產出，若無則看目標產出)
-            product_qty_val = (
-                po.actual_qty if po.actual_qty is not None else po.target_qty
+        # 如果沒有受影響的生產單，可以提早結束迴圈，直接回傳
+        if tainted_pos:
+            # ---------------------------------------------------------
+            # 3. 取得「產品的配方基準量 (base_quantity) Mapping」
+            # ---------------------------------------------------------
+            # 🚀 效能優化：一次性把需要的 base_quantity 撈出來，不做 N+1 查詢
+            tainted_product_ids = {po.product_id for po in tainted_pos}
+
+            # 因為同一個成品 (parent) 的所有配方列 (child) 其 base_quantity 都是一樣的
+            # 我們可以直接用 values + distinct() 快速取得每個產品的配方基數
+            bom_qs = (
+                BOM.objects.filter(parent_id__in=tainted_product_ids, is_active=True)
+                .values("parent_id", "base_quantity")
+                .distinct()
             )
-            total_produced_product += to_decimal4(product_qty_val)
 
-            # 4. 尚未出貨產品總量 (直接讀取既有 property)
-            total_in_stock_product += to_decimal4(po.remaining_qty)
+            # 產出 mapping 字典： { product_id: base_quantity }
+            base_qty_map = {
+                item["parent_id"]: to_decimal4(item["base_quantity"]) for item in bom_qs
+            }
 
-            # 5. 下游總出貨總量 (直接加總所有出貨紀錄)
-            delivered_agg = po.delivery_notes.filter(is_active=True).aggregate(
-                total=Sum("quantity")
-            )["total"]
-            total_shipped_product += to_decimal4(delivered_agg)
+            # ---------------------------------------------------------
+            # 4. 計算指標 3, 4, 5 (次數/批數 × 配方基準量)
+            # ---------------------------------------------------------
+            for po in tainted_pos:
+                # 取出對應產品的 base_quantity，若無設定則預設為 1 (避免乘法歸零)
+                base_qty = base_qty_map.get(po.product_id, Decimal("1.0000"))
 
+                # 👉 指標 3. 產品生產總量 (實際生產批數 × 配方基數)
+                product_qty_val = (
+                    po.actual_qty if po.actual_qty is not None else po.target_qty
+                )
+                total_produced_product += to_decimal4(product_qty_val or 0) * base_qty
+
+                # 👉 指標 4. 尚未出貨產品總量
+                # Model 裡寫的 @property remaining_qty 是：target_qty - active_delivered_qty
+                # 我們直接拿這個「剩餘未出貨批數」乘上配方基數
+                po_remaining_batches = po.remaining_qty
+                total_in_stock_product += (
+                    to_decimal4(po_remaining_batches or 0) * base_qty
+                )
+
+                # 👉 指標 5. 下游總出貨總量
+                # Model 裡寫的 @property active_delivered_qty 就是歷史累計出貨批數
+                po_delivered_batches = po.active_delivered_qty
+                total_shipped_product += (
+                    to_decimal4(po_delivered_batches or 0) * base_qty
+                )
+
+        # ---------------------------------------------------------
+        # 5. 組合並回傳資料
+        # ---------------------------------------------------------
         data = {
             "material_id": material.id,
             "material_name": material.name,
@@ -1375,6 +1407,7 @@ class TraceViewSet(viewsets.ViewSet):
             "total_shipped_product": total_shipped_product,
         }
 
+        # 將計算結果透過 Serializer 回傳給前端
         serializer = RecallReportSerializer(data)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
