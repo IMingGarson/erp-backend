@@ -185,6 +185,15 @@ class Material(models.Model):
         default="IN_PROD",
         verbose_name="物料使用階段",
     )
+    is_additive = models.BooleanField(default=False, verbose_name="是否為法規添加物")
+    legal_limit_percent = models.DecimalField(
+        max_digits=6,
+        decimal_places=4,
+        null=True,
+        blank=True,
+        verbose_name="法規上限比例(%)",
+        help_text="如二矽法規上限2%，請填 2.0",
+    )
     created_by = models.ForeignKey(User, on_delete=models.DO_NOTHING)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

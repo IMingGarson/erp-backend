@@ -221,6 +221,8 @@ class MaterialSerializer(serializers.ModelSerializer):
             "storage_life",  # 保存期限
             "description",  # 描述 (成分來源)
             "additive_license_no",  # 添加物許可證號
+            "is_additive",  # 是否為添加物
+            "legal_limit_percent",  # 添加物比例上限
             "license_valid_date",  # 許可證效期
             "product_registration_no",  # 產品登錄號
             "origin",  # 產地
