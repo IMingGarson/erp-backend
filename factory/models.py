@@ -155,6 +155,16 @@ class Material(models.Model):
         max_length=10, choices=TYPE_CHOICES, verbose_name="物料類型"
     )
     unit = models.CharField(max_length=10, default="KG", verbose_name="單位")
+
+    pack_capacity = models.DecimalField(
+        max_digits=10,
+        decimal_places=4,
+        null=True,
+        blank=True,
+        verbose_name="包材容量/淨重(KG)",
+        help_text="若物料為包材(PACK)，請輸入此包材單一個數可裝載之重量(KG)，如：500g包裝袋請填 0.5",
+    )
+
     allergen_info = models.CharField(
         max_length=100, blank=True, null=True, verbose_name="過敏原資訊"
     )

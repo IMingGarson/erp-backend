@@ -6,9 +6,12 @@
 # 添加物總量警示，成品、半成品，總用量不能超過某%
 # 新增物料：添加物、展開成分、過敏原、基準單位、輔助單位（袋、箱）
 # 營養標籤字體、排序都有規定
+from decimal import Decimal
+
 from django.contrib.auth.models import User
 from django.db import transaction
 from rest_framework import serializers
+from rest_framework.exceptions import ValidationError
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
 from .models import (
@@ -302,15 +305,137 @@ class BOMSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "parent",
-            "child",  # For GET method
+            "child",
             "parent_id",
-            "child_id",  # For POST/PUT method
+            "child_id",
             "base_quantity",
             "quantity_required",
             "is_active",
             "created_at",
             "updated_at",
         ]
+
+    def _get_additive_contributions(self, material, current_ratio):
+        """
+        遞迴函數：計算傳入的 material (包含其子件) 會貢獻多少添加物比例
+        """
+        additives = {}
+
+        # 1. 如果自己本身就是添加物
+        if material.is_additive and material.legal_limit_percent:
+            additives[material.code] = {
+                "name": material.name,
+                "limit": Decimal(str(material.legal_limit_percent)),
+                "ratio": Decimal(str(current_ratio)),
+            }
+
+        # 2. 如果是半成品，遞迴往下挖
+        elif material.type == "SEMI":
+            semi_boms = material.main_product.filter(is_active=True).select_related(
+                "child"
+            )
+
+            if semi_boms.exists():
+                semi_base_qty = semi_boms.first().base_quantity
+                for bom in semi_boms:
+                    child_ratio = Decimal(str(current_ratio)) * (
+                        bom.quantity_required / semi_base_qty
+                    )
+                    child_adds = self._get_additive_contributions(
+                        bom.child, child_ratio
+                    )
+
+                    for code, data in child_adds.items():
+                        if code in additives:
+                            additives[code]["ratio"] += data["ratio"]
+                        else:
+                            additives[code] = data
+
+        return additives
+
+    def _check_additive_limits(
+        self, parent, child, base_qty, qty_required, exclude_bom_id=None
+    ):
+        """
+        核心驗算邏輯：計算加入此筆明細後，總配方是否會超標
+        """
+        base_qty = Decimal(str(base_qty))
+        qty_required = Decimal(str(qty_required))
+
+        if base_qty <= 0:
+            raise ValidationError({"base_quantity": ["基準產量必須大於 0"]})
+
+        # 1. 取得這筆「準備新增/修改」的明細，會帶入多少添加物
+        current_item_ratio = qty_required / base_qty
+        new_additives = self._get_additive_contributions(child, current_item_ratio)
+
+        if not new_additives:
+            return  # 沒有添加物，安全放行
+
+        # 2. 撈取同配方(母件)底下「其他」已存在的 BOM
+        existing_boms = parent.main_product.filter(is_active=True).select_related(
+            "child"
+        )
+
+        if exclude_bom_id:
+            existing_boms = existing_boms.exclude(id=exclude_bom_id)
+
+        total_additives = new_additives.copy()
+
+        # 3. 累加資料庫內現有配方的添加物
+        for bom in existing_boms:
+            bom_ratio = bom.quantity_required / bom.base_quantity
+            existing_adds = self._get_additive_contributions(bom.child, bom_ratio)
+
+            for code, data in existing_adds.items():
+                if code in total_additives:
+                    total_additives[code]["ratio"] += data["ratio"]
+                else:
+                    total_additives[code] = data
+
+        # 4. 最終驗算：是否超過法規上限
+        for code, data in total_additives.items():
+            usage_percent = data["ratio"] * Decimal(100)
+            if usage_percent > data["limit"]:
+                raise ValidationError(
+                    {
+                        "non_field_errors": [
+                            f"後端防護阻擋：添加物【{data['name']}】總佔比 ({usage_percent.quantize(Decimal('0.00'))}%) 已超過法定安全上限 {data['limit']}%！"
+                        ]
+                    }
+                )
+
+    @transaction.atomic
+    def create(self, validated_data):
+        parent = Material.objects.select_for_update().get(
+            id=validated_data["parent"].id
+        )
+
+        self._check_additive_limits(
+            parent=parent,
+            child=validated_data["child"],
+            base_qty=validated_data["base_quantity"],
+            qty_required=validated_data["quantity_required"],
+        )
+
+        return super().create(validated_data)
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        parent_id = validated_data.get("parent", instance.parent).id
+        parent = Material.objects.select_for_update().get(id=parent_id)
+
+        self._check_additive_limits(
+            parent=parent,
+            child=validated_data.get("child", instance.child),
+            base_qty=validated_data.get("base_quantity", instance.base_quantity),
+            qty_required=validated_data.get(
+                "quantity_required", instance.quantity_required
+            ),
+            exclude_bom_id=instance.id,  # 排除自己舊的數據，避免重複計算
+        )
+
+        return super().update(instance, validated_data)
 
 
 class CustomerOrderSerializer(serializers.ModelSerializer):
@@ -629,17 +754,28 @@ class RecallReportSerializer(serializers.Serializer):
 class MaterialMinimalSerializer(serializers.ModelSerializer):
     class Meta:
         model = Material
-        fields = ["id", "code", "name", "type", "unit"]
+        fields = ["id", "code", "name", "type", "unit", "estimated_cost"]
 
 
 class CustomerQuotationItemSerializer(serializers.ModelSerializer):
     id = serializers.IntegerField(required=False, allow_null=True)
-
     product_detail = MaterialMinimalSerializer(source="product", read_only=True)
     total_cost_per_kg = serializers.DecimalField(
         max_digits=10, decimal_places=2, read_only=True
     )
     calculated_price = serializers.IntegerField(read_only=True)
+
+    # 🌟 與 Model 欄位名稱完全統一的外掛欄位 (供 ProductProfile 使用)
+    sales_unit = serializers.CharField(max_length=10, required=False, write_only=True)
+    sales_unit_quantity = serializers.DecimalField(
+        max_digits=10, decimal_places=2, required=False, write_only=True
+    )
+    sales_pack_unit = serializers.CharField(
+        max_length=10, required=False, write_only=True
+    )
+    sales_pack_quantity = serializers.DecimalField(
+        max_digits=10, decimal_places=2, required=False, write_only=True
+    )
 
     class Meta:
         model = CustomerQuotationItem
@@ -654,6 +790,11 @@ class CustomerQuotationItemSerializer(serializers.ModelSerializer):
             "total_cost_per_kg",
             "calculated_price",
             "is_active",
+            # 統一命名後的外掛欄位
+            "sales_unit",
+            "sales_unit_quantity",
+            "sales_pack_unit",
+            "sales_pack_quantity",
         ]
         extra_kwargs = {"product": {"write_only": True}}
 
@@ -691,19 +832,69 @@ class CustomerQuotationSerializer(serializers.ModelSerializer):
             return f"{obj.created_by.last_name}{obj.created_by.first_name}"
         return ""
 
+    def _sync_product_profile(self, item_data, customer):
+        """
+        🌟 同步更新或建立 ProductProfile，直接使用統一的變數名稱提取資料
+        """
+        material = item_data.get("product")
+        if not material:
+            return
+
+        spec = item_data.get("spec", "")
+        sales_unit = item_data.get("sales_unit", "箱")
+        sales_unit_quantity = item_data.get("sales_unit_quantity", 1)
+        sales_pack_unit = item_data.get("sales_pack_unit", "包")
+        sales_pack_quantity = item_data.get("sales_pack_quantity", 1)
+        sales_price = item_data.get("final_price_per_kg", None)
+
+        profile = ProductProfile.objects.filter(
+            material=material, vendor=customer
+        ).first()
+
+        if profile:
+            profile.spec = spec
+            profile.sales_unit = sales_unit
+            profile.sales_unit_quantity = sales_unit_quantity
+            profile.sales_pack_unit = sales_pack_unit
+            profile.sales_pack_quantity = sales_pack_quantity
+            profile.sales_price = sales_price
+            profile.save()
+        else:
+            ProductProfile.objects.create(
+                material=material,
+                vendor=customer,
+                spec=spec,
+                sales_unit=sales_unit,
+                sales_unit_quantity=sales_unit_quantity,
+                sales_pack_unit=sales_pack_unit,
+                sales_pack_quantity=sales_pack_quantity,
+                sales_price=sales_price,
+            )
+
+    @transaction.atomic
     def create(self, validated_data):
         items_data = validated_data.pop("items", [])
+        customer = validated_data.get("customer")
 
         quotation = super().create(validated_data)
 
         for item_data in items_data:
+            self._sync_product_profile(item_data, customer)
+
             item_data.pop("id", None)
+            item_data.pop("sales_unit", None)
+            item_data.pop("sales_unit_quantity", None)
+            item_data.pop("sales_pack_unit", None)
+            item_data.pop("sales_pack_quantity", None)
+
             CustomerQuotationItem.objects.create(quotation=quotation, **item_data)
 
         return quotation
 
+    @transaction.atomic
     def update(self, instance, validated_data):
         items_data = validated_data.pop("items", None)
+        customer = validated_data.get("customer", instance.customer)
 
         instance = super().update(instance, validated_data)
 
@@ -711,14 +902,20 @@ class CustomerQuotationSerializer(serializers.ModelSerializer):
             existing_items = {
                 item.id: item for item in instance.items.filter(is_active=True)
             }
-
             incoming_ids = set()
-
             items_to_update = []
             items_to_delete = []
 
             for item_data in items_data:
                 item_id = item_data.get("id")
+
+                self._sync_product_profile(item_data, customer)
+
+                # 清除外掛欄位 (變數名稱已統一)
+                item_data.pop("sales_unit", None)
+                item_data.pop("sales_unit_quantity", None)
+                item_data.pop("sales_pack_unit", None)
+                item_data.pop("sales_pack_quantity", None)
 
                 if item_id and item_id in existing_items:
                     incoming_ids.add(item_id)
@@ -728,7 +925,6 @@ class CustomerQuotationSerializer(serializers.ModelSerializer):
                         setattr(existing_item, attr, value)
 
                     items_to_update.append(existing_item)
-
                 else:
                     item_data.pop("id", None)
                     CustomerQuotationItem.objects.create(
@@ -747,6 +943,7 @@ class CustomerQuotationSerializer(serializers.ModelSerializer):
 
             if items_to_update:
                 update_fields = [
+                    "spec",
                     "costs_breakdown",
                     "pricing_multiplier",
                     "final_price_per_kg",

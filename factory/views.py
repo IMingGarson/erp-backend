@@ -1006,8 +1006,7 @@ class BOMViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     search_fields = ["parent__name", "parent__code", "child__name", "child__code"]
 
     def get_permissions(self):
-        return [IsAuthenticated()]
-        # return [IsAuthenticated(), IsAdminOrEmployerOrReadOnly()]
+        return [IsAuthenticated(), IsRDOrReadOnly()]
 
 
 class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
