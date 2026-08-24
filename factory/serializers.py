@@ -560,14 +560,56 @@ class ProductionLogSerializer(serializers.ModelSerializer):
 
 
 class SimpleProductSerializer(serializers.ModelSerializer):
-    spec = serializers.CharField(source="product_profile.spec", read_only=True)
-    sales_price = serializers.CharField(
-        source="product_profile.sales_price", read_only=True
-    )
+    spec = serializers.SerializerMethodField()
+    sales_price = serializers.SerializerMethodField()
+    sales_unit = serializers.SerializerMethodField()
+    sales_pack_unit = serializers.SerializerMethodField()
+    sales_unit_quantity = serializers.SerializerMethodField()
+    sales_pack_quantity = serializers.SerializerMethodField()
 
     class Meta:
         model = Material
-        fields = ["id", "code", "name", "type", "unit", "sales_price", "spec"]
+        fields = [
+            "id",
+            "code",
+            "name",
+            "type",
+            "unit",
+            "spec",
+            "sales_price",
+            "sales_unit",
+            "sales_pack_unit",
+            "sales_unit_quantity",
+            "sales_pack_quantity",
+        ]
+
+    def _get_profile(self, obj):
+        # 抓取第一筆設定的 Profile
+        return obj.product_profiles.first()
+
+    def get_spec(self, obj):
+        profile = self._get_profile(obj)
+        return profile.spec if profile else None
+
+    def get_sales_price(self, obj):
+        profile = self._get_profile(obj)
+        return str(profile.sales_price) if profile and profile.sales_price else None
+
+    def get_sales_unit(self, obj):
+        profile = self._get_profile(obj)
+        return profile.sales_unit if profile else "箱"
+
+    def get_sales_pack_unit(self, obj):
+        profile = self._get_profile(obj)
+        return profile.sales_pack_unit if profile else "包"
+
+    def get_sales_unit_quantity(self, obj):
+        profile = self._get_profile(obj)
+        return str(profile.sales_unit_quantity) if profile else "1"
+
+    def get_sales_pack_quantity(self, obj):
+        profile = self._get_profile(obj)
+        return str(profile.sales_pack_quantity) if profile else "1"
 
 
 class ProductionOrderSerializer(serializers.ModelSerializer):

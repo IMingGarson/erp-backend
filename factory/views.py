@@ -997,7 +997,7 @@ class BatchInventoryViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                     if batch.expiration_date
                     else None,
                     "trace_details": {
-                        # "mrps": mrps,
+                        "mrps": mrps,
                         "orders": orders,
                     },
                 }
