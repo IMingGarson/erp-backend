@@ -162,10 +162,11 @@ class ProductProfileSerializer(serializers.ModelSerializer):
         fields = [
             "spec",
             "sales_unit",
-            "sales_price",
-            "label_info",
+            "sales_pack_unit",
             "sales_unit_quantity",
             "sales_pack_quantity",
+            "sales_price",
+            "label_info",
         ]
 
 
@@ -232,6 +233,7 @@ class MaterialSerializer(serializers.ModelSerializer):
             "product_profiles",  # 關聯成品專屬資訊
             "is_active",  # 是否啟用
             "is_raw_material",  # 是否為原物料
+            "pack_capacity",  # PACK 限定：包材容量（KG）
             "created_by",  # 建立者
             "creator_name",  # 建立者姓名 (自訂方法)
             "created_at",  # 建立時間
@@ -287,7 +289,7 @@ class BatchInventorySerializer(serializers.ModelSerializer):
 class BOMMaterialMinimalSerializer(serializers.ModelSerializer):
     class Meta:
         model = Material
-        fields = ["id", "code", "name", "type", "unit"]
+        fields = ["id", "code", "name", "type", "unit", "pack_capacity"]
 
 
 class BOMSerializer(serializers.ModelSerializer):
@@ -790,7 +792,6 @@ class CustomerQuotationItemSerializer(serializers.ModelSerializer):
             "total_cost_per_kg",
             "calculated_price",
             "is_active",
-            # 統一命名後的外掛欄位
             "sales_unit",
             "sales_unit_quantity",
             "sales_pack_unit",

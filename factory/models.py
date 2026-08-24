@@ -11,6 +11,8 @@ TYPE_CHOICES = (
     ("SEMI", "半成品"),
     ("PRODUCT", "成品"),
     ("PACK", "包材"),
+    ("STICKER", "標籤貼紙"),
+    ("OTHER", "其他"),
 )
 
 
@@ -307,7 +309,7 @@ class ProductProfile(models.Model):
         help_text="如: 1KG*25包/箱，則填1(箱)",
     )
     sales_pack_unit = models.CharField(
-        max_length=10, default="包", verbose_name="銷售輔助單位"
+        max_length=10, default="箱", verbose_name="銷售輔助單位"
     )
     sales_pack_quantity = models.DecimalField(
         max_digits=10,
@@ -624,11 +626,6 @@ class BatchInventoryLog(models.Model):
 
     class Meta:
         db_table = "batch_inventory_logs"
-
-
-class RequisitionStatus(models.TextChoices):
-    WAITING = "WAITING", "等待進貨"
-    STOCKED = "STOCKED", "已經入庫"
 
 
 class PurchaseRequisition(models.Model):

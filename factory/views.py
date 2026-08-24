@@ -60,9 +60,19 @@ from .serializers import (
     MaterialSerializer,
     ProductionOrderSerializer,
     PurchaseRequisitionSerializer,
-    RecallReportSerializer,
     VendorSerializer,
 )
+
+
+def to_decimal5(value):
+    """轉換為精準的五位小數 Decimal"""
+    FIVE_DECIMALS = Decimal("0.00000")
+    if value is None or value == "":
+        return FIVE_DECIMALS
+    try:
+        return Decimal(str(value)).quantize(FIVE_DECIMALS, rounding=ROUND_HALF_UP)
+    except (ValueError, TypeError, InvalidOperation):
+        return FIVE_DECIMALS
 
 
 class CRUDAuditMixin:
@@ -378,7 +388,9 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     serializer_class = MaterialRequirementPlanSerializer
 
     def get_permissions(self):
-        return [IsAuthenticated(), IsAdminOrEmployerOrReadOnly()]
+        return [IsAuthenticated()]
+
+        # return [IsAuthenticated(), IsAdminOrEmployerOrReadOnly()]
 
     @action(detail=False, methods=["get"])
     def daily_sequence(self, request):
@@ -635,7 +647,9 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     search_fields = ["name", "code", "english_name"]
 
     def get_permissions(self):
-        return [IsAuthenticated(), IsRDOrReadOnly()]
+        return [IsAuthenticated()]
+
+        # return [IsAuthenticated(), IsRDOrReadOnly()]
 
     def get_queryset(self):
         queryset = Material.objects.filter(is_active=True).order_by("-id")
@@ -1088,7 +1102,7 @@ class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 two_weeks_ago = today - timedelta(days=365)
                 queryset = queryset.filter(request_date__range=[two_weeks_ago, today])
 
-        return queryset.order_by("-request_date")
+        return queryset.order_by("-created_at")
 
     def perform_create(self, serializer):
         items_data = serializer.validated_data.pop("items", [])
@@ -1219,7 +1233,8 @@ class CustomerOrderViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     serializer_class = CustomerOrderSerializer
 
     def get_permissions(self):
-        return [IsAuthenticated(), IsAdminOrEmployerOrReadOnly()]
+        return [IsAuthenticated()]
+        # return [IsAuthenticated(), IsAdminOrEmployerOrReadOnly()]
 
     @transaction.atomic
     def perform_create(self, serializer):
@@ -1255,9 +1270,17 @@ class CustomerOrderViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         return Response(serializer.data)
 
 
-def to_decimal4(value):
-    """轉換為精準的四位小數 Decimal"""
-    FOUR_DECIMALS = Decimal("0.0000")
+from collections import deque
+
+from rest_framework import viewsets
+from rest_framework.decorators import action
+
+from .models import BOM, BatchInventory, Material, ProductionOrder
+
+
+def to_decimal5(value):
+    """轉換為精準的五位小數 Decimal"""
+    FOUR_DECIMALS = Decimal("0.00000")
     if value is None or value == "":
         return FOUR_DECIMALS
     try:
@@ -1269,17 +1292,6 @@ def to_decimal4(value):
 class TraceViewSet(viewsets.ViewSet):
     """
     取得特定異常物料的回收計畫書核心指標
-
-    1. 回收原料總量 (異常原料進貨總量/已投入量)
-       - 實作：遍歷所有啟用中的生產單加總異常物料的實際使用量。
-    2. 尚未使用原料總量 (異常原料在庫總量)
-       - 實作：查詢批號庫存 (BatchInventory) 中該物料的 remaining_qty 總和。
-    3. 產品生產總量 (各品項產品之總量)
-       - 實作：受污染的生產單產量 × 該產品 BOM 的 base_quantity。
-    4. 尚未出貨產品總量 (各品項在庫總量)
-       - 實作：受污染的生產單剩餘庫存 × 該產品 BOM 的 base_quantity。
-    5. 下游總出貨總量 (已出貨至下游廠商之總量)
-       - 實作：受污染生產單的銷貨量 × 該產品 BOM 的 base_quantity。
     """
 
     def get_permissions(self):
@@ -1300,115 +1312,111 @@ class TraceViewSet(viewsets.ViewSet):
             return Response({"error": "找不到該物料"}, status=status.HTTP_404_NOT_FOUND)
 
         # ---------------------------------------------------------
-        # 1. 取得「尚未使用的原料總量」(指標 2)
+        # 1. 取得「尚未使用原料總量」 (異常原料在庫總量)
         # ---------------------------------------------------------
         unused_raw_agg = BatchInventory.objects.filter(
             material=material, is_active=True
         ).aggregate(total=Sum("remaining_qty"))["total"]
 
-        used_raw_total = Decimal("0.0000")  # 指標 1 (異常原料已投入量)
-        unused_raw_total = to_decimal4(unused_raw_agg or 0)  # 指標 2 (異常原料在庫量)
-        total_produced_product = Decimal("0.0000")  # 指標 3 (產品生產總量)
-        total_in_stock_product = Decimal("0.0000")  # 指標 4 (尚未出貨產品總量)
-        total_shipped_product = Decimal("0.0000")  # 指標 5 (下游總出貨總量)
+        used_raw_total = Decimal("0.00000")
+        unused_raw_total = to_decimal5(unused_raw_agg or 0)
+
+        total_produced_product = Decimal("0.00000")
+        total_in_stock_product = Decimal("0.00000")
+        total_shipped_product = Decimal("0.00000")
 
         # ---------------------------------------------------------
-        # 2. 篩選受污染的生產單，並計算「已使用的原料總量」(指標 1)
+        # 2. 向上追溯 (Bottom-Up Trace) - 🚀 deque & 零 N+1 查詢
         # ---------------------------------------------------------
-        # 🚀 效能優化：加入 select_related("product")
-        all_pos = (
-            ProductionOrder.objects.filter(is_active=True)
+        tainted_material_ids = {material.id}
+        queue = deque([material.id])
+
+        while queue:
+            # 批次處理：一次把同階層的 ID 彈出，用 1 次 Query 找齊母件
+            current_batch = [queue.popleft() for _ in range(len(queue))]
+
+            parent_ids = BOM.objects.filter(
+                child_id__in=current_batch, is_active=True
+            ).values_list("parent_id", flat=True)
+
+            for parent_id in parent_ids:
+                if parent_id not in tainted_material_ids:
+                    tainted_material_ids.add(parent_id)
+                    queue.append(parent_id)
+
+        # ---------------------------------------------------------
+        # 3. 抓取受污染物料家族的生產單與重量轉換係數
+        # ---------------------------------------------------------
+        tainted_pos = (
+            ProductionOrder.objects.filter(
+                product_id__in=tainted_material_ids, is_active=True
+            )
             .select_related("product")
             .prefetch_related("delivery_notes")
         )
 
-        tainted_pos = []
-        for po in all_pos:
-            is_tainted = False
-            materials_info = (
-                po.materials_info if isinstance(po.materials_info, list) else []
-            )
-
-            for mat_info in materials_info:
-                # 這裡對齊 JSON 裡面的結構，假設 JSON 裡有存 material.code
-                if str(mat_info.get("code")) == material.code:
-                    is_tainted = True
-
-                    # 計算指標 1: 加總實際使用的異常原料
-                    batches = mat_info.get("batches", [])
-                    for b in batches:
-                        used_qty = to_decimal4(b.get("used", 0))
-                        used_raw_total += used_qty
-
-            if is_tainted:
-                tainted_pos.append(po)
-
-        # 如果沒有受影響的生產單，可以提早結束迴圈，直接回傳
-        if tainted_pos:
+        if tainted_pos.exists():
             # ---------------------------------------------------------
-            # 3. 取得「產品的配方基準量 (base_quantity) Mapping」
-            # ---------------------------------------------------------
-            # 🚀 效能優化：一次性把需要的 base_quantity 撈出來，不做 N+1 查詢
-            tainted_product_ids = {po.product_id for po in tainted_pos}
-
-            # 因為同一個成品 (parent) 的所有配方列 (child) 其 base_quantity 都是一樣的
-            # 我們可以直接用 values + distinct() 快速取得每個產品的配方基數
-            bom_qs = (
-                BOM.objects.filter(parent_id__in=tainted_product_ids, is_active=True)
-                .values("parent_id", "base_quantity")
-                .distinct()
-            )
-
-            # 產出 mapping 字典： { product_id: base_quantity }
-            base_qty_map = {
-                item["parent_id"]: to_decimal4(item["base_quantity"]) for item in bom_qs
-            }
-
-            # ---------------------------------------------------------
-            # 4. 計算指標 3, 4, 5 (次數/批數 × 配方基準量)
+            # 4. 指標計算
             # ---------------------------------------------------------
             for po in tainted_pos:
-                # 取出對應產品的 base_quantity，若無設定則預設為 1 (避免乘法歸零)
-                base_qty = base_qty_map.get(po.product_id, Decimal("1.0000"))
-
-                # 👉 指標 3. 產品生產總量 (實際生產批數 × 配方基數)
-                product_qty_val = (
-                    po.actual_qty if po.actual_qty is not None else po.target_qty
+                # (A) 指標 1: 異常原料投入總量
+                materials_info = (
+                    po.materials_info if isinstance(po.materials_info, list) else []
                 )
-                total_produced_product += to_decimal4(product_qty_val or 0) * base_qty
+                for mat_info in materials_info:
+                    if str(mat_info.get("code")) == material.code:
+                        for b in mat_info.get("batches", []):
+                            used_raw_total += to_decimal5(b.get("used", 0))
 
-                # 👉 指標 4. 尚未出貨產品總量
-                # Model 裡寫的 @property remaining_qty 是：target_qty - active_delivered_qty
-                # 我們直接拿這個「剩餘未出貨批數」乘上配方基數
-                po_remaining_batches = po.remaining_qty
-                total_in_stock_product += (
-                    to_decimal4(po_remaining_batches or 0) * base_qty
-                )
+                # (B) 指標 3, 4, 5: 產品相關重量
+                # 只有最終成品 (PRODUCT) 才會計入對外通報的回收產品總量
+                if po.product.type == "PRODUCT":
+                    product_qty_val = (
+                        po.actual_qty if po.actual_qty is not None else po.target_qty
+                    )
+                    total_produced_product += to_decimal5(product_qty_val or 0)
 
-                # 👉 指標 5. 下游總出貨總量
-                # Model 裡寫的 @property active_delivered_qty 就是歷史累計出貨批數
-                po_delivered_batches = po.active_delivered_qty
-                total_shipped_product += (
-                    to_decimal4(po_delivered_batches or 0) * base_qty
-                )
+                    po_remaining_batches = po.remaining_qty
+                    total_in_stock_product += to_decimal5(po_remaining_batches or 0)
+
+                    po_delivered_batches = po.active_delivered_qty
+                    total_shipped_product += to_decimal5(po_delivered_batches or 0)
 
         # ---------------------------------------------------------
-        # 5. 組合並回傳資料
+        # 5. 精度強制約束與浮點數誤差吸收
         # ---------------------------------------------------------
+        used_raw_total = to_decimal5(used_raw_total)
+        total_produced_product = to_decimal5(total_produced_product)
+        total_in_stock_product = to_decimal5(total_in_stock_product)
+        total_shipped_product = to_decimal5(total_shipped_product)
+
+        # 【浮點數誤差吸收機制】
+        total_raw = used_raw_total + unused_raw_total
+        if abs(total_raw - total_raw.to_integral_value()) < Decimal("0.0005"):
+            corrected_total = total_raw.to_integral_value()
+            unused_raw_total = to_decimal5(corrected_total - used_raw_total)
+            # 重算修正後的總量 (等同於進貨總量)
+            total_raw = corrected_total
+
         data = {
             "material_id": material.id,
             "material_name": material.name,
             "material_code": material.code,
-            "used_raw_total": used_raw_total,
+            # 回收原料總量 = 異常原料進貨總量(kg)
+            "total_raw_recalled": to_decimal5(total_raw),
+            # 尚未使用原料總量 = 異常原料在庫總量(kg)
             "unused_raw_total": unused_raw_total,
+            # 以下指標已經全部轉換為公斤 (KG)
             "total_produced_product": total_produced_product,
             "total_in_stock_product": total_in_stock_product,
             "total_shipped_product": total_shipped_product,
         }
 
         # 將計算結果透過 Serializer 回傳給前端
-        serializer = RecallReportSerializer(data)
-        return Response(serializer.data, status=status.HTTP_200_OK)
+        # serializer = RecallReportSerializer(data)
+        # return Response(serializer.data, status=status.HTTP_200_OK)
+        return Response(data, status=status.HTTP_200_OK)
 
 
 class CustomerQuotationViewSet(CRUDAuditMixin, viewsets.ModelViewSet):

@@ -1,3 +1,4 @@
+import random
 from datetime import timedelta
 from decimal import Decimal
 
@@ -9,7 +10,7 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import BOM, BatchInventory, Material, ProductProfile
+from .models import BOM, BatchInventory, Material, MaterialProvider, ProductProfile
 
 
 class InitMockDataAPIView(APIView):
@@ -387,6 +388,117 @@ class InitMockDataAPIView(APIView):
                         "total_product_profiles": profiles_created,
                         "total_boms_created": boms_created,
                         "total_inventory_batches": inventory_materials.count(),
+                    },
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        except Exception as e:
+            return Response(
+                {"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+
+from django.db.models import Q
+from rest_framework.views import APIView
+
+from .models import (
+    PurchaseRequisition,
+    PurchaseRequisitionItem,
+)
+
+
+class InitPurchaseMockDataAPIView(APIView):
+    """
+    動態抓取資料庫內的 原物料 (RAW) 與 包材 (PACK) 資料 (排除標籤)，
+    並生成近 90 天內的歷史請購單，用以驗證 estimated_cost 的加權平均成本算法。
+    """
+
+    def get_permissions(self):
+        return [AllowAny()]
+
+    def post(self, request):
+        user = User.objects.first()
+        if not user:
+            return Response(
+                {"error": "請先建立至少一個 User"}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # 1. 準備通用的供應商 (若不存在則建立)
+        provider, _ = MaterialProvider.objects.get_or_create(
+            code="MOCK_V01",
+            defaults={
+                "name": "預設模擬供應商",
+                "tax_id": "99999999",
+                "note": "系統自動產生的測試用供應商",
+                "created_by": user,
+            },
+        )
+
+        # 2. 單一 Query 提取目標物料：
+        #    條件：(類型為 RAW) OR (類型為 PACK 且 名稱不包含 "貼")，並確保是啟用狀態
+        target_materials = Material.objects.filter(
+            Q(type="RAW") | (Q(type="PACK") & ~Q(name__icontains="貼")), is_active=True
+        )
+
+        if not target_materials.exists():
+            return Response(
+                {"error": "資料庫內找不到符合條件的 RAW 或 PACK 物料，請先建立資料。"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        requisitions_created = 0
+
+        try:
+            with transaction.atomic():
+                today = timezone.now().date()
+
+                for mat in target_materials:
+                    # 產生過去 90 天內的 3 個隨機日期作為進貨日
+                    purchase_dates = [
+                        today - timedelta(days=random.randint(1, 29)),
+                        today - timedelta(days=random.randint(30, 59)),
+                        today - timedelta(days=random.randint(60, 89)),
+                    ]
+
+                    # 決定這項物料的基礎單價 (RAW 用 100 當基準，PACK 用 10 當基準)
+                    base_price = 100.0 if mat.type == "RAW" else 10.0
+
+                    for p_date in purchase_dates:
+                        # 隨機波動價格 (± 15%)
+                        price_fluctuation = base_price * random.uniform(0.85, 1.15)
+                        # 隨機進貨數量 (RAW: 100~500 KG, PACK: 1000~5000 個)
+                        qty = (
+                            random.randint(100, 500)
+                            if mat.type == "RAW"
+                            else random.randint(1000, 5000)
+                        )
+
+                        # 建立請購單
+                        req = PurchaseRequisition.objects.create(
+                            request_date=p_date,
+                            applicant="系統產生 (Mock)",
+                            status="stocked",  # 狀態必須是 stocked 才會被計入 estimated_cost 成本
+                        )
+                        requisitions_created += 1
+
+                        # 建立請購明細
+                        PurchaseRequisitionItem.objects.create(
+                            requisition=req,
+                            material=mat,
+                            material_provider=provider,
+                            quantity=Decimal(str(qty)),
+                            unit=mat.unit,
+                            purchased_price=Decimal(str(round(price_fluctuation, 2))),
+                            expected_delivery_date=p_date + timedelta(days=3),
+                        )
+
+            return Response(
+                {
+                    "message": "歷史採購 Mock Data 建立成功，可用於驗證 estimated_cost！",
+                    "stats": {
+                        "total_materials_processed": target_materials.count(),
+                        "purchase_requisitions_created": requisitions_created,
                     },
                 },
                 status=status.HTTP_200_OK,

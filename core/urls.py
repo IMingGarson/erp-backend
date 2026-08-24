@@ -11,7 +11,7 @@ from factory.auth.views import (
     LogoutView,
     UserProfileViewSet,
 )
-from factory.mock import InitMockDataAPIView
+from factory.mock import InitMockDataAPIView, InitPurchaseMockDataAPIView
 from factory.views import (
     BatchInventoryViewSet,
     BOMViewSet,
@@ -65,6 +65,11 @@ dev_urlpatterns = [
         name="add-employer-account",
     ),
     path("api/init-mock-data", InitMockDataAPIView.as_view(), name="import_sheets"),
+    path(
+        "api/init-purchased-data",
+        InitPurchaseMockDataAPIView.as_view(),
+        name="mock-purchase-data",
+    ),
 ]
 
 if getattr(settings, "ENV", "dev") == "dev":
