@@ -221,6 +221,7 @@ class MaterialSerializer(serializers.ModelSerializer):
             "type",  # 物料類型
             "unit",  # 單位
             "estimated_cost",  # 預估成本 (動態計算：三個月加權平均)
+            "nutrition_fact", # 八大營養價值標示
             "allergen_info",  # 過敏原資訊
             "storage_life",  # 保存期限
             "description",  # 描述 (成分來源)

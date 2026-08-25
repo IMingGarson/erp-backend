@@ -176,7 +176,12 @@ class Material(models.Model):
     description = models.TextField(
         blank=True, null=True, verbose_name="描述 (成分來源)"
     )
-
+    nutrition_fact = models.JSONField(
+        blank=True, 
+        null=True,
+        default=dict,
+        verbose_name="八大營養價值標示"
+    )
     additive_license_no = models.CharField(
         max_length=100, blank=True, null=True, verbose_name="添加物許可證號"
     )

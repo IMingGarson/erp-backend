@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation
+
+from collections import deque
 
 from django.db import models, transaction
 from django.db.models import (
@@ -20,7 +22,7 @@ from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotAuthenticated, ValidationError
 from rest_framework.filters import SearchFilter
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
 
 from .models import (
@@ -63,16 +65,7 @@ from .serializers import (
     VendorSerializer,
 )
 
-
-def to_decimal5(value):
-    """轉換為精準的五位小數 Decimal"""
-    FIVE_DECIMALS = Decimal("0.00000")
-    if value is None or value == "":
-        return FIVE_DECIMALS
-    try:
-        return Decimal(str(value)).quantize(FIVE_DECIMALS, rounding=ROUND_HALF_UP)
-    except (ValueError, TypeError, InvalidOperation):
-        return FIVE_DECIMALS
+from .services import TFDALoopUpService, UtilsFuncService
 
 
 class CRUDAuditMixin:
@@ -649,7 +642,26 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     def get_permissions(self):
         return [IsAuthenticated()]
 
-        # return [IsAuthenticated(), IsRDOrReadOnly()]
+    @action(detail=False, methods=["get"], url_path="tfda_lookup")
+    def tfda_lookup(self, request):
+        search_term = request.query_params.get("q", "").strip()
+        if not search_term:
+            return Response(
+                {"message": "error", "error": "請提供搜尋關鍵字 (參數: q)"}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            results = TFDALoopUpService.import_tfda_open_data(search_term)
+            return Response(results, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            return Response(
+                {"message": "error", "data": str(e)}, 
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+
 
     def get_queryset(self):
         queryset = Material.objects.filter(is_active=True).order_by("-id")
@@ -1269,26 +1281,6 @@ class CustomerOrderViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
 
-
-from collections import deque
-
-from rest_framework import viewsets
-from rest_framework.decorators import action
-
-from .models import BOM, BatchInventory, Material, ProductionOrder
-
-
-def to_decimal5(value):
-    """轉換為精準的五位小數 Decimal"""
-    FOUR_DECIMALS = Decimal("0.00000")
-    if value is None or value == "":
-        return FOUR_DECIMALS
-    try:
-        return Decimal(str(value)).quantize(FOUR_DECIMALS, rounding=ROUND_HALF_UP)
-    except (ValueError, TypeError, InvalidOperation):
-        return FOUR_DECIMALS
-
-
 class TraceViewSet(viewsets.ViewSet):
     """
     取得特定異常物料的回收計畫書核心指標
@@ -1319,7 +1311,7 @@ class TraceViewSet(viewsets.ViewSet):
         ).aggregate(total=Sum("remaining_qty"))["total"]
 
         used_raw_total = Decimal("0.00000")
-        unused_raw_total = to_decimal5(unused_raw_agg or 0)
+        unused_raw_total = UtilsFuncService.to_decimal5(unused_raw_agg or 0)
 
         total_produced_product = Decimal("0.00000")
         total_in_stock_product = Decimal("0.00000")
@@ -1367,7 +1359,7 @@ class TraceViewSet(viewsets.ViewSet):
                 for mat_info in materials_info:
                     if str(mat_info.get("code")) == material.code:
                         for b in mat_info.get("batches", []):
-                            used_raw_total += to_decimal5(b.get("used", 0))
+                            used_raw_total += UtilsFuncService.to_decimal5(b.get("used", 0))
 
                 # (B) 指標 3, 4, 5: 產品相關重量
                 # 只有最終成品 (PRODUCT) 才會計入對外通報的回收產品總量
@@ -1375,27 +1367,27 @@ class TraceViewSet(viewsets.ViewSet):
                     product_qty_val = (
                         po.actual_qty if po.actual_qty is not None else po.target_qty
                     )
-                    total_produced_product += to_decimal5(product_qty_val or 0)
+                    total_produced_product += UtilsFuncService.to_decimal5(product_qty_val or 0)
 
                     po_remaining_batches = po.remaining_qty
-                    total_in_stock_product += to_decimal5(po_remaining_batches or 0)
+                    total_in_stock_product += UtilsFuncService.to_decimal5(po_remaining_batches or 0)
 
                     po_delivered_batches = po.active_delivered_qty
-                    total_shipped_product += to_decimal5(po_delivered_batches or 0)
+                    total_shipped_product += UtilsFuncService.to_decimal5(po_delivered_batches or 0)
 
         # ---------------------------------------------------------
         # 5. 精度強制約束與浮點數誤差吸收
         # ---------------------------------------------------------
-        used_raw_total = to_decimal5(used_raw_total)
-        total_produced_product = to_decimal5(total_produced_product)
-        total_in_stock_product = to_decimal5(total_in_stock_product)
-        total_shipped_product = to_decimal5(total_shipped_product)
+        used_raw_total = UtilsFuncService.to_decimal5(used_raw_total)
+        total_produced_product = UtilsFuncService.to_decimal5(total_produced_product)
+        total_in_stock_product = UtilsFuncService.to_decimal5(total_in_stock_product)
+        total_shipped_product = UtilsFuncService.to_decimal5(total_shipped_product)
 
         # 【浮點數誤差吸收機制】
         total_raw = used_raw_total + unused_raw_total
         if abs(total_raw - total_raw.to_integral_value()) < Decimal("0.0005"):
             corrected_total = total_raw.to_integral_value()
-            unused_raw_total = to_decimal5(corrected_total - used_raw_total)
+            unused_raw_total = UtilsFuncService.to_decimal5(corrected_total - used_raw_total)
             # 重算修正後的總量 (等同於進貨總量)
             total_raw = corrected_total
 
@@ -1404,7 +1396,7 @@ class TraceViewSet(viewsets.ViewSet):
             "material_name": material.name,
             "material_code": material.code,
             # 回收原料總量 = 異常原料進貨總量(kg)
-            "total_raw_recalled": to_decimal5(total_raw),
+            "total_raw_recalled": UtilsFuncService.to_decimal5(total_raw),
             # 尚未使用原料總量 = 異常原料在庫總量(kg)
             "unused_raw_total": unused_raw_total,
             # 以下指標已經全部轉換為公斤 (KG)
