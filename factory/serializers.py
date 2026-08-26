@@ -203,12 +203,34 @@ class MaterialProviderSerializer(serializers.ModelSerializer):
             return f"{obj.created_by.last_name}{obj.created_by.first_name}"
         return "系統產生"
 
+class BOMItemSerializer(serializers.ModelSerializer):
+    child_code = serializers.CharField(source='child.code', read_only=True)
+    child_name = serializers.CharField(source='child.name', read_only=True)
+    child_type = serializers.CharField(source='child.type', read_only=True)
+    child_unit = serializers.CharField(source='child.unit', read_only=True)
+    child_nutrition_fact = serializers.JSONField(source='child.nutrition_fact', read_only=True)
+
+    class Meta:
+        model = BOM
+        fields = [
+            "id", 
+            "child",                # 子物料的 ID
+            "child_code",           # 子物料代號
+            "child_name",           # 子物料名稱
+            "child_type",           # 子物料類型 (RAW, SEMI...)
+            "child_unit",           # 子物料單位 (KG, G...)
+            "child_nutrition_fact", # 子物料的營養素 (🌟 展算用)
+            "base_quantity",        # 配方基數
+            "quantity_required",    # 需求數量
+            "is_active"
+        ]
 
 class MaterialSerializer(serializers.ModelSerializer):
     is_raw_material = serializers.ReadOnlyField()
     estimated_cost = serializers.ReadOnlyField()
     creator_name = serializers.SerializerMethodField()
     product_profiles = ProductProfileSerializer(many=True, read_only=True)
+    boms = BOMItemSerializer(source="main_product", many=True, read_only=True)
 
     class Meta:
         model = Material
@@ -239,6 +261,7 @@ class MaterialSerializer(serializers.ModelSerializer):
             "creator_name",  # 建立者姓名 (自訂方法)
             "created_at",  # 建立時間
             "updated_at",  # 更新時間
+            "boms"
         ]
         read_only_fields = ["id", "created_by", "created_at", "updated_at"]
 
