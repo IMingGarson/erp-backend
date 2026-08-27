@@ -299,6 +299,26 @@ class ProductProfile(models.Model):
         verbose_name="關聯成品",
     )
 
+    outer_pack = models.ForeignKey(
+        Material,
+        on_delete=models.SET_NULL,
+        related_name="outer_pack_profiles",
+        verbose_name="外層包材 (MAJOR)",
+        help_text="對應 sales_unit (如: 5號標準外箱)。負責定義『箱/桶』的實體物料。",
+        blank=True,
+        null=True
+    )
+    
+    inner_pack = models.ForeignKey(
+        Material,
+        on_delete=models.SET_NULL,
+        related_name="inner_pack_profiles",
+        verbose_name="內層包材 (AUX)",
+        help_text="對應 sales_pack_unit (如: 1KG用厚鋁箔袋)。負責定義『包/袋』的實體物料。",
+        blank=True,
+        null=True
+    )
+
     spec = models.TextField(
         blank=True,
         null=True,
@@ -889,6 +909,24 @@ class CustomerQuotationItem(models.Model):
     )
     product = models.ForeignKey(
         "Material", on_delete=models.CASCADE, verbose_name="報價產品"
+    )
+
+    sales_unit = models.CharField(max_length=10, default="箱", verbose_name="銷售單位")
+    sales_unit_quantity = models.DecimalField(
+        max_digits=10, decimal_places=2, default=1, verbose_name="銷售單位數量"
+    )
+    sales_pack_unit = models.CharField(max_length=10, default="包", verbose_name="包裝單位")
+    sales_pack_quantity = models.DecimalField(
+        max_digits=10, decimal_places=2, default=1, verbose_name="每銷售單位含包裝數"
+    )
+    
+    outer_pack = models.ForeignKey(
+        "Material", on_delete=models.SET_NULL, related_name="quotation_outer_packs",
+        null=True, blank=True, verbose_name="外層實體包材"
+    )
+    inner_pack = models.ForeignKey(
+        "Material", on_delete=models.SET_NULL, related_name="quotation_inner_packs",
+        null=True, blank=True, verbose_name="內層實體包材"
     )
 
     # 採用 JSONField 儲存動態成本結構

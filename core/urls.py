@@ -25,6 +25,7 @@ from factory.views import (
     PurchaseRequisitionViewSet,
     TraceViewSet,
     VendorViewSet,
+    ProductProfileViewSet
 )
 
 router = DefaultRouter(trailing_slash=False)
@@ -47,6 +48,7 @@ router.register(
     r"material_providers", MaterialProviderViewSet, basename="material-providers"
 )
 router.register(r"quotations", CustomerQuotationViewSet, basename="quotations")
+router.register(r'product_profiles', ProductProfileViewSet, basename='product-profile')
 
 urlpatterns = [
     path("admin/", admin.site.urls),

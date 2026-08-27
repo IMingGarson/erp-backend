@@ -157,9 +157,18 @@ class UserUpdateSerializer(serializers.ModelSerializer):
 
 
 class ProductProfileSerializer(serializers.ModelSerializer):
+    outer_pack_id = serializers.IntegerField(read_only=True)
+    inner_pack_id = serializers.IntegerField(read_only=True)
     class Meta:
         model = ProductProfile
         fields = [
+            "id",
+            "material",
+            "vendor",
+            "outer_pack",
+            "inner_pack",
+            "outer_pack_id",
+            "inner_pack_id",
             "spec",
             "sales_unit",
             "sales_pack_unit",
@@ -227,7 +236,7 @@ class BOMItemSerializer(serializers.ModelSerializer):
 
 class MaterialSerializer(serializers.ModelSerializer):
     is_raw_material = serializers.ReadOnlyField()
-    estimated_cost = serializers.ReadOnlyField()
+    estimated_cost = serializers.ReadOnlyField() 
     creator_name = serializers.SerializerMethodField()
     product_profiles = ProductProfileSerializer(many=True, read_only=True)
     boms = BOMItemSerializer(source="main_product", many=True, read_only=True)
@@ -833,18 +842,16 @@ class CustomerQuotationItemSerializer(serializers.ModelSerializer):
     )
     calculated_price = serializers.IntegerField(read_only=True)
 
-    # 🌟 與 Model 欄位名稱完全統一的外掛欄位 (供 ProductProfile 使用)
-    sales_unit = serializers.CharField(max_length=10, required=False, write_only=True)
-    sales_unit_quantity = serializers.DecimalField(
-        max_digits=10, decimal_places=2, required=False, write_only=True
+    outer_pack = serializers.PrimaryKeyRelatedField(
+        queryset=Material.objects.filter(type__in=["PACK", "OTHER", "STICKER"]),
+        required=False,
+        allow_null=True,
     )
-    sales_pack_unit = serializers.CharField(
-        max_length=10, required=False, write_only=True
+    inner_pack = serializers.PrimaryKeyRelatedField(
+        queryset=Material.objects.filter(type__in=["PACK", "OTHER", "STICKER"]),
+        required=False,
+        allow_null=True,
     )
-    sales_pack_quantity = serializers.DecimalField(
-        max_digits=10, decimal_places=2, required=False, write_only=True
-    )
-
     class Meta:
         model = CustomerQuotationItem
         fields = [
@@ -862,6 +869,8 @@ class CustomerQuotationItemSerializer(serializers.ModelSerializer):
             "sales_unit_quantity",
             "sales_pack_unit",
             "sales_pack_quantity",
+            "outer_pack", 
+            "inner_pack",
         ]
         extra_kwargs = {"product": {"write_only": True}}
 
@@ -901,7 +910,7 @@ class CustomerQuotationSerializer(serializers.ModelSerializer):
 
     def _sync_product_profile(self, item_data, customer):
         """
-        🌟 同步更新或建立 ProductProfile，直接使用統一的變數名稱提取資料
+        🌟 同步更新或建立 ProductProfile
         """
         material = item_data.get("product")
         if not material:
@@ -913,6 +922,9 @@ class CustomerQuotationSerializer(serializers.ModelSerializer):
         sales_pack_unit = item_data.get("sales_pack_unit", "包")
         sales_pack_quantity = item_data.get("sales_pack_quantity", 1)
         sales_price = item_data.get("final_price_per_kg", None)
+        
+        outer_pack = item_data.get("outer_pack", None)
+        inner_pack = item_data.get("inner_pack", None)
 
         profile = ProductProfile.objects.filter(
             material=material, vendor=customer
@@ -925,6 +937,8 @@ class CustomerQuotationSerializer(serializers.ModelSerializer):
             profile.sales_pack_unit = sales_pack_unit
             profile.sales_pack_quantity = sales_pack_quantity
             profile.sales_price = sales_price
+            profile.outer_pack = outer_pack
+            profile.inner_pack = inner_pack
             profile.save()
         else:
             ProductProfile.objects.create(
@@ -936,6 +950,8 @@ class CustomerQuotationSerializer(serializers.ModelSerializer):
                 sales_pack_unit=sales_pack_unit,
                 sales_pack_quantity=sales_pack_quantity,
                 sales_price=sales_price,
+                outer_pack=outer_pack,
+                inner_pack=inner_pack,
             )
 
     @transaction.atomic
@@ -949,11 +965,7 @@ class CustomerQuotationSerializer(serializers.ModelSerializer):
             self._sync_product_profile(item_data, customer)
 
             item_data.pop("id", None)
-            item_data.pop("sales_unit", None)
-            item_data.pop("sales_unit_quantity", None)
-            item_data.pop("sales_pack_unit", None)
-            item_data.pop("sales_pack_quantity", None)
-
+            
             CustomerQuotationItem.objects.create(quotation=quotation, **item_data)
 
         return quotation
@@ -977,12 +989,6 @@ class CustomerQuotationSerializer(serializers.ModelSerializer):
                 item_id = item_data.get("id")
 
                 self._sync_product_profile(item_data, customer)
-
-                # 清除外掛欄位 (變數名稱已統一)
-                item_data.pop("sales_unit", None)
-                item_data.pop("sales_unit_quantity", None)
-                item_data.pop("sales_pack_unit", None)
-                item_data.pop("sales_pack_quantity", None)
 
                 if item_id and item_id in existing_items:
                     incoming_ids.add(item_id)
@@ -1014,6 +1020,12 @@ class CustomerQuotationSerializer(serializers.ModelSerializer):
                     "costs_breakdown",
                     "pricing_multiplier",
                     "final_price_per_kg",
+                    "sales_unit",
+                    "sales_unit_quantity",
+                    "sales_pack_unit",
+                    "sales_pack_quantity",
+                    "outer_pack",
+                    "inner_pack",
                 ]
                 CustomerQuotationItem.objects.bulk_update(
                     items_to_update, update_fields

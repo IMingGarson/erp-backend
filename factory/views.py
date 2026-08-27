@@ -47,6 +47,7 @@ from .models import (
     PurchaseRequisition,
     PurchaseRequisitionItem,
     PurchaseRequisitionLog,
+    ProductProfile,
     Vendor,
     VendorLog,
 )
@@ -63,6 +64,7 @@ from .serializers import (
     ProductionOrderSerializer,
     PurchaseRequisitionSerializer,
     VendorSerializer,
+    ProductProfileSerializer
 )
 
 from .services import TFDALoopUpService, UtilsFuncService
@@ -661,8 +663,6 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
-
-
     def get_queryset(self):
         queryset = Material.objects.filter(is_active=True).order_by("-id")
 
@@ -726,6 +726,7 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
             )
 
             queryset = queryset.prefetch_related(
+                "product_profiles",
                 Prefetch("main_product__child", queryset=annotated_material_qs),
                 Prefetch(
                     "main_product__child__main_product__child",
@@ -1405,9 +1406,6 @@ class TraceViewSet(viewsets.ViewSet):
             "total_shipped_product": total_shipped_product,
         }
 
-        # 將計算結果透過 Serializer 回傳給前端
-        # serializer = RecallReportSerializer(data)
-        # return Response(serializer.data, status=status.HTTP_200_OK)
         return Response(data, status=status.HTTP_200_OK)
 
 
@@ -1491,3 +1489,19 @@ class CustomerQuotationViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 user,
                 f"系統自動動作：已將 {updated_count} 筆關聯的 IN_DEV 物料推進至 IN_PROD 狀態 單據 #{quotation}",
             )
+
+
+class ProductProfileViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
+    queryset = ProductProfile.objects.select_related(
+        "material",
+        "outer_pack",
+        "inner_pack",
+        "vendor"
+    ).filter(
+        is_active=True
+    ).order_by("-id")
+
+    serializer_class = ProductProfileSerializer
+
+    def get_permissions(self):
+        return [IsAuthenticated()]
