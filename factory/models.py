@@ -211,6 +211,33 @@ class Material(models.Model):
         verbose_name="法規上限比例(%)",
         help_text="如二矽法規上限2%，請填 2.0",
     )
+    # ==========================
+    # 廠內品管物理指標 (固定欄位)
+    # ==========================
+    qc_dilution_ratio = models.CharField(
+        max_length=20, blank=True, null=True, verbose_name="檢測稀釋比例", help_text="如: (1:1), (1:5) 或 (原)"
+    )
+    qc_brix_min = models.DecimalField(
+        max_digits=5, decimal_places=2, null=True, blank=True, verbose_name="Brix 下限"
+    )
+    qc_brix_max = models.DecimalField(
+        max_digits=5, decimal_places=2, null=True, blank=True, verbose_name="Brix 上限"
+    )
+    qc_salt_min = models.DecimalField(
+        max_digits=5, decimal_places=2, null=True, blank=True, verbose_name="鹽度 下限"
+    )
+    qc_salt_max = models.DecimalField(
+        max_digits=5, decimal_places=2, null=True, blank=True, verbose_name="鹽度 上限"
+    )
+    qc_moisture_max = models.DecimalField(
+        max_digits=5, decimal_places=2, null=True, blank=True, verbose_name="水分上限(%)", help_text="如: 10 代表 <10%"
+    )
+    qc_microbiology = models.JSONField(
+        blank=True, 
+        null=True,
+        default=list,
+        verbose_name="微生物與其他法定檢驗標準"
+    )
     created_by = models.ForeignKey(User, on_delete=models.DO_NOTHING)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -356,7 +383,6 @@ class ProductProfile(models.Model):
         blank=True,
     )
 
-    label_info = models.JSONField(verbose_name="標籤資訊", default=dict, blank=True)
     is_active = models.BooleanField(
         default=True, db_index=True, verbose_name="是否啟用"
     )

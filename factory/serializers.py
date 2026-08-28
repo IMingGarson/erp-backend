@@ -175,7 +175,6 @@ class ProductProfileSerializer(serializers.ModelSerializer):
             "sales_unit_quantity",
             "sales_pack_quantity",
             "sales_price",
-            "label_info",
         ]
 
 
@@ -270,7 +269,20 @@ class MaterialSerializer(serializers.ModelSerializer):
             "creator_name",  # 建立者姓名 (自訂方法)
             "created_at",  # 建立時間
             "updated_at",  # 更新時間
-            "boms"
+            "boms", # 配方資料
+            # ==========================
+            # 廠內品管物理指標欄位
+            # ==========================
+            "qc_dilution_ratio",  # 稀釋比例 (如: 1:1, 1:5, 原)
+            "qc_brix_min",        # Brix 下限
+            "qc_brix_max",        # Brix 上限
+            "qc_salt_min",        # 鹽度 下限
+            "qc_salt_max",        # 鹽度 上限
+            "qc_moisture_max",    # 水分上限 (%)
+            # ==========================
+            # 微生物檢驗標準 (JSON)
+            # ==========================
+            "qc_microbiology",    # 微生物檢驗陣列 (JSON)
         ]
         read_only_fields = ["id", "created_by", "created_at", "updated_at"]
 
