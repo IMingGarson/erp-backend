@@ -14,8 +14,9 @@ from django.db.models import (
     Q,
     Subquery,
     Sum,
+    Avg
 )
-from django.db.models.functions import Cast, Coalesce
+from django.db.models.functions import Cast, Coalesce, TruncMonth
 from django.utils import timezone
 from django_filters import rest_framework as filters
 from rest_framework import status, viewsets
@@ -68,7 +69,6 @@ from .serializers import (
 )
 
 from .services import TFDALoopUpService, UtilsFuncService
-
 
 class CRUDAuditMixin:
     LOG_MODEL_MAP = {
@@ -644,6 +644,105 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     def get_permissions(self):
         return [IsAuthenticated()]
 
+    @action(detail=True, methods=['get'])
+    def historical_prices(self, request, pk=None):
+        material = self.get_object()
+
+        # ==========================================
+        # 情況一：RAW 與 PACK (回傳明細，供前端畫圖與切換供應商)
+        # ==========================================
+        if material.type in ["RAW", "PACK"]:
+            items = PurchaseRequisitionItem.objects.filter(
+                material=material,
+                is_active=True,
+                requisition__is_active=True,
+                requisition__status="stocked"
+            ).select_related('requisition', 'material_provider').order_by('requisition__request_date')
+
+            data = [
+                {
+                    "date": item.requisition.request_date.strftime("%Y-%m-%d"),
+                    "unit_price": float(item.purchased_price),  # 模型定義的「採購單價」
+                    "quantity": float(item.quantity),           # 購買數量
+                    "total_price": float(item.purchased_price * item.quantity), # 總金額由後端算好
+                    "provider": item.material_provider.name if item.material_provider else "未知供應商"
+                }
+                for item in items
+            ]
+            return Response({"type": material.type, "data": data})
+
+        # ==========================================
+        # 情況二：SEMI 與 PRODUCT (後端處理 BOM 展開與月份斷層 LOCF)
+        # ==========================================
+        elif material.type in ["SEMI", "PRODUCT"]:
+            boms = material.main_product.filter(is_active=True)
+            if not boms.exists():
+                return Response({"type": material.type, "data": []})
+
+            base_qty = float(boms.first().base_quantity)
+            components_history = {}
+            all_months = set()
+
+            # 1. 收集每個子物料的「歷史月平均單價」
+            for bom in boms:
+                child = bom.child
+                req_ratio = float(bom.quantity_required) / base_qty
+
+                monthly_avg = PurchaseRequisitionItem.objects.filter(
+                    material=child,
+                    is_active=True,
+                    requisition__is_active=True,
+                    requisition__status="stocked"
+                ).annotate(
+                    month=TruncMonth('requisition__request_date')
+                ).values('month').annotate(
+                    avg_price=Avg('purchased_price')
+                ).order_by('month')
+
+                history_map = {m['month'].strftime("%Y-%m"): float(m['avg_price']) for m in monthly_avg if m['month']}
+                components_history[child.id] = {
+                    "name": child.name, # 🌟 紀錄子物料名稱供前端顯示
+                    "ratio": req_ratio,
+                    "history": history_map,
+                    "fallback_price": float(child.estimated_cost)
+                }
+                all_months.update(history_map.keys())
+
+            # 2. 處理「月份斷層」並加總當月 BOM 總成本與成本結構
+            sorted_months = sorted(list(all_months))
+            data = []
+            
+            last_known_price = {child_id: info["fallback_price"] for child_id, info in components_history.items()}
+
+            for month_str in sorted_months:
+                total_monthly_cost = 0
+                breakdown = [] # 🌟 準備存放該月的成本細項
+
+                for child_id, info in components_history.items():
+                    if month_str in info["history"]:
+                        last_known_price[child_id] = info["history"][month_str]
+                    
+                    # 該物料當月貢獻的成本
+                    cost_contribution = last_known_price[child_id] * info["ratio"]
+                    total_monthly_cost += cost_contribution
+                    
+                    # 🌟 寫入 breakdown
+                    breakdown.append({
+                        "name": info["name"],
+                        "cost": round(cost_contribution, 2)
+                    })
+
+                # 依成本佔比由高到低排序，讓前端顯示更直觀
+                breakdown = sorted(breakdown, key=lambda x: x["cost"], reverse=True)
+
+                data.append({
+                    "month": month_str,
+                    "unit_price": round(total_monthly_cost, 2),
+                    "breakdown": breakdown # 🌟 傳給前端
+                })
+
+            return Response({"type": material.type, "data": data})
+        
     @action(detail=False, methods=["get"], url_path="tfda_lookup")
     def tfda_lookup(self, request):
         search_term = request.query_params.get("q", "").strip()

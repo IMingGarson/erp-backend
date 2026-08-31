@@ -128,7 +128,7 @@ class MaterialProvider(models.Model):
     bank_account = models.CharField(
         max_length=100, blank=True, null=True, verbose_name="銀行帳號"
     )
-    note = models.TextField(verbose_name="備註")
+    note = models.TextField(blank=True, null=True, verbose_name="備註")
     is_active = models.BooleanField(default=True, verbose_name="是否啟用")
     created_at = models.DateTimeField(auto_now_add=True)
     created_by = models.ForeignKey(User, on_delete=models.DO_NOTHING, default=None)
