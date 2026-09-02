@@ -177,10 +177,7 @@ class Material(models.Model):
         blank=True, null=True, verbose_name="描述 (成分來源)"
     )
     nutrition_fact = models.JSONField(
-        blank=True, 
-        null=True,
-        default=dict,
-        verbose_name="八大營養價值標示"
+        blank=True, null=True, default=dict, verbose_name="八大營養價值標示"
     )
     additive_license_no = models.CharField(
         max_length=100, blank=True, null=True, verbose_name="添加物許可證號"
@@ -215,7 +212,11 @@ class Material(models.Model):
     # 廠內品管物理指標 (固定欄位)
     # ==========================
     qc_dilution_ratio = models.CharField(
-        max_length=20, blank=True, null=True, verbose_name="檢測稀釋比例", help_text="如: (1:1), (1:5) 或 (原)"
+        max_length=20,
+        blank=True,
+        null=True,
+        verbose_name="檢測稀釋比例",
+        help_text="如: (1:1), (1:5) 或 (原)",
     )
     qc_brix_min = models.DecimalField(
         max_digits=5, decimal_places=2, null=True, blank=True, verbose_name="Brix 下限"
@@ -230,13 +231,15 @@ class Material(models.Model):
         max_digits=5, decimal_places=2, null=True, blank=True, verbose_name="鹽度 上限"
     )
     qc_moisture_max = models.DecimalField(
-        max_digits=5, decimal_places=2, null=True, blank=True, verbose_name="水分上限(%)", help_text="如: 10 代表 <10%"
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        verbose_name="水分上限(%)",
+        help_text="如: 10 代表 <10%",
     )
     qc_microbiology = models.JSONField(
-        blank=True, 
-        null=True,
-        default=list,
-        verbose_name="微生物與其他法定檢驗標準"
+        blank=True, null=True, default=list, verbose_name="微生物與其他法定檢驗標準"
     )
     created_by = models.ForeignKey(User, on_delete=models.DO_NOTHING)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -333,9 +336,9 @@ class ProductProfile(models.Model):
         verbose_name="外層包材 (MAJOR)",
         help_text="對應 sales_unit (如: 5號標準外箱)。負責定義『箱/桶』的實體物料。",
         blank=True,
-        null=True
+        null=True,
     )
-    
+
     inner_pack = models.ForeignKey(
         Material,
         on_delete=models.SET_NULL,
@@ -343,7 +346,7 @@ class ProductProfile(models.Model):
         verbose_name="內層包材 (AUX)",
         help_text="對應 sales_pack_unit (如: 1KG用厚鋁箔袋)。負責定義『包/袋』的實體物料。",
         blank=True,
-        null=True
+        null=True,
     )
 
     spec = models.TextField(
@@ -517,6 +520,34 @@ class BatchInventory(models.Model):
     created_by = models.ForeignKey(User, on_delete=models.DO_NOTHING)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    # ==========================
+    # 進貨當下的現場規格紀錄 (驗收點收依據)
+    # ==========================
+    in_stock_spec = models.CharField(
+        max_length=150, blank=True, null=True, verbose_name="入庫規格"
+    )
+    package_qty = models.DecimalField(
+        max_digits=10, decimal_places=2, null=True, blank=True, verbose_name="入庫件數"
+    )
+    aux_unit = models.CharField(
+        max_length=20, blank=True, null=True, verbose_name="輔助單位"
+    )
+    aux_quantity = models.DecimalField(
+        max_digits=10,
+        decimal_places=4,
+        null=True,
+        blank=True,
+        verbose_name="單件基本重",
+    )
+    note = models.TextField(blank=True, null=True, verbose_name="進貨備註")
+    source_pr_item = models.OneToOneField(
+        "PurchaseRequisitionItem",
+        on_delete=models.DO_NOTHING,
+        null=True,
+        blank=True,
+        related_name="generated_batch",
+    )
 
     def __str__(self):
         return f"{self.material.name} ({self.batch_number})"
@@ -740,6 +771,26 @@ class PurchaseRequisitionItem(models.Model):
     remark = models.TextField(null=True, blank=True, verbose_name="備註")
     is_active = models.BooleanField(default=True, verbose_name="是否啟用")
 
+    # ==========================
+    # 請購包裝規格 (代表：採購預期)
+    # ==========================
+    in_stock_spec = models.CharField(
+        max_length=150, blank=True, null=True, verbose_name="參考規格"
+    )
+    package_qty = models.DecimalField(
+        max_digits=10, decimal_places=2, null=True, blank=True, verbose_name="採購件數"
+    )
+    aux_unit = models.CharField(
+        max_length=20, blank=True, null=True, verbose_name="輔助單位"
+    )
+    aux_quantity = models.DecimalField(
+        max_digits=10,
+        decimal_places=4,
+        null=True,
+        blank=True,
+        verbose_name="單件基本重",
+    )
+
     @property
     def material_name(self):
         return self.material.name if self.material else ""
@@ -941,18 +992,28 @@ class CustomerQuotationItem(models.Model):
     sales_unit_quantity = models.DecimalField(
         max_digits=10, decimal_places=2, default=1, verbose_name="銷售單位數量"
     )
-    sales_pack_unit = models.CharField(max_length=10, default="包", verbose_name="包裝單位")
+    sales_pack_unit = models.CharField(
+        max_length=10, default="包", verbose_name="包裝單位"
+    )
     sales_pack_quantity = models.DecimalField(
         max_digits=10, decimal_places=2, default=1, verbose_name="每銷售單位含包裝數"
     )
-    
+
     outer_pack = models.ForeignKey(
-        "Material", on_delete=models.SET_NULL, related_name="quotation_outer_packs",
-        null=True, blank=True, verbose_name="外層實體包材"
+        "Material",
+        on_delete=models.SET_NULL,
+        related_name="quotation_outer_packs",
+        null=True,
+        blank=True,
+        verbose_name="外層實體包材",
     )
     inner_pack = models.ForeignKey(
-        "Material", on_delete=models.SET_NULL, related_name="quotation_inner_packs",
-        null=True, blank=True, verbose_name="內層實體包材"
+        "Material",
+        on_delete=models.SET_NULL,
+        related_name="quotation_inner_packs",
+        null=True,
+        blank=True,
+        verbose_name="內層實體包材",
     )
 
     # 採用 JSONField 儲存動態成本結構
@@ -1032,3 +1093,78 @@ class CustomerQuotationLog(models.Model):
 
     def __str__(self):
         return f"{self.quotation.quotation_number} - {self.action_detail} at {self.created_at}"
+
+
+# ==========================================
+# 供應商報價單
+# ==========================================
+class MaterialProviderQuotation(models.Model):
+    id = models.AutoField(primary_key=True)
+    provider = models.ForeignKey(
+        "MaterialProvider",
+        on_delete=models.CASCADE,
+        related_name="quotations",
+        verbose_name="供應商",
+    )
+    quote_date = models.DateField(null=True, blank=True, verbose_name="報價日期")
+    valid_until = models.DateField(null=True, blank=True, verbose_name="報價效期")
+    effective_date = models.DateField(verbose_name="系統生效日期")
+    is_tax_included = models.BooleanField(default=True, verbose_name="是否含稅")
+    remark = models.TextField(blank=True, null=True, verbose_name="整單備註")
+    is_active = models.BooleanField(default=True, verbose_name="是否啟用")
+    created_by = models.ForeignKey(User, on_delete=models.DO_NOTHING)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "material_provider_quotations"
+        verbose_name = "供應商報價單"
+
+
+# ==========================================
+# 報價單明細
+# ==========================================
+class MaterialProviderPrice(models.Model):
+    id = models.AutoField(primary_key=True)
+    quotation = models.ForeignKey(
+        MaterialProviderQuotation, on_delete=models.CASCADE, related_name="items"
+    )
+    material = models.ForeignKey(
+        "Material",
+        on_delete=models.CASCADE,
+        related_name="provider_prices",
+        verbose_name="物料",
+    )
+
+    spec_text = models.CharField(
+        max_length=150, blank=True, null=True, verbose_name="報價規格"
+    )
+    aux_unit = models.CharField(
+        max_length=20, blank=True, null=True, verbose_name="輔助單位"
+    )
+    aux_quantity = models.DecimalField(
+        max_digits=10,
+        decimal_places=4,
+        null=True,
+        blank=True,
+        verbose_name="單件基本重",
+    )
+
+    quoted_price = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        verbose_name="廠商原始報價",
+    )
+    quoted_unit = models.CharField(
+        max_length=20, null=True, blank=True, verbose_name="報價單位"
+    )
+    price = models.DecimalField(
+        max_digits=12, decimal_places=4, verbose_name="系統基本單價"
+    )
+
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "material_provider_prices"

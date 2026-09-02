@@ -1,10 +1,10 @@
+from collections import deque
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
-from collections import deque
-
 from django.db import models, transaction
 from django.db.models import (
+    Avg,
     CharField,
     ExpressionWrapper,
     F,
@@ -14,7 +14,6 @@ from django.db.models import (
     Q,
     Subquery,
     Sum,
-    Avg
 )
 from django.db.models.functions import Cast, Coalesce, TruncMonth
 from django.utils import timezone
@@ -23,7 +22,7 @@ from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotAuthenticated, ValidationError
 from rest_framework.filters import SearchFilter
-from rest_framework.permissions import IsAuthenticated, AllowAny
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from .models import (
@@ -41,14 +40,16 @@ from .models import (
     Material,
     MaterialLog,
     MaterialProvider,
+    MaterialProviderPrice,
+    MaterialProviderQuotation,
     MaterialRequirementPlan,
     MaterialRequirementPlanLog,
     ProductionLog,
     ProductionOrder,
+    ProductProfile,
     PurchaseRequisition,
     PurchaseRequisitionItem,
     PurchaseRequisitionLog,
-    ProductProfile,
     Vendor,
     VendorLog,
 )
@@ -59,16 +60,17 @@ from .serializers import (
     CustomerOrderSerializer,
     CustomerQuotationSerializer,
     DeliveryNoteSerializer,
+    MaterialProviderQuotationSerializer,
     MaterialProviderSerializer,
     MaterialRequirementPlanSerializer,
     MaterialSerializer,
     ProductionOrderSerializer,
+    ProductProfileSerializer,
     PurchaseRequisitionSerializer,
     VendorSerializer,
-    ProductProfileSerializer
 )
-
 from .services import TFDALoopUpService, UtilsFuncService
+
 
 class CRUDAuditMixin:
     LOG_MODEL_MAP = {
@@ -644,7 +646,7 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     def get_permissions(self):
         return [IsAuthenticated()]
 
-    @action(detail=True, methods=['get'])
+    @action(detail=True, methods=["get"])
     def historical_prices(self, request, pk=None):
         material = self.get_object()
 
@@ -652,20 +654,28 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         # 情況一：RAW 與 PACK (回傳明細，供前端畫圖與切換供應商)
         # ==========================================
         if material.type in ["RAW", "PACK"]:
-            items = PurchaseRequisitionItem.objects.filter(
-                material=material,
-                is_active=True,
-                requisition__is_active=True,
-                requisition__status="stocked"
-            ).select_related('requisition', 'material_provider').order_by('requisition__request_date')
+            items = (
+                PurchaseRequisitionItem.objects.filter(
+                    material=material,
+                    is_active=True,
+                    requisition__is_active=True,
+                    requisition__status="stocked",
+                )
+                .select_related("requisition", "material_provider")
+                .order_by("requisition__request_date")
+            )
 
             data = [
                 {
                     "date": item.requisition.request_date.strftime("%Y-%m-%d"),
                     "unit_price": float(item.purchased_price),  # 模型定義的「採購單價」
-                    "quantity": float(item.quantity),           # 購買數量
-                    "total_price": float(item.purchased_price * item.quantity), # 總金額由後端算好
-                    "provider": item.material_provider.name if item.material_provider else "未知供應商"
+                    "quantity": float(item.quantity),  # 購買數量
+                    "total_price": float(
+                        item.purchased_price * item.quantity
+                    ),  # 總金額由後端算好
+                    "provider": item.material_provider.name
+                    if item.material_provider
+                    else "未知供應商",
                 }
                 for item in items
             ]
@@ -688,68 +698,78 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 child = bom.child
                 req_ratio = float(bom.quantity_required) / base_qty
 
-                monthly_avg = PurchaseRequisitionItem.objects.filter(
-                    material=child,
-                    is_active=True,
-                    requisition__is_active=True,
-                    requisition__status="stocked"
-                ).annotate(
-                    month=TruncMonth('requisition__request_date')
-                ).values('month').annotate(
-                    avg_price=Avg('purchased_price')
-                ).order_by('month')
+                monthly_avg = (
+                    PurchaseRequisitionItem.objects.filter(
+                        material=child,
+                        is_active=True,
+                        requisition__is_active=True,
+                        requisition__status="stocked",
+                    )
+                    .annotate(month=TruncMonth("requisition__request_date"))
+                    .values("month")
+                    .annotate(avg_price=Avg("purchased_price"))
+                    .order_by("month")
+                )
 
-                history_map = {m['month'].strftime("%Y-%m"): float(m['avg_price']) for m in monthly_avg if m['month']}
+                history_map = {
+                    m["month"].strftime("%Y-%m"): float(m["avg_price"])
+                    for m in monthly_avg
+                    if m["month"]
+                }
                 components_history[child.id] = {
-                    "name": child.name, # 🌟 紀錄子物料名稱供前端顯示
+                    "name": child.name,  # 🌟 紀錄子物料名稱供前端顯示
                     "ratio": req_ratio,
                     "history": history_map,
-                    "fallback_price": float(child.estimated_cost)
+                    "fallback_price": float(child.estimated_cost),
                 }
                 all_months.update(history_map.keys())
 
             # 2. 處理「月份斷層」並加總當月 BOM 總成本與成本結構
             sorted_months = sorted(list(all_months))
             data = []
-            
-            last_known_price = {child_id: info["fallback_price"] for child_id, info in components_history.items()}
+
+            last_known_price = {
+                child_id: info["fallback_price"]
+                for child_id, info in components_history.items()
+            }
 
             for month_str in sorted_months:
                 total_monthly_cost = 0
-                breakdown = [] # 🌟 準備存放該月的成本細項
+                breakdown = []  # 🌟 準備存放該月的成本細項
 
                 for child_id, info in components_history.items():
                     if month_str in info["history"]:
                         last_known_price[child_id] = info["history"][month_str]
-                    
+
                     # 該物料當月貢獻的成本
                     cost_contribution = last_known_price[child_id] * info["ratio"]
                     total_monthly_cost += cost_contribution
-                    
+
                     # 🌟 寫入 breakdown
-                    breakdown.append({
-                        "name": info["name"],
-                        "cost": round(cost_contribution, 2)
-                    })
+                    breakdown.append(
+                        {"name": info["name"], "cost": round(cost_contribution, 2)}
+                    )
 
                 # 依成本佔比由高到低排序，讓前端顯示更直觀
                 breakdown = sorted(breakdown, key=lambda x: x["cost"], reverse=True)
 
-                data.append({
-                    "month": month_str,
-                    "unit_price": round(total_monthly_cost, 2),
-                    "breakdown": breakdown # 🌟 傳給前端
-                })
+                data.append(
+                    {
+                        "month": month_str,
+                        "unit_price": round(total_monthly_cost, 2),
+                        "breakdown": breakdown,  # 🌟 傳給前端
+                    }
+                )
 
             return Response({"type": material.type, "data": data})
-        
+
     @action(detail=False, methods=["get"], url_path="tfda_lookup")
     def tfda_lookup(self, request):
         search_term = request.query_params.get("q", "").strip()
         if not search_term:
             return Response(
-                {"message": "error", "error": "請提供搜尋關鍵字 (參數: q)"}, 
-                status=status.HTTP_400_BAD_REQUEST
+                {"message": "error", "error": "請提供搜尋關鍵字 (參數: q)"},
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
         try:
@@ -758,8 +778,8 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
         except Exception as e:
             return Response(
-                {"message": "error", "data": str(e)}, 
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                {"message": "error", "data": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
     def get_queryset(self):
@@ -1144,36 +1164,130 @@ class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
     @action(detail=False, methods=["get"], url_path="prev_purchase_price")
     def get_latest_price(self, request):
-        """
-        取得特定物料的最近一次採購單價
-        API Endpoint: GET /api/purchase_requisitions/prev_purchase_price?material_id=XXX
-        """
         material_id = request.query_params.get("material_id")
+        provider_id = request.query_params.get("provider_id")
 
         if not material_id:
-            return Response(
-                {"detail": "必須提供 material_id 參數"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+            raise ValidationError("必須提供 material_id 參數")
 
-        latest_item = (
-            PurchaseRequisitionItem.objects.filter(
-                material_id=material_id,
-                is_active=True,
-                purchased_price__isnull=False,
-                requisition__status="stocked",
-                requisition__is_active=True,
-            )
-            .select_related("requisition")
-            .order_by("-requisition__request_date", "-id")
+        today = timezone.now().date()
+
+        stock_agg = BatchInventory.objects.filter(
+            material_id=material_id, is_active=True, remaining_qty__gt=0
+        ).aggregate(total_stock=Sum("remaining_qty"))
+        current_stock = stock_agg["total_stock"] or 0.0
+
+        price_query = MaterialProviderPrice.objects.filter(
+            material_id=material_id,
+            is_active=True,
+            quotation__is_active=True,
+            quotation__effective_date__lte=today,
+        ).order_by("-quotation__effective_date", "-id")
+
+        if provider_id:
+            price_query = price_query.filter(quotation__provider_id=provider_id)
+
+        latest_provider_price = price_query.first()
+
+        if latest_provider_price:
+            data = {
+                "latest_price": latest_provider_price.price,
+                "latest_spec": latest_provider_price.spec_text or "",
+                "latest_aux_unit": latest_provider_price.aux_unit or "",
+                "latest_aux_quantity": latest_provider_price.aux_quantity or "",
+                "is_tax_included": latest_provider_price.quotation.is_tax_included,
+                "current_stock": current_stock,
+                "source": "PROVIDER",
+            }
+            return Response(data, status=status.HTTP_200_OK)
+
+        # ==========================================
+        # 策略 2：Fallback 回原先的歷史紀錄邏輯
+        # ==========================================
+        item_query = PurchaseRequisitionItem.objects.filter(
+            material_id=material_id,
+            is_active=True,
+            purchased_price__isnull=False,
+            requisition__status="stocked",
+            requisition__is_active=True,
+        ).select_related("requisition")
+
+        if provider_id:
+            item_query = item_query.filter(material_provider_id=provider_id)
+
+        latest_item = item_query.order_by("-requisition__request_date", "-id").first()
+
+        latest_batch = (
+            BatchInventory.objects.filter(material_id=material_id, is_active=True)
+            .order_by("-received_date", "-id")
             .first()
         )
-        if latest_item:
-            return Response(
-                {"latest_price": latest_item.purchased_price}, status=status.HTTP_200_OK
-            )
 
-        return Response({"latest_price": None}, status=status.HTTP_200_OK)
+        latest_spec = getattr(latest_batch, "in_stock_spec", None) or getattr(
+            latest_item, "in_stock_spec", ""
+        )
+        latest_aux_unit = getattr(latest_batch, "aux_unit", None) or getattr(
+            latest_item, "aux_unit", ""
+        )
+        latest_aux_qty = getattr(latest_batch, "aux_quantity", None) or getattr(
+            latest_item, "aux_quantity", ""
+        )
+
+        data = {
+            "latest_price": latest_item.purchased_price if latest_item else None,
+            "latest_spec": latest_spec,
+            "latest_aux_unit": latest_aux_unit,
+            "latest_aux_quantity": latest_aux_qty,
+            "is_tax_included": True,
+            "source": "HISTORY",
+        }
+
+        return Response(data, status=status.HTTP_200_OK)
+
+    def _create_batches_from_incoming_data(
+        self, instance, user, items_data, existing_items
+    ):
+        today = timezone.now().date()
+        date_str = today.strftime("%Y%m%d")
+
+        for item_data in items_data:
+            item_id = item_data.get("id")
+            pr_item = existing_items.get(item_id)
+            if not pr_item:
+                continue
+
+            material = pr_item.material
+
+            # 1. 計算該 Material 在今天的最大流水號
+            existing_batches = BatchInventory.objects.filter(
+                material=material, batch_number__startswith=date_str
+            ).values_list("batch_number", flat=True)
+
+            max_seq = 0
+            for b_num in existing_batches:
+                try:
+                    seq = int(b_num.replace(date_str, ""))
+                    max_seq = max(max_seq, seq)
+                except ValueError:
+                    continue
+
+            new_batch_number = f"{date_str}{max_seq + 1:03d}"
+
+            # 2. 建立批號，使用 payload 傳來的「真實驗收資料」，並綁定 source_pr_item
+            BatchInventory.objects.create(
+                material=material,
+                batch_number=new_batch_number,
+                original_qty=item_data.get("quantity", pr_item.quantity),
+                remaining_qty=item_data.get("quantity", pr_item.quantity),
+                received_date=today,
+                in_stock_spec=item_data.get("in_stock_spec", pr_item.in_stock_spec),
+                package_qty=item_data.get("package_qty", pr_item.package_qty),
+                aux_unit=item_data.get("aux_unit", pr_item.aux_unit),
+                aux_quantity=item_data.get("aux_quantity", pr_item.aux_quantity),
+                note=item_data.get("remark", pr_item.remark),
+                created_by=user,
+                source_pr_item=pr_item,  # 🌟 重點綁定
+            )
 
     def get_queryset(self):
         active_items_prefetch = Prefetch(
@@ -1216,26 +1330,39 @@ class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
         return queryset.order_by("-created_at")
 
+    @transaction.atomic
     def perform_create(self, serializer):
+        user = self.get_valid_user()
         items_data = serializer.validated_data.pop("items", [])
+
         super().perform_create(serializer)
         instance = serializer.instance
 
+        existing_items = {}
         for item_data in items_data:
-            purchased_price = item_data.get("purchased_price")
-            material = item_data.get("material")
-            if purchased_price in [None, ""]:
-                raise ValidationError(
-                    {
-                        "detail": f"異常資料：id={material.id}, name={material.name}, price={purchased_price}"
-                    }
-                )
+            new_item = PurchaseRequisitionItem.objects.create(
+                requisition=instance, **item_data
+            )
+            existing_items[new_item.id] = new_item
+            item_data["id"] = new_item.id
 
-            PurchaseRequisitionItem.objects.create(requisition=instance, **item_data)
+        if instance.status == "stocked":
+            self._create_batches_from_incoming_data(
+                instance, user, items_data, existing_items
+            )
+            self._record_db_log(
+                instance,
+                user,
+                f"{user.last_name}{user.first_name} 建立已入庫請購單，並自動產生批號",
+            )
 
+    @transaction.atomic
     def perform_update(self, serializer):
         user = self.get_valid_user()
         items_data = serializer.validated_data.pop("items", None)
+
+        old_status = serializer.instance.status
+        new_status = serializer.validated_data.get("status", old_status)
 
         super().perform_update(serializer)
         instance = serializer.instance
@@ -1246,41 +1373,39 @@ class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
             }
             incoming_item_ids = []
 
-            for item_data in items_data:
-                item_id = item_data.get("id")
-
-                if item_id and item_id in existing_items:
-                    item_instance = existing_items[item_id]
-                    self._record_db_log(
-                        instance,
-                        user,
-                        f"{user.last_name}{user.first_name} 更新了請購明細: {item_instance.material.name}",
-                    )
-                    for attr, value in item_data.items():
-                        setattr(item_instance, attr, value)
-                    item_instance.save()
-                    incoming_item_ids.append(item_instance.id)
-                else:
-                    item_data.pop("id", None)
-                    new_item = PurchaseRequisitionItem.objects.create(
-                        requisition=instance, **item_data
-                    )
-                    self._record_db_log(
-                        instance,
-                        user,
-                        f"{user.last_name}{user.first_name} 新增了請購明細: {new_item.material.name}",
-                    )
-                    incoming_item_ids.append(new_item.id)
+            if old_status == "waiting" and new_status == "stocked":
+                # 若是入庫動作，不做 PR 更新，拿真實填寫的 payload 去建立 Batch
+                self._create_batches_from_incoming_data(
+                    instance, user, items_data, existing_items
+                )
+                self._record_db_log(
+                    instance,
+                    user,
+                    f"{user.last_name}{user.first_name} 將單據轉為已入庫，自動產生對應批號",
+                )
+                for item_data in items_data:
+                    if item_data.get("id"):
+                        incoming_item_ids.append(item_data.get("id"))
+            else:
+                for item_data in items_data:
+                    item_id = item_data.get("id")
+                    if item_id and item_id in existing_items:
+                        item_instance = existing_items[item_id]
+                        for attr, value in item_data.items():
+                            setattr(item_instance, attr, value)
+                        item_instance.save()
+                        incoming_item_ids.append(item_instance.id)
+                    else:
+                        item_data.pop("id", None)
+                        new_item = PurchaseRequisitionItem.objects.create(
+                            requisition=instance, **item_data
+                        )
+                        incoming_item_ids.append(new_item.id)
 
             for item_id, item_instance in existing_items.items():
                 if item_id not in incoming_item_ids:
                     item_instance.is_active = False
                     item_instance.save(update_fields=["is_active"])
-                    self._record_db_log(
-                        instance,
-                        user,
-                        f"{user.last_name}{user.first_name} 刪除了請購明細: {item_instance.material.name}",
-                    )
 
 
 class DeliveryNoteFilter(filters.FilterSet):
@@ -1381,6 +1506,7 @@ class CustomerOrderViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
 
+
 class TraceViewSet(viewsets.ViewSet):
     """
     取得特定異常物料的回收計畫書核心指標
@@ -1459,7 +1585,9 @@ class TraceViewSet(viewsets.ViewSet):
                 for mat_info in materials_info:
                     if str(mat_info.get("code")) == material.code:
                         for b in mat_info.get("batches", []):
-                            used_raw_total += UtilsFuncService.to_decimal5(b.get("used", 0))
+                            used_raw_total += UtilsFuncService.to_decimal5(
+                                b.get("used", 0)
+                            )
 
                 # (B) 指標 3, 4, 5: 產品相關重量
                 # 只有最終成品 (PRODUCT) 才會計入對外通報的回收產品總量
@@ -1467,13 +1595,19 @@ class TraceViewSet(viewsets.ViewSet):
                     product_qty_val = (
                         po.actual_qty if po.actual_qty is not None else po.target_qty
                     )
-                    total_produced_product += UtilsFuncService.to_decimal5(product_qty_val or 0)
+                    total_produced_product += UtilsFuncService.to_decimal5(
+                        product_qty_val or 0
+                    )
 
                     po_remaining_batches = po.remaining_qty
-                    total_in_stock_product += UtilsFuncService.to_decimal5(po_remaining_batches or 0)
+                    total_in_stock_product += UtilsFuncService.to_decimal5(
+                        po_remaining_batches or 0
+                    )
 
                     po_delivered_batches = po.active_delivered_qty
-                    total_shipped_product += UtilsFuncService.to_decimal5(po_delivered_batches or 0)
+                    total_shipped_product += UtilsFuncService.to_decimal5(
+                        po_delivered_batches or 0
+                    )
 
         # ---------------------------------------------------------
         # 5. 精度強制約束與浮點數誤差吸收
@@ -1487,7 +1621,9 @@ class TraceViewSet(viewsets.ViewSet):
         total_raw = used_raw_total + unused_raw_total
         if abs(total_raw - total_raw.to_integral_value()) < Decimal("0.0005"):
             corrected_total = total_raw.to_integral_value()
-            unused_raw_total = UtilsFuncService.to_decimal5(corrected_total - used_raw_total)
+            unused_raw_total = UtilsFuncService.to_decimal5(
+                corrected_total - used_raw_total
+            )
             # 重算修正後的總量 (等同於進貨總量)
             total_raw = corrected_total
 
@@ -1591,16 +1727,78 @@ class CustomerQuotationViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
 
 class ProductProfileViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
-    queryset = ProductProfile.objects.select_related(
-        "material",
-        "outer_pack",
-        "inner_pack",
-        "vendor"
-    ).filter(
-        is_active=True
-    ).order_by("-id")
+    queryset = (
+        ProductProfile.objects.select_related(
+            "material", "outer_pack", "inner_pack", "vendor"
+        )
+        .filter(is_active=True)
+        .order_by("-id")
+    )
 
     serializer_class = ProductProfileSerializer
 
     def get_permissions(self):
         return [IsAuthenticated()]
+
+
+class MaterialProviderQuotationViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
+    serializer_class = MaterialProviderQuotationSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        queryset = (
+            MaterialProviderQuotation.objects.filter(is_active=True)
+            .select_related("provider")
+            .prefetch_related("items")
+        )
+
+        provider_id = self.request.query_params.get("provider_id")
+        if provider_id:
+            queryset = queryset.filter(provider_id=provider_id)
+
+        return queryset.order_by("-effective_date", "-id")
+
+    @transaction.atomic
+    def perform_create(self, serializer):
+        user = self.get_valid_user()
+        items_data = serializer.validated_data.pop("items", [])
+        instance = serializer.save(created_by=user)
+
+        for item_data in items_data:
+            MaterialProviderPrice.objects.create(quotation=instance, **item_data)
+
+        self._record_db_log(instance, user, f"新增了 {instance.provider.name} 的報價單")
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        user = self.get_valid_user()
+        items_data = serializer.validated_data.pop("items", None)
+        instance = serializer.save()
+
+        if items_data is not None:
+            existing_items = {
+                item.id: item for item in instance.items.filter(is_active=True)
+            }
+            incoming_ids = []
+
+            for item_data in items_data:
+                item_id = item_data.get("id")
+                if item_id and item_id in existing_items:
+                    item_instance = existing_items[item_id]
+                    for attr, val in item_data.items():
+                        setattr(item_instance, attr, val)
+                    item_instance.save()
+                    incoming_ids.append(item_instance.id)
+                else:
+                    item_data.pop("id", None)
+                    new_item = MaterialProviderPrice.objects.create(
+                        quotation=instance, **item_data
+                    )
+                    incoming_ids.append(new_item.id)
+
+            for item_id, item_instance in existing_items.items():
+                if item_id not in incoming_ids:
+                    item_instance.is_active = False
+                    item_instance.save(update_fields=["is_active"])
+
+        self._record_db_log(instance, user, f"更新了 {instance.provider.name} 的報價單")

@@ -23,6 +23,8 @@ from .models import (
     DeliveryNote,
     Material,
     MaterialProvider,
+    MaterialProviderPrice,
+    MaterialProviderQuotation,
     MaterialRequirementPlan,
     ProductionLog,
     ProductionOrder,
@@ -159,6 +161,7 @@ class UserUpdateSerializer(serializers.ModelSerializer):
 class ProductProfileSerializer(serializers.ModelSerializer):
     outer_pack_id = serializers.IntegerField(read_only=True)
     inner_pack_id = serializers.IntegerField(read_only=True)
+
     class Meta:
         model = ProductProfile
         fields = [
@@ -211,31 +214,35 @@ class MaterialProviderSerializer(serializers.ModelSerializer):
             return f"{obj.created_by.last_name}{obj.created_by.first_name}"
         return "系統產生"
 
+
 class BOMItemSerializer(serializers.ModelSerializer):
-    child_code = serializers.CharField(source='child.code', read_only=True)
-    child_name = serializers.CharField(source='child.name', read_only=True)
-    child_type = serializers.CharField(source='child.type', read_only=True)
-    child_unit = serializers.CharField(source='child.unit', read_only=True)
-    child_nutrition_fact = serializers.JSONField(source='child.nutrition_fact', read_only=True)
+    child_code = serializers.CharField(source="child.code", read_only=True)
+    child_name = serializers.CharField(source="child.name", read_only=True)
+    child_type = serializers.CharField(source="child.type", read_only=True)
+    child_unit = serializers.CharField(source="child.unit", read_only=True)
+    child_nutrition_fact = serializers.JSONField(
+        source="child.nutrition_fact", read_only=True
+    )
 
     class Meta:
         model = BOM
         fields = [
-            "id", 
-            "child",                # 子物料的 ID
-            "child_code",           # 子物料代號
-            "child_name",           # 子物料名稱
-            "child_type",           # 子物料類型 (RAW, SEMI...)
-            "child_unit",           # 子物料單位 (KG, G...)
-            "child_nutrition_fact", # 子物料的營養素 (🌟 展算用)
-            "base_quantity",        # 配方基數
-            "quantity_required",    # 需求數量
-            "is_active"
+            "id",
+            "child",  # 子物料的 ID
+            "child_code",  # 子物料代號
+            "child_name",  # 子物料名稱
+            "child_type",  # 子物料類型 (RAW, SEMI...)
+            "child_unit",  # 子物料單位 (KG, G...)
+            "child_nutrition_fact",  # 子物料的營養素 (🌟 展算用)
+            "base_quantity",  # 配方基數
+            "quantity_required",  # 需求數量
+            "is_active",
         ]
+
 
 class MaterialSerializer(serializers.ModelSerializer):
     is_raw_material = serializers.ReadOnlyField()
-    estimated_cost = serializers.ReadOnlyField() 
+    estimated_cost = serializers.ReadOnlyField()
     creator_name = serializers.SerializerMethodField()
     product_profiles = ProductProfileSerializer(many=True, read_only=True)
     boms = BOMItemSerializer(source="main_product", many=True, read_only=True)
@@ -251,7 +258,7 @@ class MaterialSerializer(serializers.ModelSerializer):
             "type",  # 物料類型
             "unit",  # 單位
             "estimated_cost",  # 預估成本 (動態計算：三個月加權平均)
-            "nutrition_fact", # 八大營養價值標示
+            "nutrition_fact",  # 八大營養價值標示
             "allergen_info",  # 過敏原資訊
             "storage_life",  # 保存期限
             "description",  # 描述 (成分來源)
@@ -269,20 +276,20 @@ class MaterialSerializer(serializers.ModelSerializer):
             "creator_name",  # 建立者姓名 (自訂方法)
             "created_at",  # 建立時間
             "updated_at",  # 更新時間
-            "boms", # 配方資料
+            "boms",  # 配方資料
             # ==========================
             # 廠內品管物理指標欄位
             # ==========================
             "qc_dilution_ratio",  # 稀釋比例 (如: 1:1, 1:5, 原)
-            "qc_brix_min",        # Brix 下限
-            "qc_brix_max",        # Brix 上限
-            "qc_salt_min",        # 鹽度 下限
-            "qc_salt_max",        # 鹽度 上限
-            "qc_moisture_max",    # 水分上限 (%)
+            "qc_brix_min",  # Brix 下限
+            "qc_brix_max",  # Brix 上限
+            "qc_salt_min",  # 鹽度 下限
+            "qc_salt_max",  # 鹽度 上限
+            "qc_moisture_max",  # 水分上限 (%)
             # ==========================
             # 微生物檢驗標準 (JSON)
             # ==========================
-            "qc_microbiology",    # 微生物檢驗陣列 (JSON)
+            "qc_microbiology",  # 微生物檢驗陣列 (JSON)
         ]
         read_only_fields = ["id", "created_by", "created_at", "updated_at"]
 
@@ -315,9 +322,6 @@ class BatchInventorySerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "material",
-            "material_name",
-            "material_type",
-            "unit",
             "batch_number",
             "original_qty",
             "remaining_qty",
@@ -325,8 +329,18 @@ class BatchInventorySerializer(serializers.ModelSerializer):
             "expiration_date",
             "adjustment_type",
             "adjustment_qty",
+            "is_active",
+            "created_by",
             "created_at",
             "updated_at",
+            "material_name",
+            "material_type",
+            "unit",
+            "in_stock_spec",
+            "package_qty",
+            "aux_unit",
+            "aux_quantity",
+            "note",
         ]
         read_only_fields = ["id", "created_at", "updated_at"]
 
@@ -770,6 +784,29 @@ class PurchaseRequisitionItemSerializer(serializers.ModelSerializer):
     material_name = serializers.ReadOnlyField()
     provider_name = serializers.SerializerMethodField()
 
+    actual_in_stock_spec = serializers.CharField(
+        source="generated_batch.in_stock_spec", read_only=True
+    )
+    actual_package_qty = serializers.DecimalField(
+        source="generated_batch.package_qty",
+        max_digits=10,
+        decimal_places=2,
+        read_only=True,
+    )
+    actual_aux_unit = serializers.CharField(
+        source="generated_batch.aux_unit", read_only=True
+    )
+    actual_quantity = serializers.DecimalField(
+        source="generated_batch.original_qty",
+        max_digits=15,
+        decimal_places=4,
+        read_only=True,
+    )
+    batch_number = serializers.CharField(
+        source="generated_batch.batch_number", read_only=True
+    )
+    batch_note = serializers.CharField(source="generated_batch.note", read_only=True)
+
     class Meta:
         model = PurchaseRequisitionItem
         fields = [
@@ -783,6 +820,16 @@ class PurchaseRequisitionItemSerializer(serializers.ModelSerializer):
             "remark",
             "purchased_price",
             "material_name",
+            "in_stock_spec",
+            "package_qty",
+            "aux_unit",
+            "aux_quantity",
+            "actual_in_stock_spec",
+            "actual_package_qty",
+            "actual_aux_unit",
+            "actual_quantity",
+            "batch_number",
+            "batch_note",
         ]
 
     def get_provider_name(self, obj):
@@ -864,6 +911,7 @@ class CustomerQuotationItemSerializer(serializers.ModelSerializer):
         required=False,
         allow_null=True,
     )
+
     class Meta:
         model = CustomerQuotationItem
         fields = [
@@ -881,7 +929,7 @@ class CustomerQuotationItemSerializer(serializers.ModelSerializer):
             "sales_unit_quantity",
             "sales_pack_unit",
             "sales_pack_quantity",
-            "outer_pack", 
+            "outer_pack",
             "inner_pack",
         ]
         extra_kwargs = {"product": {"write_only": True}}
@@ -934,7 +982,7 @@ class CustomerQuotationSerializer(serializers.ModelSerializer):
         sales_pack_unit = item_data.get("sales_pack_unit", "包")
         sales_pack_quantity = item_data.get("sales_pack_quantity", 1)
         sales_price = item_data.get("final_price_per_kg", None)
-        
+
         outer_pack = item_data.get("outer_pack", None)
         inner_pack = item_data.get("inner_pack", None)
 
@@ -977,7 +1025,7 @@ class CustomerQuotationSerializer(serializers.ModelSerializer):
             self._sync_product_profile(item_data, customer)
 
             item_data.pop("id", None)
-            
+
             CustomerQuotationItem.objects.create(quotation=quotation, **item_data)
 
         return quotation
@@ -1044,3 +1092,49 @@ class CustomerQuotationSerializer(serializers.ModelSerializer):
                 )
 
         return instance
+
+
+class MaterialProviderPriceSerializer(serializers.ModelSerializer):
+    material_name = serializers.CharField(source="material.name", read_only=True)
+    material_code = serializers.CharField(source="material.code", read_only=True)
+    material_unit = serializers.CharField(source="material.unit", read_only=True)
+
+    class Meta:
+        model = MaterialProviderPrice
+        fields = [
+            "id",
+            "material",
+            "material_name",
+            "material_code",
+            "material_unit",
+            "spec_text",
+            "aux_unit",
+            "aux_quantity",
+            "quoted_price",
+            "quoted_unit",
+            "price",
+            "is_active",
+        ]
+
+
+class MaterialProviderQuotationSerializer(serializers.ModelSerializer):
+    provider_name = serializers.CharField(source="provider.name", read_only=True)
+    provider_code = serializers.CharField(source="provider.code", read_only=True)
+    items = MaterialProviderPriceSerializer(many=True, required=False)
+
+    class Meta:
+        model = MaterialProviderQuotation
+        fields = [
+            "id",
+            "provider",
+            "provider_name",
+            "provider_code",
+            "quote_date",
+            "valid_until",
+            "effective_date",
+            "is_tax_included",
+            "remark",
+            "is_active",
+            "items",
+            "created_at",
+        ]
