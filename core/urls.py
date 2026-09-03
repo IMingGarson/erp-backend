@@ -14,6 +14,7 @@ from factory.auth.views import (
 from factory.mock import InitMockDataAPIView, InitPurchaseMockDataAPIView
 from factory.views import (
     BatchInventoryViewSet,
+    BatchQCRecordViewSet,
     BOMViewSet,
     CustomerOrderViewSet,
     CustomerQuotationViewSet,
@@ -55,6 +56,7 @@ router.register(
     MaterialProviderQuotationViewSet,
     basename="provider-material-price",
 )
+router.register(r"qc_records", BatchQCRecordViewSet, basename="qc-records")
 
 urlpatterns = [
     path("admin/", admin.site.urls),

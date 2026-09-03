@@ -29,6 +29,7 @@ from .models import (
     BOM,
     BatchInventory,
     BatchInventoryLog,
+    BatchQCRecord,
     BOMLog,
     CustomerOrder,
     CustomerOrderLog,
@@ -56,6 +57,7 @@ from .models import (
 from .permissions import IsAdminOrEmployerOrReadOnly, IsRDOrReadOnly
 from .serializers import (
     BatchInventorySerializer,
+    BatchQCRecordSerializer,
     BOMSerializer,
     CustomerOrderSerializer,
     CustomerQuotationSerializer,
@@ -1188,22 +1190,20 @@ class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
             price_query = price_query.filter(quotation__provider_id=provider_id)
 
         latest_provider_price = price_query.first()
-
+        PROVIDER_QUOTATION = None
         if latest_provider_price:
-            data = {
+            PROVIDER_QUOTATION = {
                 "latest_price": latest_provider_price.price,
                 "latest_spec": latest_provider_price.spec_text or "",
                 "latest_aux_unit": latest_provider_price.aux_unit or "",
                 "latest_aux_quantity": latest_provider_price.aux_quantity or "",
                 "is_tax_included": latest_provider_price.quotation.is_tax_included,
                 "current_stock": current_stock,
+                "quote_date": latest_provider_price.quotation.quote_date,
+                "valid_until": latest_provider_price.quotation.valid_until,
                 "source": "PROVIDER",
             }
-            return Response(data, status=status.HTTP_200_OK)
 
-        # ==========================================
-        # 策略 2：Fallback 回原先的歷史紀錄邏輯
-        # ==========================================
         item_query = PurchaseRequisitionItem.objects.filter(
             material_id=material_id,
             is_active=True,
@@ -1233,16 +1233,25 @@ class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
             latest_item, "aux_quantity", ""
         )
 
-        data = {
+        HISTORICAL_PR_DATA = {
             "latest_price": latest_item.purchased_price if latest_item else None,
             "latest_spec": latest_spec,
             "latest_aux_unit": latest_aux_unit,
             "latest_aux_quantity": latest_aux_qty,
+            "current_stock": current_stock,
+            "quote_date": None,
+            "valid_until": None,
             "is_tax_included": True,
             "source": "HISTORY",
         }
 
-        return Response(data, status=status.HTTP_200_OK)
+        return Response(
+            {
+                "from_provider": PROVIDER_QUOTATION,
+                "from_historical_pr": HISTORICAL_PR_DATA,
+            },
+            status=status.HTTP_200_OK,
+        )
 
     def _create_batches_from_incoming_data(
         self, instance, user, items_data, existing_items
@@ -1802,3 +1811,83 @@ class MaterialProviderQuotationViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                     item_instance.save(update_fields=["is_active"])
 
         self._record_db_log(instance, user, f"更新了 {instance.provider.name} 的報價單")
+
+
+class BatchQCRecordViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
+    serializer_class = BatchQCRecordSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        # 預先 select_related，避免 N+1 Query 問題
+        queryset = (
+            BatchQCRecord.objects.filter(is_active=True)
+            .select_related("batch", "material", "inspector")
+            .order_by("-test_date", "-id")
+        )
+
+        # ==========================================
+        # 支援多維度檢索 (對應查核人員的需求)
+        # ==========================================
+        material_id = self.request.query_params.get("material_id")
+        batch_id = self.request.query_params.get("batch_id")
+        batch_number = self.request.query_params.get("batch_number")
+        is_passed = self.request.query_params.get("is_passed")
+        start_date = self.request.query_params.get("start_date")
+        end_date = self.request.query_params.get("end_date")
+
+        if material_id:
+            queryset = queryset.filter(material_id=material_id)
+
+        if batch_id:
+            queryset = queryset.filter(batch_id=batch_id)
+
+        if batch_number:
+            # 支援模糊搜尋批號 (因應客訴時通常只提供部分批號字串)
+            queryset = queryset.filter(batch__batch_number__icontains=batch_number)
+
+        if is_passed is not None:
+            is_passed_bool = str(is_passed).lower() in ["true", "1", "t", "y", "yes"]
+            queryset = queryset.filter(is_passed=is_passed_bool)
+
+        if start_date:
+            queryset = queryset.filter(test_date__gte=start_date)
+
+        if end_date:
+            queryset = queryset.filter(test_date__lte=end_date)
+
+        return queryset
+
+    def perform_create(self, serializer):
+        user = self.get_valid_user()
+
+        batch = serializer.validated_data.get("batch")
+        material = serializer.validated_data.get("material")
+
+        if batch and not material:
+            serializer.validated_data["material"] = batch.material
+
+        instance = serializer.save(inspector=user)
+        self._record_db_log(
+            instance,
+            user,
+            f"{user.last_name}{user.first_name} 新增了批號 {instance.batch.batch_number} 的品管檢驗紀錄",
+        )
+
+    def perform_update(self, serializer):
+        user = self.get_valid_user()
+        instance = serializer.save()
+        self._record_db_log(
+            instance,
+            user,
+            f"{user.last_name}{user.first_name} 更新了批號 {instance.batch.batch_number} 的品管檢驗紀錄",
+        )
+
+    def perform_destroy(self, instance):
+        user = self.get_valid_user()
+        instance.is_active = False
+        instance.save(update_fields=["is_active"])
+        self._record_db_log(
+            instance,
+            user,
+            f"{user.last_name}{user.first_name} 移除了批號 {instance.batch.batch_number} 的品管檢驗紀錄",
+        )

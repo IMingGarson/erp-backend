@@ -17,6 +17,7 @@ from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from .models import (
     BOM,
     BatchInventory,
+    BatchQCRecord,
     CustomerOrder,
     CustomerQuotation,
     CustomerQuotationItem,
@@ -313,6 +314,7 @@ class MaterialSerializer(serializers.ModelSerializer):
 
 
 class BatchInventorySerializer(serializers.ModelSerializer):
+    material_id = serializers.CharField(source="material.id", read_only=True)
     material_name = serializers.CharField(source="material.name", read_only=True)
     unit = serializers.CharField(source="material.unit", read_only=True)
     material_type = serializers.CharField(source="material.type", read_only=True)
@@ -333,6 +335,7 @@ class BatchInventorySerializer(serializers.ModelSerializer):
             "created_by",
             "created_at",
             "updated_at",
+            "material_id",
             "material_name",
             "material_type",
             "unit",
@@ -1138,3 +1141,56 @@ class MaterialProviderQuotationSerializer(serializers.ModelSerializer):
             "items",
             "created_at",
         ]
+
+
+class MaterialQCSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Material
+        fields = [
+            "id",
+            "code",
+            "name",
+            "unit",
+            "qc_dilution_ratio",
+            "qc_brix_min",
+            "qc_brix_max",
+            "qc_salt_min",
+            "qc_salt_max",
+            "qc_moisture_max",
+            "qc_microbiology",
+        ]
+
+
+class BatchQCRecordSerializer(serializers.ModelSerializer):
+    batch_number = serializers.CharField(source="batch.batch_number", read_only=True)
+    material_info = MaterialQCSerializer(source="material", read_only=True)
+    inspector_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BatchQCRecord
+        fields = [
+            "id",
+            "batch",
+            "batch_number",
+            "material",
+            "material_info",
+            "sample_date",
+            "test_date",
+            "actual_moisture",
+            "actual_brix",
+            "actual_salt",
+            "actual_microbiology",
+            "is_passed",
+            "remark",
+            "inspector",
+            "inspector_name",
+            "is_active",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["inspector"]
+
+    def get_inspector_name(self, obj):
+        if obj.inspector:
+            return f"{obj.inspector.last_name}{obj.inspector.first_name}"
+        return "系統或未指定"

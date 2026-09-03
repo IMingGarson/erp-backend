@@ -1168,3 +1168,90 @@ class MaterialProviderPrice(models.Model):
 
     class Meta:
         db_table = "material_provider_prices"
+
+
+class BatchQCRecord(models.Model):
+    id = models.AutoField(primary_key=True)
+
+    # 關聯：針對哪一個實體批號進行檢驗
+    batch = models.ForeignKey(
+        BatchInventory,
+        on_delete=models.DO_NOTHING,
+        related_name="qc_records",
+        verbose_name="檢驗批號",
+    )
+
+    material = models.ForeignKey(
+        Material,
+        on_delete=models.DO_NOTHING,
+        related_name="qc_records",
+        verbose_name="物料",
+    )
+
+    # ==========================
+    # 檢驗基礎資訊
+    # ==========================
+    sample_date = models.DateField(verbose_name="取樣日期")
+    test_date = models.DateField(verbose_name="檢測日期")
+
+    # 物理化學指標 (實際檢測出的數值)
+    actual_moisture = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        verbose_name="實際水分(%)",
+    )
+    actual_brix = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        verbose_name="實際糖度(Brix)",
+    )
+    actual_salt = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        verbose_name="實際鹽度(%)",
+    )
+
+    # 若有額外的微生物或特殊檢驗，可利用 JSONField 動態記錄
+    actual_microbiology = models.JSONField(
+        blank=True, null=True, default=dict, verbose_name="實際微生物檢驗結果"
+    )
+
+    # ==========================
+    # 綜合判定與備註
+    # ==========================
+    is_passed = models.BooleanField(default=True, verbose_name="最終判定(合格/不合格)")
+    remark = models.TextField(
+        blank=True,
+        null=True,
+        verbose_name="備註",
+        help_text="如: 綜合此檢測落點，修正鹽度規格",
+    )
+
+    # ==========================
+    # 系統欄位
+    # ==========================
+    inspector = models.ForeignKey(
+        User,
+        on_delete=models.DO_NOTHING,
+        related_name="inspected_qcs",
+        verbose_name="檢驗人員",
+    )
+    is_active = models.BooleanField(default=True, verbose_name="是否啟用")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "batch_qc_records"
+        verbose_name = "批號品管檢驗紀錄"
+        ordering = ["-test_date", "-id"]
+
+    def __str__(self):
+        return (
+            f"QC - {self.batch.batch_number} ({'合格' if self.is_passed else '不合格'})"
+        )
