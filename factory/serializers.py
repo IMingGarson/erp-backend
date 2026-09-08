@@ -1,11 +1,3 @@
-# 請購單和進貨單可同一張，更新狀態
-# 樣品狀態的貨編可能需要一個區別方式（prefix: TEST，提供研發人員辨識)
-# 成本估算單 per 耗損 const；原料成本資料來自前次進貨單回填的成本價
-# cond. 估算單要考慮包材、運費、加工費；但包材受平均值（20KG裝30KG箱）、運費分常溫、冷藏、批次、回頭車
-# 成品報價、單價需per 客戶，預設前次價格、其次交易日期、該成品成本價（ Maybe checkbox for one-time 更新 per 客戶）
-# 添加物總量警示，成品、半成品，總用量不能超過某%
-# 新增物料：添加物、展開成分、過敏原、基準單位、輔助單位（袋、箱）
-# 營養標籤字體、排序都有規定
 from decimal import Decimal
 
 from django.contrib.auth.models import User
@@ -234,9 +226,10 @@ class BOMItemSerializer(serializers.ModelSerializer):
             "child_name",  # 子物料名稱
             "child_type",  # 子物料類型 (RAW, SEMI...)
             "child_unit",  # 子物料單位 (KG, G...)
-            "child_nutrition_fact",  # 子物料的營養素 (🌟 展算用)
+            "child_nutrition_fact",  # 子物料的營養素
             "base_quantity",  # 配方基數
             "quantity_required",  # 需求數量
+            "remark",  # 原物料備註
             "is_active",
         ]
 
@@ -309,7 +302,7 @@ class MaterialSerializer(serializers.ModelSerializer):
 
     def get_estimated_cost(self, obj):
         if hasattr(obj, "annotated_estimated_cost"):
-            return round(obj.annotated_estimated_cost, 2)
+            return round(obj.annotated_estimated_cost, 4)
         return obj.estimated_cost
 
 
@@ -374,6 +367,8 @@ class BOMSerializer(serializers.ModelSerializer):
             "child_id",
             "base_quantity",
             "quantity_required",
+            "remark",
+            "set_cost",
             "is_active",
             "created_at",
             "updated_at",

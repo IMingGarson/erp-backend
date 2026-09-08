@@ -270,11 +270,11 @@ class Material(models.Model):
 
             base_qty = float(boms[0].base_quantity)
 
-            return round(total_cost / base_qty, 2) if base_qty > 0 else 0.0
+            return round(total_cost / base_qty, 4) if base_qty > 0 else 0.0
 
         annotated_cost = getattr(self, "annotated_estimated_cost", None)
         if annotated_cost is not None:
-            return round(annotated_cost, 2)
+            return round(annotated_cost, 4)
 
         three_months_ago = timezone.now().date() - timedelta(days=90)
 
@@ -298,7 +298,7 @@ class Material(models.Model):
         total_val = aggregates.get("total_value")
 
         if total_qty and total_qty > 0 and total_val is not None:
-            return round(total_val / total_qty, 2)
+            return round(total_val / total_qty, 4)
 
         latest_purchase = (
             self.purchase_items.filter(
@@ -426,6 +426,8 @@ class BOM(models.Model):
     is_active = models.BooleanField(
         default=True, db_index=True, verbose_name="是否啟用"
     )
+    remark = models.TextField(null=True, blank=True, verbose_name="物料備註")
+    set_cost = models.IntegerField(null=True, blank=True, verbose_name="自訂單位成本")
 
     class Meta:
         db_table = "boms"
