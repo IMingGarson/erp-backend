@@ -38,7 +38,9 @@ from .models import (
     CustomerQuotationLog,
     DeliveryNote,
     DeliveryNoteLog,
+    Ingredient,
     Material,
+    MaterialIngredient,
     MaterialLog,
     MaterialProvider,
     MaterialProviderPrice,
@@ -62,6 +64,7 @@ from .serializers import (
     CustomerOrderSerializer,
     CustomerQuotationSerializer,
     DeliveryNoteSerializer,
+    IngredientSerializer,
     MaterialProviderQuotationSerializer,
     MaterialProviderSerializer,
     MaterialRequirementPlanSerializer,
@@ -846,8 +849,16 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 annotated_estimated_cost=cost_annotation
             )
 
+            active_ingredients_prefetch = Prefetch(
+                "material_ingredients",
+                queryset=MaterialIngredient.objects.filter(
+                    is_active=True
+                ).select_related("ingredient"),
+            )
+
             queryset = queryset.prefetch_related(
                 "product_profiles",
+                active_ingredients_prefetch,
                 Prefetch("main_product__child", queryset=annotated_material_qs),
                 Prefetch(
                     "main_product__child__main_product__child",
@@ -1891,3 +1902,18 @@ class BatchQCRecordViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
             user,
             f"{user.last_name}{user.first_name} 移除了批號 {instance.batch.batch_number} 的品管檢驗紀錄",
         )
+
+
+class IngredientViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
+    serializer_class = IngredientSerializer
+    filter_backends = [filters.DjangoFilterBackend, SearchFilter]
+    search_fields = ["name", "tfda_code"]
+
+    def get_permissions(self):
+        return [IsAuthenticated()]
+
+    def get_queryset(self):
+        return Ingredient.objects.all().order_by("-id")
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.get_valid_user())

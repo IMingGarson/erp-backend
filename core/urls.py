@@ -19,6 +19,7 @@ from factory.views import (
     CustomerOrderViewSet,
     CustomerQuotationViewSet,
     DeliveryNoteViewSet,
+    IngredientViewSet,
     MaterialProviderQuotationViewSet,
     MaterialProviderViewSet,
     MaterialRequirementPlanViewSet,
@@ -57,6 +58,7 @@ router.register(
     basename="provider-material-price",
 )
 router.register(r"qc_records", BatchQCRecordViewSet, basename="qc-records")
+router.register(r"ingredients", IngredientViewSet, basename="ingredient")
 
 urlpatterns = [
     path("admin/", admin.site.urls),

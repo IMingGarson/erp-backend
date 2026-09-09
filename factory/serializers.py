@@ -14,7 +14,9 @@ from .models import (
     CustomerQuotation,
     CustomerQuotationItem,
     DeliveryNote,
+    Ingredient,
     Material,
+    MaterialIngredient,
     MaterialProvider,
     MaterialProviderPrice,
     MaterialProviderQuotation,
@@ -234,12 +236,43 @@ class BOMItemSerializer(serializers.ModelSerializer):
         ]
 
 
+class IngredientSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Ingredient
+        fields = "__all__"
+        read_only_fields = ["id", "created_by", "created_at", "updated_at"]
+
+
+class MaterialIngredientListSerializer(serializers.ListSerializer):
+    def to_representation(self, data):
+        iterable = data.all() if hasattr(data, "all") else data
+        active_data = [item for item in iterable if item.is_active]
+        return super().to_representation(active_data)
+
+
+class MaterialIngredientSerializer(serializers.ModelSerializer):
+    ingredient_detail = IngredientSerializer(source="ingredient", read_only=True)
+    ingredient_id = serializers.PrimaryKeyRelatedField(
+        source="ingredient",
+        queryset=Ingredient.objects.filter(is_active=True),
+        write_only=True,
+    )
+
+    class Meta:
+        model = MaterialIngredient
+        fields = ["id", "is_active", "ingredient_id", "ingredient_detail"]
+        list_serializer_class = MaterialIngredientListSerializer
+
+
 class MaterialSerializer(serializers.ModelSerializer):
     is_raw_material = serializers.ReadOnlyField()
     estimated_cost = serializers.ReadOnlyField()
     creator_name = serializers.SerializerMethodField()
     product_profiles = ProductProfileSerializer(many=True, read_only=True)
     boms = BOMItemSerializer(source="main_product", many=True, read_only=True)
+    ingredients = MaterialIngredientSerializer(
+        source="material_ingredients", many=True, required=False
+    )
 
     class Meta:
         model = Material
@@ -256,10 +289,6 @@ class MaterialSerializer(serializers.ModelSerializer):
             "allergen_info",  # 過敏原資訊
             "storage_life",  # 保存期限
             "description",  # 描述 (成分來源)
-            "additive_license_no",  # 添加物許可證號
-            "is_additive",  # 是否為添加物
-            "legal_limit_percent",  # 添加物比例上限
-            "license_valid_date",  # 許可證效期
             "product_registration_no",  # 產品登錄號
             "origin",  # 產地
             "product_profiles",  # 關聯成品專屬資訊
@@ -284,6 +313,9 @@ class MaterialSerializer(serializers.ModelSerializer):
             # 微生物檢驗標準 (JSON)
             # ==========================
             "qc_microbiology",  # 微生物檢驗陣列 (JSON)
+            "storage_method",  # 常溫、冷凍、冷藏
+            "dietary_type",  # 葷素判斷
+            "ingredients",  # 成分
         ]
         read_only_fields = ["id", "created_by", "created_at", "updated_at"]
 
@@ -304,6 +336,55 @@ class MaterialSerializer(serializers.ModelSerializer):
         if hasattr(obj, "annotated_estimated_cost"):
             return round(obj.annotated_estimated_cost, 4)
         return obj.estimated_cost
+
+    def create(self, validated_data):
+        ingredients_data = validated_data.pop("material_ingredients", [])
+
+        material = super().create(validated_data)
+
+        for item in ingredients_data:
+            MaterialIngredient.objects.create(
+                material=material, ingredient=item["ingredient"]
+            )
+
+        if ingredients_data:
+            material.recalculate_from_ingredients()
+
+        return material
+
+    def update(self, instance, validated_data):
+        ingredients_data = validated_data.pop("material_ingredients", None)
+
+        instance = super().update(instance, validated_data)
+
+        if ingredients_data is not None:
+            incoming_ingredients = [item["ingredient"] for item in ingredients_data]
+            incoming_ingredient_ids = [ing.id for ing in incoming_ingredients]
+
+            existing_associations = instance.material_ingredients.all()
+            existing_mapping = {
+                assoc.ingredient_id: assoc for assoc in existing_associations
+            }
+
+            for existing_id, assoc in existing_mapping.items():
+                if existing_id not in incoming_ingredient_ids:
+                    if assoc.is_active:
+                        assoc.is_active = False
+                        assoc.save(update_fields=["is_active"])
+                else:
+                    if not assoc.is_active:
+                        assoc.is_active = True
+                        assoc.save(update_fields=["is_active"])
+
+            for incoming_ing in incoming_ingredients:
+                if incoming_ing.id not in existing_mapping:
+                    MaterialIngredient.objects.create(
+                        material=instance, ingredient=incoming_ing, is_active=True
+                    )
+
+            instance.recalculate_from_ingredients()
+
+        return instance
 
 
 class BatchInventorySerializer(serializers.ModelSerializer):
@@ -654,19 +735,19 @@ class SimpleProductSerializer(serializers.ModelSerializer):
 
     def get_sales_unit(self, obj):
         profile = self._get_profile(obj)
-        return profile.sales_unit if profile else "箱"
+        return profile.sales_unit if profile else "-"
 
     def get_sales_pack_unit(self, obj):
         profile = self._get_profile(obj)
-        return profile.sales_pack_unit if profile else "包"
+        return profile.sales_pack_unit if profile else "-"
 
     def get_sales_unit_quantity(self, obj):
         profile = self._get_profile(obj)
-        return str(profile.sales_unit_quantity) if profile else "1"
+        return str(profile.sales_unit_quantity) if profile else "0"
 
     def get_sales_pack_quantity(self, obj):
         profile = self._get_profile(obj)
-        return str(profile.sales_pack_quantity) if profile else "1"
+        return str(profile.sales_pack_quantity) if profile else "0"
 
 
 class ProductionOrderSerializer(serializers.ModelSerializer):
@@ -977,8 +1058,8 @@ class CustomerQuotationSerializer(serializers.ModelSerializer):
         spec = item_data.get("spec", "")
         sales_unit = item_data.get("sales_unit", "箱")
         sales_unit_quantity = item_data.get("sales_unit_quantity", 1)
-        sales_pack_unit = item_data.get("sales_pack_unit", "包")
-        sales_pack_quantity = item_data.get("sales_pack_quantity", 1)
+        sales_pack_unit = item_data.get("sales_pack_unit", "-")
+        sales_pack_quantity = item_data.get("sales_pack_quantity", 0)
         sales_price = item_data.get("final_price_per_kg", None)
 
         outer_pack = item_data.get("outer_pack", None)

@@ -144,6 +144,19 @@ class MaterialProvider(models.Model):
 
 class Material(models.Model):
     PHASE_CHOICE = (("IN_DEV", "開發"), ("IN_PROD", "正式"))
+    STORAGE_CHOICES = (
+        ("ROOM_TEMP", "常溫"),
+        ("REFRIGERATED", "冷藏"),
+        ("FROZEN", "冷凍"),
+    )
+    DIETARY_CHOICES = (
+        ("MEAT", "葷食"),
+        ("VEGAN", "全素"),
+        ("LACTO", "奶素"),
+        ("OVO", "蛋素"),
+        ("LACTO_OVO", "蛋奶素"),
+        ("FIVE_PUNGENT", "植物五辛素"),
+    )
     code = models.CharField(
         max_length=30, db_index=True, unique=True, verbose_name="物料代號"
     )
@@ -179,12 +192,6 @@ class Material(models.Model):
     nutrition_fact = models.JSONField(
         blank=True, null=True, default=dict, verbose_name="八大營養價值標示"
     )
-    additive_license_no = models.CharField(
-        max_length=100, blank=True, null=True, verbose_name="添加物許可證號"
-    )
-    license_valid_date = models.DateField(
-        blank=True, null=True, verbose_name="許可證效期"
-    )
     product_registration_no = models.CharField(
         max_length=100, blank=True, null=True, verbose_name="產品登錄號"
     )
@@ -198,15 +205,6 @@ class Material(models.Model):
         choices=PHASE_CHOICE,
         default="IN_PROD",
         verbose_name="物料使用階段",
-    )
-    is_additive = models.BooleanField(default=False, verbose_name="是否為法規添加物")
-    legal_limit_percent = models.DecimalField(
-        max_digits=6,
-        decimal_places=4,
-        null=True,
-        blank=True,
-        verbose_name="法規上限比例(%)",
-        help_text="如二矽法規上限2%，請填 2.0",
     )
     # ==========================
     # 廠內品管物理指標 (固定欄位)
@@ -241,9 +239,72 @@ class Material(models.Model):
     qc_microbiology = models.JSONField(
         blank=True, null=True, default=list, verbose_name="微生物與其他法定檢驗標準"
     )
+    storage_method = models.CharField(
+        max_length=20,
+        choices=STORAGE_CHOICES,
+        default="ROOM_TEMP",
+        verbose_name="保存方式",
+        help_text="預設為常溫",
+    )
+
+    dietary_type = models.CharField(
+        max_length=20,
+        choices=DIETARY_CHOICES,
+        blank=True,
+        null=True,
+        verbose_name="素食類別",
+        help_text="如為複合原料，請依據成分中最嚴格的葷素級別標示",
+    )
     created_by = models.ForeignKey(User, on_delete=models.DO_NOTHING)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    def recalculate_from_ingredients(self):
+        """
+        根據關聯的成分，直接加總營養素並聯集過敏原
+        """
+        m_ingredients = self.material_ingredients.filter(is_active=True).select_related(
+            "ingredient"
+        )
+        if not m_ingredients:
+            return
+
+        calc_nutrition = {
+            "energy_kcal": 0,
+            "protein": 0,
+            "fat": 0,
+            "saturated_fat": 0,
+            "trans_fat": 0,
+            "carbs": 0,
+            "sugar": 0,
+            "sodium": 0,
+        }
+        allergens = set()
+
+        for mi in m_ingredients:
+            ing_nut = mi.ingredient.nutrition_fact or {}
+
+            # 直接加總營養素
+            for key in calc_nutrition:
+                val = float(ing_nut.get(key) or 0)
+                calc_nutrition[key] += val
+
+            # 聯集過敏原
+            if mi.ingredient.allergen_info:
+                parsed_allergens = [
+                    a.strip()
+                    for a in mi.ingredient.allergen_info.split(",")
+                    if a.strip()
+                ]
+                allergens.update(parsed_allergens)
+
+        formatted_nutrition = {k: str(round(v, 2)) for k, v in calc_nutrition.items()}
+        self.nutrition_fact = formatted_nutrition
+
+        if allergens:
+            self.allergen_info = ",".join(sorted(allergens))
+
+        self.save(update_fields=["nutrition_fact", "allergen_info"])
 
     @property
     def is_raw_material(self):
@@ -984,10 +1045,10 @@ class CustomerQuotation(models.Model):
 
 class CustomerQuotationItem(models.Model):
     quotation = models.ForeignKey(
-        CustomerQuotation, on_delete=models.CASCADE, related_name="items"
+        CustomerQuotation, on_delete=models.DO_NOTHING, related_name="items"
     )
     product = models.ForeignKey(
-        "Material", on_delete=models.CASCADE, verbose_name="報價產品"
+        "Material", on_delete=models.DO_NOTHING, verbose_name="報價產品"
     )
 
     sales_unit = models.CharField(max_length=10, default="箱", verbose_name="銷售單位")
@@ -995,10 +1056,10 @@ class CustomerQuotationItem(models.Model):
         max_digits=10, decimal_places=2, default=1, verbose_name="銷售單位數量"
     )
     sales_pack_unit = models.CharField(
-        max_length=10, default="包", verbose_name="包裝單位"
+        max_length=10, null=True, blank=True, verbose_name="包裝單位"
     )
     sales_pack_quantity = models.DecimalField(
-        max_digits=10, decimal_places=2, default=1, verbose_name="每銷售單位含包裝數"
+        max_digits=10, decimal_places=2, default=0, verbose_name="每銷售單位含包裝數"
     )
 
     outer_pack = models.ForeignKey(
@@ -1257,3 +1318,78 @@ class BatchQCRecord(models.Model):
         return (
             f"QC - {self.batch.batch_number} ({'合格' if self.is_passed else '不合格'})"
         )
+
+
+class Ingredient(models.Model):
+    """
+    成分表：對應法規標示上的成分文字與其營養價值/過敏原
+    """
+
+    SOURCE_CHOICES = (
+        ("TFDA", "食藥署資料庫"),
+        ("MANUAL", "手動建檔"),
+    )
+
+    id = models.AutoField(primary_key=True)
+    name = models.CharField(max_length=150, verbose_name="成分名稱")
+    source_type = models.CharField(
+        max_length=10, choices=SOURCE_CHOICES, default="MANUAL", verbose_name="資料來源"
+    )
+    tfda_code = models.CharField(
+        max_length=50, blank=True, null=True, verbose_name="TFDA代碼"
+    )
+    is_additive = models.BooleanField(default=False, verbose_name="是否為法規添加物")
+    legal_limit_percent = models.DecimalField(
+        max_digits=6,
+        decimal_places=4,
+        null=True,
+        blank=True,
+        verbose_name="法規上限(%)",
+    )
+    additive_license_no = models.CharField(
+        max_length=100, blank=True, null=True, verbose_name="許可證號"
+    )
+    license_valid_date = models.DateField(
+        blank=True, null=True, verbose_name="許可證效期"
+    )
+    nutrition_fact = models.JSONField(
+        blank=True, null=True, default=dict, verbose_name="八大營養素"
+    )
+    allergen_info = models.CharField(
+        max_length=100, blank=True, null=True, verbose_name="法定過敏原"
+    )
+    is_active = models.BooleanField(default=True, verbose_name="是否啟用")
+    created_by = models.ForeignKey(
+        User, on_delete=models.DO_NOTHING, verbose_name="建檔人"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.name} ({self.get_source_type_display()})"
+
+    class Meta:
+        db_table = "ingredients"
+        verbose_name = "成分"
+
+
+class MaterialIngredient(models.Model):
+    """
+    原物料與成分關聯表 (純粹紀錄該原物料用到了哪些成分)
+    """
+
+    id = models.AutoField(primary_key=True)
+    material = models.ForeignKey(
+        Material,
+        on_delete=models.DO_NOTHING,
+        related_name="material_ingredients",
+        verbose_name="原物料",
+    )
+    ingredient = models.ForeignKey(
+        Ingredient, on_delete=models.DO_NOTHING, verbose_name="成分"
+    )
+    is_active = models.BooleanField(default=True, verbose_name="是否啟用")
+
+    class Meta:
+        db_table = "material_ingredients"
+        verbose_name = "原物料成分明細"
