@@ -6,6 +6,7 @@ from django.db import models, transaction
 from django.db.models import (
     Avg,
     CharField,
+    DecimalField,
     ExpressionWrapper,
     F,
     FloatField,
@@ -74,7 +75,7 @@ from .serializers import (
     PurchaseRequisitionSerializer,
     VendorSerializer,
 )
-from .services import TFDALoopUpService, UtilsFuncService
+from .services import UtilsFuncService
 
 
 class CRUDAuditMixin:
@@ -768,41 +769,298 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
             return Response({"type": material.type, "data": data})
 
-    @action(detail=False, methods=["get"], url_path="tfda_lookup")
-    def tfda_lookup(self, request):
-        search_term = request.query_params.get("q", "").strip()
-        if not search_term:
-            return Response(
-                {"message": "error", "error": "請提供搜尋關鍵字 (參數: q)"},
-                status=status.HTTP_400_BAD_REQUEST,
+    def _get_historical_base_cost(self, material):
+        """輔助函數：計算不受最新報價影響的歷史純採購成本"""
+
+        three_months_ago = timezone.now().date() - timedelta(days=90)
+        recent_purchases = PurchaseRequisitionItem.objects.filter(
+            material=material,
+            is_active=True,
+            requisition__is_active=True,
+            requisition__status="stocked",
+            requisition__request_date__gte=three_months_ago,
+        )
+        aggregates = recent_purchases.aggregate(
+            total_qty=Sum("quantity"),
+            total_val=Sum(
+                ExpressionWrapper(
+                    F("quantity") * F("purchased_price"), output_field=DecimalField()
+                )
+            ),
+        )
+        if aggregates.get("total_qty") and aggregates.get("total_val"):
+            return float(round(aggregates["total_val"] / aggregates["total_qty"], 4))
+
+        latest = (
+            PurchaseRequisitionItem.objects.filter(
+                material=material,
+                is_active=True,
+                requisition__is_active=True,
+                requisition__status="stocked",
+            )
+            .order_by("-requisition__request_date", "-id")
+            .first()
+        )
+        return float(latest.purchased_price) if latest else 0.0
+
+    @action(detail=False, methods=["get"], url_path="active_alerts")
+    def active_alerts(self, request):
+        """主動預警：抓出有漲跌幅的原料，確保同原料的多家供應商都能獨立顯示"""
+        today = timezone.now().date()
+
+        active_prices = (
+            MaterialProviderPrice.objects.filter(
+                is_active=True,
+                quotation__is_active=True,
+            )
+            .filter(
+                Q(quotation__valid_until__gte=today)
+                | Q(quotation__valid_until__isnull=True)
+            )
+            .select_related("material", "quotation", "quotation__provider")
+            .order_by("-quotation__effective_date", "-id")
+        )
+
+        checked_quotes = {}
+        for p in active_prices:
+            m_id = p.material.id
+            prov_id = p.quotation.provider_id if p.quotation else 0
+
+            # 🌟 核心修正：使用 (物料ID, 廠商ID) 作為複合鍵，保留同物料的多家廠商
+            key = (m_id, prov_id)
+
+            if key not in checked_quotes:
+                new_price = float(p.price) if p.price else 0.0
+                old_price = self._get_historical_base_cost(p.material)
+                diff = new_price - old_price
+
+                checked_quotes[key] = {
+                    "material": p.material,
+                    "new_price": new_price,
+                    "old_price": old_price,
+                    "diff_percent": round((diff / old_price * 100), 1)
+                    if old_price > 0
+                    else 0,
+                    "provider_name": p.quotation.provider.name
+                    if p.quotation.provider
+                    else "未知廠商",
+                    "effective_date": p.quotation.effective_date,
+                }
+
+        def find_parent_ids(curr_mat, ids_set):
+            parent_boms = curr_mat.sub_material.filter(is_active=True).values_list(
+                "parent_id", flat=True
+            )
+            for pid in parent_boms:
+                if pid not in ids_set:
+                    ids_set.add(pid)
+                    parent_obj = Material.objects.filter(id=pid).first()
+                    if parent_obj:
+                        find_parent_ids(parent_obj, ids_set)
+
+        alerts = []
+        for key, info in checked_quotes.items():
+            material = info["material"]
+            affected_product_ids = set()
+
+            find_parent_ids(material, affected_product_ids)
+
+            # 只要有價差就列入預警 (可根據需求加上閥值，例如 diff_percent > 5%)
+            if affected_product_ids and info["new_price"] != info["old_price"]:
+                q_count = (
+                    CustomerQuotationItem.objects.filter(
+                        product_id__in=affected_product_ids,
+                        is_active=True,
+                        quotation__is_active=True,
+                    )
+                    .values("quotation_id")
+                    .distinct()
+                    .count()
+                )
+
+                alerts.append(
+                    {
+                        "material_id": material.id,
+                        "material_code": material.code,
+                        "material_name": material.name,
+                        "material_type": material.type,
+                        "old_price": info["old_price"],
+                        "new_price": info["new_price"],
+                        "diff_percent": info["diff_percent"],
+                        "provider_name": info["provider_name"],
+                        "effective_date": info["effective_date"],
+                        "affected_products_count": len(affected_product_ids),
+                        "affected_quotations_count": q_count,
+                    }
+                )
+
+        return Response(alerts)
+
+    @action(detail=True, methods=["get"])
+    def impact_analysis(self, request, pk=None):
+        """詳細追溯分析：並將配方比例轉換為白話文解析路徑"""
+        material = self.get_object()
+        today = timezone.now().date()
+
+        old_price = self._get_historical_base_cost(material)
+
+        active_prices = (
+            material.provider_prices.filter(is_active=True, quotation__is_active=True)
+            .filter(
+                Q(quotation__valid_until__gte=today)
+                | Q(quotation__valid_until__isnull=True)
+            )
+            .select_related("quotation", "quotation__provider")
+            .order_by("quotation__provider_id", "-quotation__effective_date", "-id")
+        )
+
+        provider_quotes_map = {}
+        for pq in active_prices:
+            pid = pq.quotation.provider_id
+            if pid not in provider_quotes_map:
+                new_price = float(pq.price) if pq.price else 0.0
+                price_diff = new_price - old_price
+                diff_percent = (
+                    round((price_diff / old_price * 100), 2) if old_price > 0 else 0
+                )
+                provider_quotes_map[pid] = {
+                    "provider_id": pid,
+                    "provider_name": pq.quotation.provider.name
+                    if pq.quotation.provider
+                    else "未知廠商",
+                    "new_price": new_price,
+                    "price_diff": price_diff,
+                    "diff_percent": diff_percent,
+                    "effective_date": pq.quotation.effective_date.strftime("%Y-%m-%d"),
+                }
+        provider_quotes = sorted(
+            list(provider_quotes_map.values()), key=lambda x: x["new_price"]
+        )
+
+        affected_products_map = {}
+
+        def find_parents(current_material, current_ratio, chain):
+            parent_boms = current_material.sub_material.filter(
+                is_active=True
+            ).select_related("parent")
+            for bom in parent_boms:
+                parent_mat = bom.parent
+                req = float(bom.quantity_required)
+                base = float(bom.base_quantity)
+                step_ratio = req / base if base > 0 else 0
+                accumulated_ratio = current_ratio * step_ratio
+
+                new_chain = chain + [(current_material.name, req, base, step_ratio)]
+
+                if parent_mat.id not in affected_products_map:
+                    affected_products_map[parent_mat.id] = {
+                        "obj": parent_mat,
+                        "accumulated_ratio": 0.0,
+                        "paths": [],
+                    }
+
+                affected_products_map[parent_mat.id]["accumulated_ratio"] += (
+                    accumulated_ratio
+                )
+
+                if len(new_chain) == 1:
+                    text = f"直接添加：基準 {base:g} KG 內含 {req:g} KG ({step_ratio * 100:.2f}%)"
+                    short_text = "直接添加比例"
+                else:
+                    direct_child_name = new_chain[-1][0]
+                    text = f"透過「{direct_child_name}」帶入：基準 {base:g} KG 內含 {req:g} KG (該半成品含 {current_ratio * 100:.2f}%)，換算佔比 {accumulated_ratio * 100:.2f}%"
+                    short_text = f"經「{direct_child_name}」"
+
+                affected_products_map[parent_mat.id]["paths"].append(
+                    {
+                        "text": text,
+                        "short_text": short_text,
+                        "ratio": accumulated_ratio,
+                    }
+                )
+
+                find_parents(parent_mat, accumulated_ratio, new_chain)
+
+        # 🌟 修復 2：補上空陣列作為 chain 的初始值
+        find_parents(material, 1.0, [])
+
+        product_details = []
+        for pid, data in affected_products_map.items():
+            parent_mat = data["obj"]
+            product_details.append(
+                {
+                    "id": parent_mat.id,
+                    "code": parent_mat.code,
+                    "name": parent_mat.name,
+                    "type": parent_mat.type,
+                    "accumulated_ratio": data["accumulated_ratio"],
+                    "paths": data["paths"],
+                }
             )
 
-        try:
-            results = TFDALoopUpService.import_tfda_open_data(search_term)
-            return Response(results, status=status.HTTP_200_OK)
+        affected_quotations = []
+        if affected_products_map:
+            try:
+                quotation_items = CustomerQuotationItem.objects.filter(
+                    product_id__in=list(affected_products_map.keys()),
+                    is_active=True,
+                    quotation__is_active=True,
+                ).select_related("quotation", "quotation__customer", "product")
 
-        except Exception as e:
-            return Response(
-                {"message": "error", "data": str(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
+                quotation_map = {}
+                for item in quotation_items:
+                    q_id = item.quotation.id
+                    if q_id not in quotation_map:
+                        quotation_map[q_id] = {
+                            "quotation_id": q_id,
+                            "quotation_number": item.quotation.quotation_number,
+                            "customer_name": item.quotation.customer.name
+                            if item.quotation.customer
+                            else "未知客戶",
+                            "date": item.quotation.created_at.strftime("%Y-%m-%d"),
+                            "affected_items": [],
+                        }
+                    quotation_map[q_id]["affected_items"].append(
+                        {
+                            "product_code": item.product.code,
+                            "product_name": item.product.name,
+                            "pricing_multiplier": float(item.pricing_multiplier)
+                            if item.pricing_multiplier
+                            else 1.000,
+                            "accumulated_ratio": affected_products_map[item.product.id][
+                                "accumulated_ratio"
+                            ],
+                        }
+                    )
+                affected_quotations = list(quotation_map.values())
+            except Exception as e:
+                print(f"Quotation query error: {e}")
+
+        return Response(
+            {
+                "material_base_cost": old_price,
+                "provider_quotes": provider_quotes,
+                "affected_products": product_details,
+                "affected_quotations": sorted(
+                    affected_quotations, key=lambda x: x["date"], reverse=True
+                ),
+            }
+        )
 
     def get_queryset(self):
         queryset = Material.objects.filter(is_active=True).order_by("-id")
-
         user = self.request.user
         is_rd = (
             user.is_authenticated
             and hasattr(user, "profile")
             and user.profile.department.upper() == "RD"
         )
-        # 只有研發才會 access 到開發中的原物料
         if not is_rd:
             queryset = queryset.filter(phase="IN_PROD")
 
-        # 處理 N+1
         if self.action == "list":
-            three_months_ago = timezone.now().date() - timedelta(days=90)
+            today = timezone.now().date()
+            three_months_ago = today - timedelta(days=90)
 
             recent_items = PurchaseRequisitionItem.objects.filter(
                 material=OuterRef("pk"),
@@ -844,7 +1102,6 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
             )
 
             queryset = queryset.annotate(annotated_estimated_cost=cost_annotation)
-
             annotated_material_qs = Material.objects.filter(is_active=True).annotate(
                 annotated_estimated_cost=cost_annotation
             )

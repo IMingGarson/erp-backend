@@ -2,6 +2,8 @@ from decimal import Decimal
 
 from django.contrib.auth.models import User
 from django.db import transaction
+from django.db.models import Q
+from django.utils import timezone
 from rest_framework import serializers
 from rest_framework.exceptions import ValidationError
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
@@ -273,6 +275,7 @@ class MaterialSerializer(serializers.ModelSerializer):
     ingredients = MaterialIngredientSerializer(
         source="material_ingredients", many=True, required=False
     )
+    provider_quotes = serializers.SerializerMethodField()
 
     class Meta:
         model = Material
@@ -316,8 +319,40 @@ class MaterialSerializer(serializers.ModelSerializer):
             "storage_method",  # 常溫、冷凍、冷藏
             "dietary_type",  # 葷素判斷
             "ingredients",  # 成分
+            "provider_quotes",  # 廠商報價資訊
         ]
         read_only_fields = ["id", "created_by", "created_at", "updated_at"]
+
+    def get_provider_quotes(self, obj):
+        today = timezone.now().date()
+
+        active_prices = (
+            obj.provider_prices.filter(is_active=True, quotation__is_active=True)
+            .filter(
+                Q(quotation__valid_until__gte=today)
+                | Q(quotation__valid_until__isnull=True)
+            )
+            .select_related("quotation", "quotation__provider")
+            .order_by("quotation__provider_id", "-quotation__effective_date", "-id")
+        )
+
+        res = {}
+        for pq in active_prices:
+            pid = pq.quotation.provider_id
+            # 每個廠商只取最新的一筆報價
+            if pid not in res:
+                res[pid] = {
+                    "provider_name": pq.quotation.provider.name
+                    if pq.quotation.provider
+                    else "未知",
+                    "price": float(pq.price) if pq.price else 0.0,
+                    "effective_date": pq.quotation.effective_date.strftime("%Y-%m-%d"),
+                    "valid_until": pq.quotation.valid_until.strftime("%Y-%m-%d")
+                    if pq.quotation.valid_until
+                    else "永久有效",
+                }
+
+        return sorted(res.values(), key=lambda x: x["price"])
 
     def to_internal_value(self, data):
         mutable_data = data.copy()
@@ -1174,6 +1209,7 @@ class CustomerQuotationSerializer(serializers.ModelSerializer):
 
 
 class MaterialProviderPriceSerializer(serializers.ModelSerializer):
+    id = serializers.IntegerField(required=False)
     material_name = serializers.CharField(source="material.name", read_only=True)
     material_code = serializers.CharField(source="material.code", read_only=True)
     material_unit = serializers.CharField(source="material.unit", read_only=True)
@@ -1194,6 +1230,7 @@ class MaterialProviderPriceSerializer(serializers.ModelSerializer):
             "price",
             "is_active",
         ]
+        read_only_fields = ["quotation"]
 
 
 class MaterialProviderQuotationSerializer(serializers.ModelSerializer):
