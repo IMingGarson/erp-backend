@@ -355,32 +355,48 @@ class MaterialSerializer(serializers.ModelSerializer):
     def get_provider_quotes(self, obj):
         today = timezone.now().date()
 
-        active_prices = (
+        bound_price_ids = list(
+            obj.sub_material.filter(is_active=True, selected_price__isnull=False)
+            .values_list("selected_price_id", flat=True)
+            .distinct()
+        )
+
+        all_prices = (
             obj.provider_prices.filter(is_active=True, quotation__is_active=True)
             .filter(
                 Q(quotation__valid_until__gte=today)
                 | Q(quotation__valid_until__isnull=True)
+                | Q(id__in=bound_price_ids)
             )
             .select_related("quotation", "quotation__provider")
             .order_by("quotation__provider_id", "-quotation__effective_date", "-id")
         )
 
         res = {}
-        for pq in active_prices:
+        for pq in all_prices:
             pid = pq.quotation.provider_id
-            # 每個廠商只取最新的一筆報價
-            if pid not in res:
-                res[pid] = {
-                    "id": pq.id,
-                    "provider_name": pq.quotation.provider.name
-                    if pq.quotation.provider
-                    else "未知",
-                    "price": float(pq.price) if pq.price else 0.0,
-                    "effective_date": pq.quotation.effective_date.strftime("%Y-%m-%d"),
-                    "valid_until": pq.quotation.valid_until.strftime("%Y-%m-%d")
-                    if pq.quotation.valid_until
-                    else "永久有效",
-                }
+            is_expired = bool(
+                pq.quotation.valid_until and pq.quotation.valid_until < today
+            )
+
+            quote_data = {
+                "id": pq.id,
+                "provider_name": pq.quotation.provider.name
+                if pq.quotation.provider
+                else "未知",
+                "price": float(pq.price) if pq.price else 0.0,
+                "effective_date": pq.quotation.effective_date.strftime("%Y-%m-%d"),
+                "valid_until": pq.quotation.valid_until.strftime("%Y-%m-%d")
+                if pq.quotation.valid_until
+                else "永久有效",
+                "is_expired": is_expired,
+            }
+
+            if pq.id in bound_price_ids:
+                res[f"bound_{pq.id}"] = quote_data
+            else:
+                if pid not in res:
+                    res[pid] = quote_data
 
         return sorted(res.values(), key=lambda x: x["price"])
 
@@ -1410,29 +1426,48 @@ class BOMMaterialDropdownSerializer(serializers.ModelSerializer):
 
     def get_provider_quotes(self, obj):
         today = timezone.now().date()
-        active_prices = (
+
+        bound_price_ids = list(
+            obj.sub_material.filter(is_active=True, selected_price__isnull=False)
+            .values_list("selected_price_id", flat=True)
+            .distinct()
+        )
+
+        all_prices = (
             obj.provider_prices.filter(is_active=True, quotation__is_active=True)
             .filter(
                 Q(quotation__valid_until__gte=today)
                 | Q(quotation__valid_until__isnull=True)
+                | Q(id__in=bound_price_ids)
             )
             .select_related("quotation", "quotation__provider")
             .order_by("quotation__provider_id", "-quotation__effective_date", "-id")
         )
 
         res = {}
-        for pq in active_prices:
+        for pq in all_prices:
             pid = pq.quotation.provider_id
-            if pid not in res:
-                res[pid] = {
-                    "id": pq.id,
-                    "provider_name": pq.quotation.provider.name
-                    if pq.quotation.provider
-                    else "未知",
-                    "price": float(pq.price) if pq.price else 0.0,
-                    "effective_date": pq.quotation.effective_date.strftime("%Y-%m-%d"),
-                    "valid_until": pq.quotation.valid_until.strftime("%Y-%m-%d")
-                    if pq.quotation.valid_until
-                    else "永久有效",
-                }
+            is_expired = bool(
+                pq.quotation.valid_until and pq.quotation.valid_until < today
+            )
+
+            quote_data = {
+                "id": pq.id,
+                "provider_name": pq.quotation.provider.name
+                if pq.quotation.provider
+                else "未知",
+                "price": float(pq.price) if pq.price else 0.0,
+                "effective_date": pq.quotation.effective_date.strftime("%Y-%m-%d"),
+                "valid_until": pq.quotation.valid_until.strftime("%Y-%m-%d")
+                if pq.quotation.valid_until
+                else "永久有效",
+                "is_expired": is_expired,
+            }
+
+            if pq.id in bound_price_ids:
+                res[f"bound_{pq.id}"] = quote_data
+            else:
+                if pid not in res:
+                    res[pid] = quote_data
+
         return sorted(res.values(), key=lambda x: x["price"])
