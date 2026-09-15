@@ -377,6 +377,75 @@ class Material(models.Model):
         db_table = "materials"
 
 
+class MaterialProviderQuotation(models.Model):
+    id = models.AutoField(primary_key=True)
+    provider = models.ForeignKey(
+        MaterialProvider,
+        on_delete=models.CASCADE,
+        related_name="quotations",
+        verbose_name="供應商",
+    )
+    quote_date = models.DateField(null=True, blank=True, verbose_name="報價日期")
+    valid_until = models.DateField(null=True, blank=True, verbose_name="報價效期")
+    effective_date = models.DateField(verbose_name="系統生效日期")
+    is_tax_included = models.BooleanField(default=True, verbose_name="是否含稅")
+    remark = models.TextField(blank=True, null=True, verbose_name="整單備註")
+    is_active = models.BooleanField(default=True, verbose_name="是否啟用")
+    created_by = models.ForeignKey(User, on_delete=models.DO_NOTHING)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "material_provider_quotations"
+        verbose_name = "供應商報價單"
+
+
+class MaterialProviderPrice(models.Model):
+    id = models.AutoField(primary_key=True)
+    quotation = models.ForeignKey(
+        MaterialProviderQuotation, on_delete=models.CASCADE, related_name="items"
+    )
+    material = models.ForeignKey(
+        Material,
+        on_delete=models.CASCADE,
+        related_name="provider_prices",
+        verbose_name="物料",
+    )
+
+    spec_text = models.CharField(
+        max_length=150, blank=True, null=True, verbose_name="報價規格"
+    )
+    aux_unit = models.CharField(
+        max_length=20, blank=True, null=True, verbose_name="輔助單位"
+    )
+    aux_quantity = models.DecimalField(
+        max_digits=10,
+        decimal_places=4,
+        null=True,
+        blank=True,
+        verbose_name="單件基本重",
+    )
+
+    quoted_price = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        verbose_name="廠商原始報價",
+    )
+    quoted_unit = models.CharField(
+        max_length=20, null=True, blank=True, verbose_name="報價單位"
+    )
+    price = models.DecimalField(
+        max_digits=12, decimal_places=4, verbose_name="系統基本單價"
+    )
+
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "material_provider_prices"
+
+
 class ProductProfile(models.Model):
     id = models.AutoField(primary_key=True)
 
@@ -486,6 +555,14 @@ class BOM(models.Model):
     )
     remark = models.TextField(null=True, blank=True, verbose_name="物料備註")
     set_cost = models.IntegerField(null=True, blank=True, verbose_name="自訂單位成本")
+
+    selected_price = models.ForeignKey(
+        MaterialProviderPrice,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        verbose_name="參考廠商報價",
+    )
 
     class Meta:
         db_table = "boms"
@@ -1153,81 +1230,6 @@ class CustomerQuotationLog(models.Model):
 
     def __str__(self):
         return f"{self.quotation.quotation_number} - {self.action_detail} at {self.created_at}"
-
-
-# ==========================================
-# 供應商報價單
-# ==========================================
-class MaterialProviderQuotation(models.Model):
-    id = models.AutoField(primary_key=True)
-    provider = models.ForeignKey(
-        "MaterialProvider",
-        on_delete=models.CASCADE,
-        related_name="quotations",
-        verbose_name="供應商",
-    )
-    quote_date = models.DateField(null=True, blank=True, verbose_name="報價日期")
-    valid_until = models.DateField(null=True, blank=True, verbose_name="報價效期")
-    effective_date = models.DateField(verbose_name="系統生效日期")
-    is_tax_included = models.BooleanField(default=True, verbose_name="是否含稅")
-    remark = models.TextField(blank=True, null=True, verbose_name="整單備註")
-    is_active = models.BooleanField(default=True, verbose_name="是否啟用")
-    created_by = models.ForeignKey(User, on_delete=models.DO_NOTHING)
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        db_table = "material_provider_quotations"
-        verbose_name = "供應商報價單"
-
-
-# ==========================================
-# 報價單明細
-# ==========================================
-class MaterialProviderPrice(models.Model):
-    id = models.AutoField(primary_key=True)
-    quotation = models.ForeignKey(
-        MaterialProviderQuotation, on_delete=models.CASCADE, related_name="items"
-    )
-    material = models.ForeignKey(
-        "Material",
-        on_delete=models.CASCADE,
-        related_name="provider_prices",
-        verbose_name="物料",
-    )
-
-    spec_text = models.CharField(
-        max_length=150, blank=True, null=True, verbose_name="報價規格"
-    )
-    aux_unit = models.CharField(
-        max_length=20, blank=True, null=True, verbose_name="輔助單位"
-    )
-    aux_quantity = models.DecimalField(
-        max_digits=10,
-        decimal_places=4,
-        null=True,
-        blank=True,
-        verbose_name="單件基本重",
-    )
-
-    quoted_price = models.DecimalField(
-        max_digits=12,
-        decimal_places=2,
-        null=True,
-        blank=True,
-        verbose_name="廠商原始報價",
-    )
-    quoted_unit = models.CharField(
-        max_length=20, null=True, blank=True, verbose_name="報價單位"
-    )
-    price = models.DecimalField(
-        max_digits=12, decimal_places=4, verbose_name="系統基本單價"
-    )
-
-    is_active = models.BooleanField(default=True)
-
-    class Meta:
-        db_table = "material_provider_prices"
 
 
 class BatchQCRecord(models.Model):

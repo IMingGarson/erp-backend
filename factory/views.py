@@ -61,6 +61,7 @@ from .permissions import IsAdminOrEmployerOrReadOnly, IsRDOrReadOnly
 from .serializers import (
     BatchInventorySerializer,
     BatchQCRecordSerializer,
+    BOMMaterialDropdownSerializer,
     BOMSerializer,
     CustomerOrderSerializer,
     CustomerQuotationSerializer,
@@ -652,6 +653,11 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     def get_permissions(self):
         return [IsAuthenticated()]
 
+    def get_serializer_class(self):
+        if self.request.query_params.get("lite") == "true":
+            return BOMMaterialDropdownSerializer
+        return MaterialSerializer
+
     @action(detail=True, methods=["get"])
     def historical_prices(self, request, pk=None):
         material = self.get_object()
@@ -965,11 +971,11 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
                 if len(new_chain) == 1:
                     text = f"直接添加：基準 {base:g} KG 內含 {req:g} KG ({step_ratio * 100:.2f}%)"
-                    short_text = "直接添加比例"
+                    short_text = "原配方成本"
                 else:
                     direct_child_name = new_chain[-1][0]
                     text = f"透過「{direct_child_name}」帶入：基準 {base:g} KG 內含 {req:g} KG (該半成品含 {current_ratio * 100:.2f}%)，換算佔比 {accumulated_ratio * 100:.2f}%"
-                    short_text = f"經「{direct_child_name}」"
+                    short_text = f"(半成品)「{direct_child_name}」"
 
                 affected_products_map[parent_mat.id]["paths"].append(
                     {
@@ -1050,6 +1056,7 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     def get_queryset(self):
         queryset = Material.objects.filter(is_active=True).order_by("-id")
         user = self.request.user
+
         is_rd = (
             user.is_authenticated
             and hasattr(user, "profile")
@@ -1058,7 +1065,11 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         if not is_rd:
             queryset = queryset.filter(phase="IN_PROD")
 
-        if self.action == "list":
+        is_list = self.action == "list"
+        is_lite = self.request.query_params.get("lite") == "true"
+
+        # 不管是普通列表還是輕量下拉選單，都需要算預估成本
+        if is_list or is_lite:
             today = timezone.now().date()
             three_months_ago = today - timedelta(days=90)
 
@@ -1113,15 +1124,26 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 ).select_related("ingredient"),
             )
 
-            queryset = queryset.prefetch_related(
-                "product_profiles",
-                active_ingredients_prefetch,
-                Prefetch("main_product__child", queryset=annotated_material_qs),
-                Prefetch(
-                    "main_product__child__main_product__child",
-                    queryset=annotated_material_qs,
-                ),
-            )
+            # 🌟 分流：若是輕量模式，就不去 JOIN 龐大的 product_profiles
+            if is_lite:
+                queryset = queryset.prefetch_related(
+                    active_ingredients_prefetch,
+                    Prefetch("main_product__child", queryset=annotated_material_qs),
+                    Prefetch(
+                        "main_product__child__main_product__child",
+                        queryset=annotated_material_qs,
+                    ),
+                )
+            else:
+                queryset = queryset.prefetch_related(
+                    "product_profiles",
+                    active_ingredients_prefetch,
+                    Prefetch("main_product__child", queryset=annotated_material_qs),
+                    Prefetch(
+                        "main_product__child__main_product__child",
+                        queryset=annotated_material_qs,
+                    ),
+                )
 
         return queryset
 

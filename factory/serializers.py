@@ -220,6 +220,10 @@ class BOMItemSerializer(serializers.ModelSerializer):
     child_nutrition_fact = serializers.JSONField(
         source="child.nutrition_fact", read_only=True
     )
+    selected_price_readonly = serializers.PrimaryKeyRelatedField(
+        source="selected_price", read_only=True
+    )
+    selected_quote_info = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = BOM
@@ -235,7 +239,32 @@ class BOMItemSerializer(serializers.ModelSerializer):
             "quantity_required",  # 需求數量
             "remark",  # 原物料備註
             "is_active",
+            "set_cost",
+            "selected_price_readonly",
+            "selected_quote_info",
         ]
+
+    def get_selected_quote_info(self, obj):
+        if not obj.selected_price:
+            return None
+
+        quotation = obj.selected_price.quotation
+        today = timezone.now().date()
+
+        is_expired = False
+        if quotation and quotation.valid_until and quotation.valid_until < today:
+            is_expired = True
+
+        return {
+            "id": obj.selected_price.id,
+            "provider_name": quotation.provider.name
+            if quotation and quotation.provider
+            else "未知廠商",
+            "valid_until": quotation.valid_until.strftime("%Y-%m-%d")
+            if quotation and quotation.valid_until
+            else None,
+            "is_expired": is_expired,
+        }
 
 
 class IngredientSerializer(serializers.ModelSerializer):
@@ -342,6 +371,7 @@ class MaterialSerializer(serializers.ModelSerializer):
             # 每個廠商只取最新的一筆報價
             if pid not in res:
                 res[pid] = {
+                    "id": pq.id,
                     "provider_name": pq.quotation.provider.name
                     if pq.quotation.provider
                     else "未知",
@@ -473,6 +503,17 @@ class BOMSerializer(serializers.ModelSerializer):
         queryset=Material.objects.all(), source="child", write_only=True
     )
 
+    selected_price_id = serializers.PrimaryKeyRelatedField(
+        queryset=MaterialProviderPrice.objects.all(),
+        source="selected_price",
+        write_only=True,
+        required=False,
+        allow_null=True,
+    )
+    selected_price_readonly = serializers.PrimaryKeyRelatedField(
+        source="selected_price", read_only=True
+    )
+
     class Meta:
         model = BOM
         fields = [
@@ -488,24 +529,63 @@ class BOMSerializer(serializers.ModelSerializer):
             "is_active",
             "created_at",
             "updated_at",
+            "selected_price_id",
+            "selected_price_readonly",
         ]
+
+    def get_selected_quote_info(self, obj):
+        if not obj.selected_price:
+            return None
+
+        quotation = obj.selected_price.quotation
+        today = timezone.now().date()
+
+        is_expired = False
+        if quotation and quotation.valid_until and quotation.valid_until < today:
+            is_expired = True
+
+        return {
+            "id": obj.selected_price.id,
+            "provider_name": quotation.provider.name
+            if quotation and quotation.provider
+            else "未知廠商",
+            "valid_until": quotation.valid_until.strftime("%Y-%m-%d")
+            if quotation and quotation.valid_until
+            else None,
+            "is_expired": is_expired,
+        }
 
     def _get_additive_contributions(self, material, current_ratio):
         """
         遞迴函數：計算傳入的 material (包含其子件) 會貢獻多少添加物比例
+        透過 MaterialIngredient 關聯到 Ingredient 模型來判斷
         """
         additives = {}
 
-        # 1. 如果自己本身就是添加物
-        if material.is_additive and material.legal_limit_percent:
-            additives[material.code] = {
-                "name": material.name,
-                "limit": Decimal(str(material.legal_limit_percent)),
-                "ratio": Decimal(str(current_ratio)),
-            }
+        # 1. 撈取該原料底下的所有「有效、且有設定上限的法定添加物」
+        active_mat_ings = material.material_ingredients.filter(
+            is_active=True,
+            ingredient__is_active=True,
+            ingredient__is_additive=True,
+            ingredient__legal_limit_percent__isnull=False,
+        ).select_related("ingredient")
+
+        for mat_ing in active_mat_ings:
+            ing = mat_ing.ingredient
+            # 使用成分的 ID 當作 key，確保不同原料含有同種成分時能正確加總
+            ing_key = f"ing_{ing.id}"
+
+            if ing_key not in additives:
+                additives[ing_key] = {
+                    "name": ing.name,
+                    "limit": Decimal(str(ing.legal_limit_percent)),
+                    "ratio": Decimal(str(current_ratio)),
+                }
+            else:
+                additives[ing_key]["ratio"] += Decimal(str(current_ratio))
 
         # 2. 如果是半成品，遞迴往下挖
-        elif material.type == "SEMI":
+        if material.type == "SEMI":
             semi_boms = material.main_product.filter(is_active=True).select_related(
                 "child"
             )
@@ -540,14 +620,12 @@ class BOMSerializer(serializers.ModelSerializer):
         if base_qty <= 0:
             raise ValidationError({"base_quantity": ["基準產量必須大於 0"]})
 
-        # 1. 取得這筆「準備新增/修改」的明細，會帶入多少添加物
         current_item_ratio = qty_required / base_qty
         new_additives = self._get_additive_contributions(child, current_item_ratio)
 
         if not new_additives:
-            return  # 沒有添加物，安全放行
+            return
 
-        # 2. 撈取同配方(母件)底下「其他」已存在的 BOM
         existing_boms = parent.main_product.filter(is_active=True).select_related(
             "child"
         )
@@ -557,7 +635,6 @@ class BOMSerializer(serializers.ModelSerializer):
 
         total_additives = new_additives.copy()
 
-        # 3. 累加資料庫內現有配方的添加物
         for bom in existing_boms:
             bom_ratio = bom.quantity_required / bom.base_quantity
             existing_adds = self._get_additive_contributions(bom.child, bom_ratio)
@@ -568,7 +645,6 @@ class BOMSerializer(serializers.ModelSerializer):
                 else:
                     total_additives[code] = data
 
-        # 4. 最終驗算：是否超過法規上限
         for code, data in total_additives.items():
             usage_percent = data["ratio"] * Decimal(100)
             if usage_percent > data["limit"]:
@@ -607,7 +683,7 @@ class BOMSerializer(serializers.ModelSerializer):
             qty_required=validated_data.get(
                 "quantity_required", instance.quantity_required
             ),
-            exclude_bom_id=instance.id,  # 排除自己舊的數據，避免重複計算
+            exclude_bom_id=instance.id,
         )
 
         return super().update(instance, validated_data)
@@ -1307,3 +1383,56 @@ class BatchQCRecordSerializer(serializers.ModelSerializer):
         if obj.inspector:
             return f"{obj.inspector.last_name}{obj.inspector.first_name}"
         return "系統或未指定"
+
+
+class BOMMaterialDropdownSerializer(serializers.ModelSerializer):
+    estimated_cost = serializers.ReadOnlyField()
+    ingredients = MaterialIngredientSerializer(
+        source="material_ingredients", many=True, read_only=True
+    )
+    boms = BOMItemSerializer(source="main_product", many=True, read_only=True)
+    provider_quotes = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Material
+        fields = [
+            "id",
+            "code",
+            "name",
+            "type",
+            "unit",
+            "estimated_cost",
+            "provider_quotes",
+            "ingredients",  # 添加物安全試算需要
+            "nutrition_fact",  # 營養素加總需要
+            "boms",  # 半成品遞迴計算需要
+        ]
+
+    def get_provider_quotes(self, obj):
+        today = timezone.now().date()
+        active_prices = (
+            obj.provider_prices.filter(is_active=True, quotation__is_active=True)
+            .filter(
+                Q(quotation__valid_until__gte=today)
+                | Q(quotation__valid_until__isnull=True)
+            )
+            .select_related("quotation", "quotation__provider")
+            .order_by("quotation__provider_id", "-quotation__effective_date", "-id")
+        )
+
+        res = {}
+        for pq in active_prices:
+            pid = pq.quotation.provider_id
+            if pid not in res:
+                res[pid] = {
+                    "id": pq.id,
+                    "provider_name": pq.quotation.provider.name
+                    if pq.quotation.provider
+                    else "未知",
+                    "price": float(pq.price) if pq.price else 0.0,
+                    "effective_date": pq.quotation.effective_date.strftime("%Y-%m-%d"),
+                    "valid_until": pq.quotation.valid_until.strftime("%Y-%m-%d")
+                    if pq.quotation.valid_until
+                    else "永久有效",
+                }
+        return sorted(res.values(), key=lambda x: x["price"])
