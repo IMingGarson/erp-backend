@@ -373,7 +373,13 @@ class ProductionOrderViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         data = serializer.data
 
         if not instance.parent_id:
-            children = self.get_queryset().filter(parent_id=instance.order_number)
+            prefix = f"{instance.order_number}-"
+            children = (
+                self.get_queryset()
+                .filter(order_number__startswith=prefix)
+                .order_by("created_at")
+            )
+
             data["children_orders"] = ProductionOrderSerializer(
                 children, many=True
             ).data
@@ -496,44 +502,50 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         if not mrp_id:
             return Response({"error": "Invalid ID"})
 
-        # 1. 撈出母單 (當前 PK 指定的 MRP)
+        # 1. 撈出母單
         try:
             parent_mrp = self.get_queryset().get(
                 id=mrp_id, status=MaterialRequirementPlan.STATUS_CHOICES[0][0]
             )
         except MaterialRequirementPlan.DoesNotExist:
             return Response(
-                {"error": "找不到此 MRP 母單"},
-                status=status.HTTP_404_NOT_FOUND,
+                {"error": "找不到此 MRP 母單"}, status=status.HTTP_404_NOT_FOUND
             )
 
-        # 2. 撈出對應的所有子單
-        children_mrps = MaterialRequirementPlan.objects.filter(
-            parent_id=parent_mrp.mrp_id,
-            status=MaterialRequirementPlan.STATUS_CHOICES[0][0],
-        )
+        # 🌟 2. 遞迴撈出對應的所有層級子單
+        children_mrps = []
+        current_parent_ids = [parent_mrp.mrp_id]
 
-        all_mrps = [parent_mrp] + list(children_mrps)
+        while current_parent_ids:
+            layer_children = list(
+                MaterialRequirementPlan.objects.filter(
+                    parent_id__in=current_parent_ids,
+                    status=MaterialRequirementPlan.STATUS_CHOICES[0][0],
+                )
+            )
+            if not layer_children:
+                break
 
-        # 3. 檢查並真實扣除庫存 (防超賣)
+            children_mrps.extend(layer_children)
+            current_parent_ids = [c.mrp_id for c in layer_children]
+
+        all_mrps = [parent_mrp] + children_mrps
+
+        # 3. 檢查並真實扣除庫存
         for mrp in all_mrps:
             for material_item in mrp.batch_inventory_info:
                 for batch in material_item.get("batches", []):
                     used_str = batch.get("used", "")
-
                     if not used_str:
                         continue
-
                     try:
                         used_qty = Decimal(str(used_str))
                     except (InvalidOperation, ValueError):
                         continue
-
                     if used_qty <= 0:
                         continue
 
                     batch_id = batch.get("id")
-
                     try:
                         inventory = BatchInventory.objects.select_for_update().get(
                             id=batch_id
@@ -542,96 +554,118 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                         raise ValidationError(f"找不到批次庫存 ID: {batch_id}")
 
                     if inventory.remaining_qty < used_qty:
-                        self._record_db_log(
-                            inventory,
-                            user,
-                            f"{user.last_name}{user.first_name} 執行從物料單號：{mrp.mrp_id} 轉單失敗，庫存不足！批次 {batch.get('batch_number')} 僅剩 {inventory.remaining_qty}，但需要扣除 {used_qty}",
-                        )
                         raise ValidationError(
                             f"庫存不足！批次 {batch.get('batch_number')} 僅剩 {inventory.remaining_qty}，但需要扣除 {used_qty}"
                         )
 
-                    # 修正：真實扣除庫存，並將 update_fields 改為 remaining_qty
                     inventory.remaining_qty -= used_qty
                     inventory.save(update_fields=["remaining_qty"])
-                    self._record_db_log(
-                        inventory,
-                        user,
-                        f"{user.last_name}{user.first_name} 執行從物料單號：{mrp.mrp_id} 轉單，自動扣除庫存數量 {used_qty}",
-                    )
 
-        # 4. 準備產生生產單
+        def _generate_qc_metrics(product):
+            standards = getattr(product, "qc_standards", [])
+            if not standards:
+                return []
+            metrics = []
+            for std in standards:
+                metric = dict(std)
+                metric.update(
+                    {
+                        "actual_value_num": None,
+                        "actual_value_text": None,
+                        "is_passed": None,
+                        "remark": "",
+                    }
+                )
+                metrics.append(metric)
+            return metrics
+
         created_pos = []
-        child_po_map = {}  # 用來記錄 子 MRP ID 對應到的 子生產單
+        mrp_to_po_map = {}
 
-        # 先建立子單的生產單
-        for child_mrp in children_mrps:
-            sorted_materials = sorted(
-                child_mrp.batch_inventory_info,
-                key=lambda x: float(x.get("requiredQty", 0)),
-                reverse=True,
-            )
-
-            child_po = ProductionOrder.objects.create(
-                order_number=child_mrp.mrp_id,
-                product=child_mrp.product,
-                target_qty=child_mrp.required_qty,
-                materials_info=sorted_materials,
-                vendor_info=child_mrp.vendor_info,
-                created_by=user,
-            )
-            child_po_map[child_mrp.id] = child_po
-            self._record_db_log(
-                child_po,
-                user,
-                f"{user.last_name}{user.first_name} 將單號：{child_mrp.mrp_id} 轉成子生產單",
-            )
-            created_pos.append(child_po)
-
-        parent_materials_info = []
-        for child_mrp in children_mrps:
-            parent_materials_info.append(
-                {
-                    "type": "CHILD_PRODUCT",
-                    "code": getattr(child_mrp.product, "code", ""),
-                    "unit": getattr(child_mrp.product, "unit", ""),
-                    "materialName": child_mrp.product.name,
-                    "requiredQty": float(child_mrp.required_qty),
-                    "isShortage": False,
-                    "child_order_number": child_po_map[child_mrp.id].order_number,
-                    "batches": [],
-                }
-            )
+        # 🌟 先整理 parent 關係
+        children_by_parent = {}
+        for child in children_mrps:
+            if child.parent_id not in children_by_parent:
+                children_by_parent[child.parent_id] = []
+            children_by_parent[child.parent_id].append(child)
 
         other_materials = sorted(
             parent_mrp.batch_inventory_info,
             key=lambda x: float(x.get("requiredQty", 0)),
             reverse=True,
         )
-        parent_materials_info.extend(other_materials)
-
-        # 建立母生產單
         parent_po = ProductionOrder.objects.create(
             order_number=parent_mrp.mrp_id,
             product=parent_mrp.product,
             target_qty=parent_mrp.required_qty,
-            materials_info=parent_materials_info,
+            materials_info=other_materials,
             vendor_info=parent_mrp.vendor_info,
+            qc_metrics=_generate_qc_metrics(parent_mrp.product),
             created_by=user,
         )
         created_pos.append(parent_po)
-        self._record_db_log(
-            parent_po,
-            user,
-            f"{user.last_name}{user.first_name} 將單號：{parent_mrp.mrp_id} 轉成主生產單",
-        )
+        mrp_to_po_map[parent_mrp.mrp_id] = parent_po
 
-        for child_po in child_po_map.values():
-            child_po.parent_id = parent_po.order_number
-            child_po.save(update_fields=["parent_id"])
+        # 🌟 使用全域流水號 (不使用 -x-y)
+        global_suffix = [1]
+
+        def create_child_pos(current_mrp_id, current_po):
+            if current_mrp_id not in children_by_parent:
+                return
+
+            layer_children = sorted(
+                children_by_parent[current_mrp_id], key=lambda x: x.created_at
+            )
+
+            child_po_infos = []
+
+            for child_mrp in layer_children:
+                # 單號命名邏輯：[最頂層母單號]-[全域流水號]
+                new_order_number = f"{parent_mrp.mrp_id}-{global_suffix[0]}"
+                global_suffix[0] += 1
+
+                sorted_materials = sorted(
+                    child_mrp.batch_inventory_info,
+                    key=lambda x: float(x.get("requiredQty", 0)),
+                    reverse=True,
+                )
+
+                child_po = ProductionOrder.objects.create(
+                    order_number=new_order_number,
+                    parent_id=current_po.order_number,
+                    product=child_mrp.product,
+                    target_qty=child_mrp.required_qty,
+                    materials_info=sorted_materials,
+                    vendor_info=child_mrp.vendor_info,
+                    qc_metrics=_generate_qc_metrics(child_mrp.product),
+                    created_by=user,
+                )
+                mrp_to_po_map[child_mrp.mrp_id] = child_po
+                created_pos.append(child_po)
+
+                child_po_infos.append(
+                    {
+                        "type": "CHILD_PRODUCT",
+                        "code": getattr(child_mrp.product, "code", ""),
+                        "unit": getattr(child_mrp.product, "unit", ""),
+                        "materialName": child_mrp.product.name,
+                        "requiredQty": float(child_mrp.required_qty),
+                        "isShortage": False,
+                        "child_order_number": new_order_number,
+                        "batches": [],
+                    }
+                )
+
+                create_child_pos(child_mrp.mrp_id, child_po)
+
+            updated_info = child_po_infos + current_po.materials_info
+            current_po.materials_info = updated_info
+            current_po.save(update_fields=["materials_info"])
+
+        create_child_pos(parent_mrp.mrp_id, parent_po)
 
         for mrp in all_mrps:
-            mrp.status = MaterialRequirementPlan.STATUS_CHOICES[1][0]  # conveted
+            mrp.status = MaterialRequirementPlan.STATUS_CHOICES[1][0]
             mrp.save(update_fields=["status"])
 
         return Response(
@@ -737,7 +771,7 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 all_months.update(history_map.keys())
 
             # 2. 處理「月份斷層」並加總當月 BOM 總成本與成本結構
-            sorted_months = sorted(list(all_months))
+            sorted_months = sorted(all_months)
             data = []
 
             last_known_price = {
@@ -940,7 +974,7 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                     "effective_date": pq.quotation.effective_date.strftime("%Y-%m-%d"),
                 }
         provider_quotes = sorted(
-            list(provider_quotes_map.values()), key=lambda x: x["new_price"]
+            provider_quotes_map.values(), key=lambda x: x["new_price"]
         )
 
         affected_products_map = {}
@@ -987,7 +1021,6 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
                 find_parents(parent_mat, accumulated_ratio, new_chain)
 
-        # 🌟 修復 2：補上空陣列作為 chain 的初始值
         find_parents(material, 1.0, [])
 
         product_details = []
@@ -1124,7 +1157,6 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 ).select_related("ingredient"),
             )
 
-            # 🌟 分流：若是輕量模式，就不去 JOIN 龐大的 product_profiles
             if is_lite:
                 queryset = queryset.prefetch_related(
                     active_ingredients_prefetch,

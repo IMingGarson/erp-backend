@@ -206,39 +206,15 @@ class Material(models.Model):
         default="IN_PROD",
         verbose_name="物料使用階段",
     )
-    # ==========================
-    # 廠內品管物理指標 (固定欄位)
-    # ==========================
-    qc_dilution_ratio = models.CharField(
-        max_length=20,
+
+    qc_standards = models.JSONField(
         blank=True,
         null=True,
-        verbose_name="檢測稀釋比例",
-        help_text="如: (1:1), (1:5) 或 (原)",
+        default=list,
+        verbose_name="預設品管檢驗標準",
+        help_text="以 JSON 陣列定義此成品的檢驗項目與合格區間",
     )
-    qc_brix_min = models.DecimalField(
-        max_digits=5, decimal_places=2, null=True, blank=True, verbose_name="Brix 下限"
-    )
-    qc_brix_max = models.DecimalField(
-        max_digits=5, decimal_places=2, null=True, blank=True, verbose_name="Brix 上限"
-    )
-    qc_salt_min = models.DecimalField(
-        max_digits=5, decimal_places=2, null=True, blank=True, verbose_name="鹽度 下限"
-    )
-    qc_salt_max = models.DecimalField(
-        max_digits=5, decimal_places=2, null=True, blank=True, verbose_name="鹽度 上限"
-    )
-    qc_moisture_max = models.DecimalField(
-        max_digits=5,
-        decimal_places=2,
-        null=True,
-        blank=True,
-        verbose_name="水分上限(%)",
-        help_text="如: 10 代表 <10%",
-    )
-    qc_microbiology = models.JSONField(
-        blank=True, null=True, default=list, verbose_name="微生物與其他法定檢驗標準"
-    )
+
     storage_method = models.CharField(
         max_length=20,
         choices=STORAGE_CHOICES,
@@ -723,6 +699,14 @@ class ProductionOrder(models.Model):
         blank=True,
         verbose_name="實際生產量",
     )
+    qc_metrics = models.JSONField(
+        blank=True,
+        null=True,
+        default=list,
+        verbose_name="品管檢驗與批號紀錄",
+        help_text="存放當次生產的各項檢測數值與結果",
+    )
+    qc_passed = models.BooleanField(null=True, blank=True, verbose_name="品管是否合格")
     is_active = models.BooleanField(default=True, verbose_name="是否啟用")
 
     created_by = models.ForeignKey(User, on_delete=models.DO_NOTHING)

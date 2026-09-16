@@ -335,16 +335,7 @@ class MaterialSerializer(serializers.ModelSerializer):
             # ==========================
             # 廠內品管物理指標欄位
             # ==========================
-            "qc_dilution_ratio",  # 稀釋比例 (如: 1:1, 1:5, 原)
-            "qc_brix_min",  # Brix 下限
-            "qc_brix_max",  # Brix 上限
-            "qc_salt_min",  # 鹽度 下限
-            "qc_salt_max",  # 鹽度 上限
-            "qc_moisture_max",  # 水分上限 (%)
-            # ==========================
-            # 微生物檢驗標準 (JSON)
-            # ==========================
-            "qc_microbiology",  # 微生物檢驗陣列 (JSON)
+            "qc_standards",
             "storage_method",  # 常溫、冷凍、冷藏
             "dietary_type",  # 葷素判斷
             "ingredients",  # 成分
@@ -506,7 +497,7 @@ class BatchInventorySerializer(serializers.ModelSerializer):
 class BOMMaterialMinimalSerializer(serializers.ModelSerializer):
     class Meta:
         model = Material
-        fields = ["id", "code", "name", "type", "unit", "pack_capacity"]
+        fields = ["id", "code", "name", "type", "unit", "pack_capacity", "qc_standards"]
 
 
 class BOMSerializer(serializers.ModelSerializer):
@@ -846,6 +837,7 @@ class SimpleProductSerializer(serializers.ModelSerializer):
             "sales_pack_unit",
             "sales_unit_quantity",
             "sales_pack_quantity",
+            "qc_standards",
         ]
 
     def _get_profile(self, obj):
@@ -907,6 +899,8 @@ class ProductionOrderSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
             "is_active",
+            "qc_metrics",
+            "qc_passed",
         ]
 
     def get_creator_name(self, obj):
@@ -1351,19 +1345,7 @@ class MaterialProviderQuotationSerializer(serializers.ModelSerializer):
 class MaterialQCSerializer(serializers.ModelSerializer):
     class Meta:
         model = Material
-        fields = [
-            "id",
-            "code",
-            "name",
-            "unit",
-            "qc_dilution_ratio",
-            "qc_brix_min",
-            "qc_brix_max",
-            "qc_salt_min",
-            "qc_salt_max",
-            "qc_moisture_max",
-            "qc_microbiology",
-        ]
+        fields = ["id", "code", "name", "unit", "qc_standards"]
 
 
 class BatchQCRecordSerializer(serializers.ModelSerializer):
