@@ -865,13 +865,15 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         for p in active_prices:
             m_id = p.material.id
             prov_id = p.quotation.provider_id if p.quotation else 0
-
-            # 🌟 核心修正：使用 (物料ID, 廠商ID) 作為複合鍵，保留同物料的多家廠商
             key = (m_id, prov_id)
 
             if key not in checked_quotes:
                 new_price = float(p.price) if p.price else 0.0
-                old_price = self._get_historical_base_cost(p.material)
+                old_price = (
+                    float(p.material.estimated_cost)
+                    if p.material.estimated_cost
+                    else 0.0
+                )
                 diff = new_price - old_price
 
                 checked_quotes[key] = {
@@ -905,7 +907,6 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
             find_parent_ids(material, affected_product_ids)
 
-            # 只要有價差就列入預警 (可根據需求加上閥值，例如 diff_percent > 5%)
             if affected_product_ids and info["new_price"] != info["old_price"]:
                 q_count = (
                     CustomerQuotationItem.objects.filter(
@@ -938,11 +939,13 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
     @action(detail=True, methods=["get"])
     def impact_analysis(self, request, pk=None):
-        """詳細追溯分析：並將配方比例轉換為白話文解析路徑"""
+        """詳細追溯分析：並精準抓出該原料在各別 BOM 階層中的實際成本狀況"""
         material = self.get_object()
         today = timezone.now().date()
 
-        old_price = self._get_historical_base_cost(material)
+        global_estimated_cost = (
+            float(material.estimated_cost) if material.estimated_cost else 0.0
+        )
 
         active_prices = (
             material.provider_prices.filter(is_active=True, quotation__is_active=True)
@@ -959,11 +962,14 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
             pid = pq.quotation.provider_id
             if pid not in provider_quotes_map:
                 new_price = float(pq.price) if pq.price else 0.0
-                price_diff = new_price - old_price
+                price_diff = new_price - global_estimated_cost
                 diff_percent = (
-                    round((price_diff / old_price * 100), 2) if old_price > 0 else 0
+                    round((price_diff / global_estimated_cost * 100), 2)
+                    if global_estimated_cost > 0
+                    else 0
                 )
                 provider_quotes_map[pid] = {
+                    "id": pq.id,
                     "provider_id": pid,
                     "provider_name": pq.quotation.provider.name
                     if pq.quotation.provider
@@ -979,10 +985,11 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
         affected_products_map = {}
 
-        def find_parents(current_material, current_ratio, chain):
+        def find_parents(current_material, current_ratio, chain, target_cost_info=None):
             parent_boms = current_material.sub_material.filter(
                 is_active=True
-            ).select_related("parent")
+            ).select_related("parent", "selected_price", "selected_price__quotation")
+
             for bom in parent_boms:
                 parent_mat = bom.parent
                 req = float(bom.quantity_required)
@@ -990,7 +997,56 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 step_ratio = req / base if base > 0 else 0
                 accumulated_ratio = current_ratio * step_ratio
 
-                new_chain = chain + [(current_material.name, req, base, step_ratio)]
+                if target_cost_info is None:
+                    cost = 0.0
+                    c_type = "NO_DATA"
+                    q_id = None
+                    is_expired = False
+
+                    if bom.set_cost is not None:
+                        cost = float(bom.set_cost)
+                        c_type = "SET_COST"
+                        q_id = None
+                    elif bom.selected_price:
+                        q = bom.selected_price.quotation
+                        if q and q.valid_until and q.valid_until < today:
+                            is_expired = True
+                            cost = (
+                                float(current_material.estimated_cost)
+                                if current_material.estimated_cost
+                                else 0.0
+                            )
+                            c_type = "EXPIRED_PRICE"
+                        else:
+                            cost = float(bom.selected_price.price)
+                            c_type = "SELECTED_PRICE"
+                            q_id = bom.selected_price.id
+                    elif current_material.estimated_cost:
+                        cost = float(current_material.estimated_cost)
+                        c_type = "ESTIMATED"
+                    else:
+                        cost = 0.0
+                        c_type = "NO_DATA"
+
+                    step_target_info = {
+                        "current_cost": cost,
+                        "cost_type": c_type,
+                        "bound_quote_id": q_id,
+                        "is_expired": is_expired,
+                    }
+                else:
+                    step_target_info = target_cost_info
+
+                # 🌟 將 current_material 的屬性獨立抓出，方便前端取用
+                new_chain = chain + [
+                    {
+                        "code": current_material.code,
+                        "name": current_material.name,
+                        "req": req,
+                        "base": base,
+                        "step_ratio": step_ratio,
+                    }
+                ]
 
                 if parent_mat.id not in affected_products_map:
                     affected_products_map[parent_mat.id] = {
@@ -1003,29 +1059,37 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                     accumulated_ratio
                 )
 
-                if len(new_chain) == 1:
+                is_direct = len(new_chain) == 1
+                if is_direct:
                     text = f"直接添加：基準 {base:g} KG 內含 {req:g} KG ({step_ratio * 100:.2f}%)"
-                    short_text = "原配方成本"
                 else:
-                    direct_child_name = new_chain[-1][0]
-                    text = f"透過「{direct_child_name}」帶入：基準 {base:g} KG 內含 {req:g} KG (該半成品含 {current_ratio * 100:.2f}%)，換算佔比 {accumulated_ratio * 100:.2f}%"
-                    short_text = f"(半成品)「{direct_child_name}」"
+                    text = f"透過「{new_chain[-1]['name']}」帶入：基準 {base:g} KG 內含 {req:g} KG，換算佔比 {accumulated_ratio * 100:.2f}%"
 
+                # 🌟 傳入 step_code, step_name 以及 is_direct 供前端 Stack UI 使用
                 affected_products_map[parent_mat.id]["paths"].append(
                     {
                         "text": text,
-                        "short_text": short_text,
+                        "step_code": new_chain[-1]["code"],
+                        "step_name": new_chain[-1]["name"],
+                        "is_direct": is_direct,
                         "ratio": accumulated_ratio,
+                        "target_cost_info": step_target_info,
                     }
                 )
 
-                find_parents(parent_mat, accumulated_ratio, new_chain)
+                find_parents(parent_mat, accumulated_ratio, new_chain, step_target_info)
 
         find_parents(material, 1.0, [])
 
         product_details = []
         for pid, data in affected_products_map.items():
             parent_mat = data["obj"]
+
+            # 🌟 強制將 is_direct (直投成品原料) 排序在最上面第一列
+            sorted_paths = sorted(
+                data["paths"], key=lambda x: 0 if x["is_direct"] else 1
+            )
+
             product_details.append(
                 {
                     "id": parent_mat.id,
@@ -1033,7 +1097,7 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                     "name": parent_mat.name,
                     "type": parent_mat.type,
                     "accumulated_ratio": data["accumulated_ratio"],
-                    "paths": data["paths"],
+                    "paths": sorted_paths,
                 }
             )
 
@@ -1061,6 +1125,7 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                         }
                     quotation_map[q_id]["affected_items"].append(
                         {
+                            "product_id": item.product.id,
                             "product_code": item.product.code,
                             "product_name": item.product.name,
                             "pricing_multiplier": float(item.pricing_multiplier)
@@ -1077,7 +1142,7 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
         return Response(
             {
-                "material_base_cost": old_price,
+                "material_base_cost": global_estimated_cost,
                 "provider_quotes": provider_quotes,
                 "affected_products": product_details,
                 "affected_quotations": sorted(
