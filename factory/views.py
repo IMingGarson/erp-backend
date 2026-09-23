@@ -332,7 +332,8 @@ class ProductionOrderViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     serializer_class = ProductionOrderSerializer
 
     def get_permissions(self):
-        return [IsAuthenticated(), IsAdminOrEmployerOrReadOnly()]
+        return [IsAuthenticated()]
+        # return [IsAuthenticated(), IsAdminOrEmployerOrReadOnly()]
 
     def list(self, request, *args, **kwargs):
         """
@@ -345,7 +346,21 @@ class ProductionOrderViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
             queryset = queryset.filter(
                 models.Q(order_number__icontains=search_keyword)
                 | models.Q(product__name__icontains=search_keyword)
+                | models.Q(product__code__icontains=search_keyword)
             )
+
+        # 🌟 1. 新增：依產品名稱篩選
+        product_keyword = request.query_params.get("product")
+        if product_keyword:
+            queryset = queryset.filter(
+                models.Q(product__name__icontains=product_keyword)
+                | models.Q(product__code__icontains=product_keyword)
+            )
+
+        # 🌟 2. 新增：依客戶(Vendor)名稱篩選 (搜尋 JSON 內部的 name)
+        vendor_keyword = request.query_params.get("vendor")
+        if vendor_keyword:
+            queryset = queryset.filter(vendor_info__name__icontains=vendor_keyword)
 
         parent_id = request.query_params.get("parent_id")
         if parent_id:
@@ -1542,6 +1557,14 @@ class BOMViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
     def get_permissions(self):
         return [IsAuthenticated(), IsRDOrReadOnly()]
+
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        parent_mat = instance.parent
+        super().perform_destroy(instance)
+
+        if parent_mat:
+            parent_mat.recalculate_from_ingredients()
 
 
 class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):

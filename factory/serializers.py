@@ -212,11 +212,46 @@ class MaterialProviderSerializer(serializers.ModelSerializer):
         return "系統產生"
 
 
+class IngredientSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Ingredient
+        fields = "__all__"
+        read_only_fields = ["id", "created_by", "created_at", "updated_at"]
+
+
+class MaterialIngredientListSerializer(serializers.ListSerializer):
+    def to_representation(self, data):
+        iterable = data.all() if hasattr(data, "all") else data
+        active_data = [item for item in iterable if item.is_active]
+        return super().to_representation(active_data)
+
+
+class MaterialIngredientSerializer(serializers.ModelSerializer):
+    ingredient_detail = IngredientSerializer(source="ingredient", read_only=True)
+    ingredient_id = serializers.PrimaryKeyRelatedField(
+        source="ingredient",
+        queryset=Ingredient.objects.filter(is_active=True),
+        write_only=True,
+    )
+
+    class Meta:
+        model = MaterialIngredient
+        fields = ["id", "is_active", "ingredient_id", "ingredient_detail"]
+        list_serializer_class = MaterialIngredientListSerializer
+
+
 class BOMItemSerializer(serializers.ModelSerializer):
     child_code = serializers.CharField(source="child.code", read_only=True)
     child_name = serializers.CharField(source="child.name", read_only=True)
     child_type = serializers.CharField(source="child.type", read_only=True)
     child_unit = serializers.CharField(source="child.unit", read_only=True)
+    child_allergen_info = serializers.CharField(
+        source="child.allergen_info", read_only=True
+    )
+
+    child_ingredients = MaterialIngredientSerializer(
+        source="child.material_ingredients", many=True, read_only=True
+    )
     child_nutrition_fact = serializers.JSONField(
         source="child.nutrition_fact", read_only=True
     )
@@ -235,6 +270,8 @@ class BOMItemSerializer(serializers.ModelSerializer):
             "child_type",  # 子物料類型 (RAW, SEMI...)
             "child_unit",  # 子物料單位 (KG, G...)
             "child_nutrition_fact",  # 子物料的營養素
+            "child_allergen_info",
+            "child_ingredients",
             "base_quantity",  # 配方基數
             "quantity_required",  # 需求數量
             "remark",  # 原物料備註
@@ -265,34 +302,6 @@ class BOMItemSerializer(serializers.ModelSerializer):
             else None,
             "is_expired": is_expired,
         }
-
-
-class IngredientSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Ingredient
-        fields = "__all__"
-        read_only_fields = ["id", "created_by", "created_at", "updated_at"]
-
-
-class MaterialIngredientListSerializer(serializers.ListSerializer):
-    def to_representation(self, data):
-        iterable = data.all() if hasattr(data, "all") else data
-        active_data = [item for item in iterable if item.is_active]
-        return super().to_representation(active_data)
-
-
-class MaterialIngredientSerializer(serializers.ModelSerializer):
-    ingredient_detail = IngredientSerializer(source="ingredient", read_only=True)
-    ingredient_id = serializers.PrimaryKeyRelatedField(
-        source="ingredient",
-        queryset=Ingredient.objects.filter(is_active=True),
-        write_only=True,
-    )
-
-    class Meta:
-        model = MaterialIngredient
-        fields = ["id", "is_active", "ingredient_id", "ingredient_detail"]
-        list_serializer_class = MaterialIngredientListSerializer
 
 
 class MaterialSerializer(serializers.ModelSerializer):
@@ -676,7 +685,10 @@ class BOMSerializer(serializers.ModelSerializer):
             qty_required=validated_data["quantity_required"],
         )
 
-        return super().create(validated_data)
+        bom_instance = super().create(validated_data)
+        bom_instance.parent.recalculate_from_ingredients()
+
+        return bom_instance
 
     @transaction.atomic
     def update(self, instance, validated_data):
@@ -693,7 +705,10 @@ class BOMSerializer(serializers.ModelSerializer):
             exclude_bom_id=instance.id,
         )
 
-        return super().update(instance, validated_data)
+        updated_instance = super().update(instance, validated_data)
+        updated_instance.parent.recalculate_from_ingredients()
+
+        return updated_instance
 
 
 class CustomerOrderSerializer(serializers.ModelSerializer):

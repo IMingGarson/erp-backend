@@ -237,30 +237,31 @@ class Material(models.Model):
 
     def recalculate_from_ingredients(self):
         """
-        根據關聯的成分，直接加總營養素並聯集過敏原
+        根據關聯的成分 或 BOM下層配方，重新計算營養素並聯集過敏原。
+        使用由下而上 (Bottom-Up) 的遞迴展算：確保半成品先算完，成品再算。
         """
-        m_ingredients = self.material_ingredients.filter(is_active=True).select_related(
-            "ingredient"
-        )
-        if not m_ingredients:
-            return
-
         calc_nutrition = {
-            "energy_kcal": 0,
-            "protein": 0,
-            "fat": 0,
-            "saturated_fat": 0,
-            "trans_fat": 0,
-            "carbs": 0,
-            "sugar": 0,
-            "sodium": 0,
+            "energy_kcal": 0.0,
+            "protein": 0.0,
+            "fat": 0.0,
+            "saturated_fat": 0.0,
+            "trans_fat": 0.0,
+            "carbs": 0.0,
+            "sugar": 0.0,
+            "sodium": 0.0,
         }
         allergens = set()
 
+        # ---------------------------------------------------------
+        # 1. 處理「手動綁定」的成分 (通常是 RAW，但有時 SEMI 也會手動補)
+        # ---------------------------------------------------------
+        m_ingredients = self.material_ingredients.filter(is_active=True).select_related(
+            "ingredient"
+        )
         for mi in m_ingredients:
             ing_nut = mi.ingredient.nutrition_fact or {}
 
-            # 直接加總營養素
+            # 加總營養素
             for key in calc_nutrition:
                 val = float(ing_nut.get(key) or 0)
                 calc_nutrition[key] += val
@@ -274,11 +275,65 @@ class Material(models.Model):
                 ]
                 allergens.update(parsed_allergens)
 
+        # ---------------------------------------------------------
+        # 2. 處理「配方 (BOM)」下層的子物料 (適用於 SEMI, PRODUCT)
+        # ---------------------------------------------------------
+        if self.type in {"SEMI", "PRODUCT"}:
+            active_boms = self.main_product.filter(is_active=True).select_related(
+                "child"
+            )
+
+            for bom in active_boms:
+                child_mat = bom.child
+                if not child_mat:
+                    continue
+
+                # 🌟 關鍵修復：強制子物料先重算自己！(Bottom-Up)
+                # 如果子物料也是 SEMI，它會再往下觸發，直到挖到最底層的 RAW
+                if child_mat.type == "SEMI":
+                    child_mat.recalculate_from_ingredients()
+
+                # 重新讀取子物料身上的最新資料
+                child_mat.refresh_from_db(fields=["nutrition_fact", "allergen_info"])
+
+                # 計算比例
+                base_qty = float(bom.base_quantity) if bom.base_quantity else 1.0
+                req_qty = float(bom.quantity_required) if bom.quantity_required else 0.0
+                ratio = req_qty / base_qty if base_qty > 0 else 0
+
+                # 依比例加總子物料的營養素 (若有)
+                child_nut = child_mat.nutrition_fact or {}
+                for key in calc_nutrition:
+                    val = float(child_nut.get(key) or 0)
+                    calc_nutrition[key] += val * ratio
+
+                # 直接聯集子物料的過敏原
+                if child_mat.allergen_info:
+                    parsed_allergens = [
+                        a.strip()
+                        for a in child_mat.allergen_info.split(",")
+                        if a.strip()
+                    ]
+                    allergens.update(parsed_allergens)
+
+        # ---------------------------------------------------------
+        # 3. 格式化後存回資料庫
+        # ---------------------------------------------------------
         formatted_nutrition = {k: str(round(v, 2)) for k, v in calc_nutrition.items()}
-        self.nutrition_fact = formatted_nutrition
+
+        is_all_zero = all(float(v) == 0.0 for v in formatted_nutrition.values())
+        if (
+            not is_all_zero
+            or m_ingredients
+            or (self.type in {"SEMI", "PRODUCT"} and self.main_product.exists())
+        ):
+            self.nutrition_fact = formatted_nutrition
 
         if allergens:
             self.allergen_info = ",".join(sorted(allergens))
+        else:
+            # 原本有設定，但算出來是空的，不主動清空以防手動設定被洗掉
+            pass
 
         self.save(update_fields=["nutrition_fact", "allergen_info"])
 
