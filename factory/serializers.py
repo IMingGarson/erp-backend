@@ -436,7 +436,64 @@ class MaterialSerializer(serializers.ModelSerializer):
     def update(self, instance, validated_data):
         ingredients_data = validated_data.pop("material_ingredients", None)
 
+        old_qc_standards = instance.qc_standards or []
+
         instance = super().update(instance, validated_data)
+
+        new_qc_standards = instance.qc_standards or []
+
+        name_changes = {}
+        for new_qc in new_qc_standards:
+            new_id = new_qc.get("id")
+            new_name = new_qc.get("name")
+            if not new_id or not new_name:
+                continue
+
+            for old_qc in old_qc_standards:
+                if old_qc.get("id") == new_id:
+                    old_name = old_qc.get("name")
+                    if old_name and old_name != new_name:
+                        name_changes[old_name] = new_name
+                    break
+
+        if name_changes:
+            production_orders = ProductionOrder.objects.filter(product=instance)
+            po_to_update = []
+            for po in production_orders:
+                po_metrics = po.qc_metrics or []
+                is_updated = False
+                for metric in po_metrics:
+                    old_name = metric.get("name")
+                    if old_name in name_changes:
+                        metric["name"] = name_changes[old_name]
+                        is_updated = True
+
+                if is_updated:
+                    po.qc_metrics = po_metrics
+                    po_to_update.append(po)
+
+            if po_to_update:
+                ProductionOrder.objects.bulk_update(po_to_update, ["qc_metrics"])
+
+            # (B) 聯動更新所有相關的「進貨批號品管紀錄 (BatchQCRecord)」
+            # (如果是原物料或半成品，會有對應的進貨或自製批號檢驗紀錄)
+            batch_qc_records = BatchQCRecord.objects.filter(material=instance)
+            qc_to_update = []
+            for qc_record in batch_qc_records:
+                qc_metrics = qc_record.qc_metrics or []
+                is_updated = False
+                for metric in qc_metrics:
+                    old_name = metric.get("name")
+                    if old_name in name_changes:
+                        metric["name"] = name_changes[old_name]
+                        is_updated = True
+
+                if is_updated:
+                    qc_record.qc_metrics = qc_metrics
+                    qc_to_update.append(qc_record)
+
+            if qc_to_update:
+                BatchQCRecord.objects.bulk_update(qc_to_update, ["qc_metrics"])
 
         if ingredients_data is not None:
             incoming_ingredients = [item["ingredient"] for item in ingredients_data]

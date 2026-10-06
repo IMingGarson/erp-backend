@@ -744,7 +744,6 @@ class ProductionOrder(models.Model):
     )
     vendor_info = models.JSONField(verbose_name="客戶與物流資訊", default=None)
     materials_info = models.JSONField(verbose_name="原物料與用量資訊", default=list)
-
     product = models.ForeignKey(
         Material, on_delete=models.DO_NOTHING, verbose_name="生產產品"
     )
