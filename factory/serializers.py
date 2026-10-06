@@ -547,6 +547,7 @@ class BOMSerializer(serializers.ModelSerializer):
             "updated_at",
             "selected_price_id",
             "selected_price_readonly",
+            "sequence_num",
         ]
 
     def get_selected_quote_info(self, obj):

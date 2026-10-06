@@ -594,21 +594,31 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 metrics.append(metric)
             return metrics
 
+        # 🌟 新增：智慧排序邏輯 Helper Function
+        def _smart_sort_key(item):
+            seq = item.get("sequence_num")
+            seq_str = str(seq).strip() if seq is not None else ""
+            req_qty = float(item.get("requiredQty", 0))
+
+            if seq_str:
+                # 若有序號：按照字串自然排列
+                return (0, seq_str, -req_qty)
+            else:
+                # 若無序號：退回預設，依照需求量倒序
+                return (1, "", -req_qty)
+
         created_pos = []
         mrp_to_po_map = {}
 
-        # 🌟 先整理 parent 關係
         children_by_parent = {}
         for child in children_mrps:
             if child.parent_id not in children_by_parent:
                 children_by_parent[child.parent_id] = []
             children_by_parent[child.parent_id].append(child)
 
-        other_materials = sorted(
-            parent_mrp.batch_inventory_info,
-            key=lambda x: float(x.get("requiredQty", 0)),
-            reverse=True,
-        )
+        # 🌟 修改 1：母單套用智慧排序
+        other_materials = sorted(parent_mrp.batch_inventory_info, key=_smart_sort_key)
+
         parent_po = ProductionOrder.objects.create(
             order_number=parent_mrp.mrp_id,
             product=parent_mrp.product,
@@ -621,7 +631,6 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         created_pos.append(parent_po)
         mrp_to_po_map[parent_mrp.mrp_id] = parent_po
 
-        # 🌟 使用全域流水號 (不使用 -x-y)
         global_suffix = [1]
 
         def create_child_pos(current_mrp_id, current_po):
@@ -633,16 +642,24 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
             )
 
             child_po_infos = []
+            child_product_codes = []  # 🌟 用來記錄已經變成子單據的半成品
 
             for child_mrp in layer_children:
-                # 單號命名邏輯：[最頂層母單號]-[全域流水號]
                 new_order_number = f"{parent_mrp.mrp_id}-{global_suffix[0]}"
                 global_suffix[0] += 1
+                child_product_code = getattr(child_mrp.product, "code", "")
+                child_product_codes.append(child_product_code)
 
+                # 🌟 尋找父單據中，該半成品的序號，讓 CHILD_PRODUCT 完美繼承
+                semi_seq = ""
+                for m in current_po.materials_info:
+                    if m.get("code") == child_product_code and m.get("type") == "SEMI":
+                        semi_seq = m.get("sequence_num", "")
+                        break
+
+                # 🌟 修改 2：子單本身內部的原料也要套用智慧排序
                 sorted_materials = sorted(
-                    child_mrp.batch_inventory_info,
-                    key=lambda x: float(x.get("requiredQty", 0)),
-                    reverse=True,
+                    child_mrp.batch_inventory_info, key=_smart_sort_key
                 )
 
                 child_po = ProductionOrder.objects.create(
@@ -661,19 +678,30 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 child_po_infos.append(
                     {
                         "type": "CHILD_PRODUCT",
-                        "code": getattr(child_mrp.product, "code", ""),
+                        "code": child_product_code,
                         "unit": getattr(child_mrp.product, "unit", ""),
                         "materialName": child_mrp.product.name,
                         "requiredQty": float(child_mrp.required_qty),
                         "isShortage": False,
                         "child_order_number": new_order_number,
                         "batches": [],
+                        "sequence_num": semi_seq,  # 🌟 讓它擁有正確的排序權重
                     }
                 )
 
                 create_child_pos(child_mrp.mrp_id, child_po)
 
-            updated_info = child_po_infos + current_po.materials_info
+            # 🌟 修改 3：過濾掉重複的 SEMI，只保留擁有連結的 CHILD_PRODUCT，並重新全體排序
+            filtered_info = [
+                m
+                for m in current_po.materials_info
+                if not (
+                    m.get("type") == "SEMI" and m.get("code") in child_product_codes
+                )
+            ]
+
+            updated_info = sorted(filtered_info + child_po_infos, key=_smart_sort_key)
+
             current_po.materials_info = updated_info
             current_po.save(update_fields=["materials_info"])
 

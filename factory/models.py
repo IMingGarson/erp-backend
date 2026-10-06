@@ -595,6 +595,10 @@ class BOM(models.Model):
         verbose_name="參考廠商報價",
     )
 
+    sequence_num = models.CharField(
+        max_length=50, null=True, blank=True, verbose_name="投入序號"
+    )
+
     class Meta:
         db_table = "boms"
         verbose_name = "配方清單"
