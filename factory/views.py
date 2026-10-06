@@ -685,24 +685,15 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                         "isShortage": False,
                         "child_order_number": new_order_number,
                         "batches": [],
-                        "sequence_num": semi_seq,  # 🌟 讓它擁有正確的排序權重
+                        "sequence_num": semi_seq,
                     }
                 )
 
                 create_child_pos(child_mrp.mrp_id, child_po)
 
-            # 🌟 修改 3：過濾掉重複的 SEMI，只保留擁有連結的 CHILD_PRODUCT，並重新全體排序
-            filtered_info = [
-                m
-                for m in current_po.materials_info
-                if not (
-                    m.get("type") == "SEMI" and m.get("code") in child_product_codes
-                )
-            ]
-
-            updated_info = sorted(filtered_info + child_po_infos, key=_smart_sort_key)
-
-            current_po.materials_info = updated_info
+            current_po.materials_info = sorted(
+                current_po.materials_info + child_po_infos, key=_smart_sort_key
+            )
             current_po.save(update_fields=["materials_info"])
 
         create_child_pos(parent_mrp.mrp_id, parent_po)
