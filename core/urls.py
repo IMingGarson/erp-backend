@@ -13,6 +13,7 @@ from factory.auth.views import (
 )
 from factory.mock import InitMockDataAPIView, InitPurchaseMockDataAPIView
 from factory.views import (
+    AccountingReportViewSet,
     BatchInventoryViewSet,
     BatchQCRecordViewSet,
     BOMViewSet,
@@ -24,6 +25,8 @@ from factory.views import (
     MaterialProviderViewSet,
     MaterialRequirementPlanViewSet,
     MaterialViewSet,
+    MiscTransactionRecordViewSet,
+    PaymentRecordViewSet,
     ProductionOrderViewSet,
     ProductProfileViewSet,
     PurchaseRequisitionViewSet,
@@ -59,6 +62,13 @@ router.register(
 )
 router.register(r"qc_records", BatchQCRecordViewSet, basename="qc-records")
 router.register(r"ingredients", IngredientViewSet, basename="ingredient")
+router.register(
+    r"accounting_report", AccountingReportViewSet, basename="accounting-report"
+)
+router.register(
+    r"misc_trans_record", MiscTransactionRecordViewSet, basename="misc-trans-record"
+)
+router.register(r"payment_record", PaymentRecordViewSet, basename="payment-record")
 
 urlpatterns = [
     path("admin/", admin.site.urls),

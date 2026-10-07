@@ -23,6 +23,8 @@ from .models import (
     MaterialProviderPrice,
     MaterialProviderQuotation,
     MaterialRequirementPlan,
+    MiscTransactionRecord,
+    PaymentRecord,
     ProductionLog,
     ProductionOrder,
     ProductProfile,
@@ -1555,3 +1557,75 @@ class BOMMaterialDropdownSerializer(serializers.ModelSerializer):
                     res[pid] = quote_data
 
         return sorted(res.values(), key=lambda x: x["price"])
+
+
+class MiscTransactionRecordSerializer(serializers.ModelSerializer):
+    creator_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = MiscTransactionRecord
+        fields = [
+            "id",
+            "transaction_date",
+            "transaction_type",
+            "amount",
+            "category",
+            "note",
+            "is_active",
+            "created_by",
+            "creator_name",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "created_by", "created_at", "updated_at"]
+
+    def get_creator_name(self, obj):
+        if obj.created_by:
+            return f"{obj.created_by.last_name}{obj.created_by.first_name}"
+        return "系統產生"
+
+
+class PaymentRecordSerializer(serializers.ModelSerializer):
+    creator_name = serializers.SerializerMethodField()
+    customer_name = serializers.CharField(source="customer.name", read_only=True)
+    provider_name = serializers.CharField(source="provider.name", read_only=True)
+
+    class Meta:
+        model = PaymentRecord
+        fields = [
+            "id",
+            "payment_date",
+            "partner_type",
+            "customer",
+            "customer_name",
+            "provider",
+            "provider_name",
+            "amount",
+            "payment_method",
+            "check_info",
+            "reference_notes",
+            "is_active",
+            "created_by",
+            "creator_name",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "created_by", "created_at", "updated_at"]
+
+    def get_creator_name(self, obj):
+        if obj.created_by:
+            return f"{obj.created_by.last_name}{obj.created_by.first_name}"
+        return "系統產生"
+
+    def validate(self, data):
+        """簡單防呆：確認類型與對象是否有對應"""
+        partner_type = data.get("partner_type")
+        if partner_type == "CUSTOMER" and not data.get("customer"):
+            raise serializers.ValidationError(
+                "當對象類型為客戶(收款)時，請指定對應的客戶。"
+            )
+        if partner_type == "VENDOR" and not data.get("provider"):
+            raise serializers.ValidationError(
+                "當對象類型為廠商(付款)時，請指定對應的廠商。"
+            )
+        return data

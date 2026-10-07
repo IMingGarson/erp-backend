@@ -48,6 +48,10 @@ from .models import (
     MaterialProviderQuotation,
     MaterialRequirementPlan,
     MaterialRequirementPlanLog,
+    MiscTransactionRecord,
+    MiscTransactionRecordLog,
+    PaymentRecord,
+    PaymentRecordLog,
     ProductionLog,
     ProductionOrder,
     ProductProfile,
@@ -71,6 +75,8 @@ from .serializers import (
     MaterialProviderSerializer,
     MaterialRequirementPlanSerializer,
     MaterialSerializer,
+    MiscTransactionRecordSerializer,
+    PaymentRecordSerializer,
     ProductionOrderSerializer,
     ProductProfileSerializer,
     PurchaseRequisitionSerializer,
@@ -91,6 +97,8 @@ class CRUDAuditMixin:
         DeliveryNote: (DeliveryNoteLog, "delivery_notes"),
         CustomerOrder: (CustomerOrderLog, "customer_order"),
         CustomerQuotation: (CustomerQuotationLog, "quotation"),
+        MiscTransactionRecord: (MiscTransactionRecordLog, "transaction_record"),
+        PaymentRecord: (PaymentRecordLog, "payment_record"),
     }
 
     def get_valid_user(self):
@@ -2433,3 +2441,255 @@ class IngredientViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 user,
                 f"系統自動動作：自動綁定關聯成分「{ingredient.name}」以共享其法定添加物屬性",
             )
+
+
+class AccountingReportViewSet(viewsets.ViewSet):
+    """
+    會計報表專用 ViewSet (階段一：動態計算應收/應付帳款)
+    不更動資料庫，純依賴現有 DeliveryNote 與 PurchaseRequisitionItem 動態計算
+    """
+
+    def get_permissions(self):
+        return [IsAuthenticated()]
+
+    @action(detail=False, methods=["get"])
+    def accumulated_debt(self, request):
+        """
+        取得各客戶的「累積欠額」
+        公式：該客戶歷史總應收 (DeliveryNote) - 該客戶歷史總已收 (PaymentRecord)
+        """
+        from django.db.models import Sum
+
+        customers = Vendor.objects.filter(is_deleted=False)
+        debt_list = []
+
+        for customer in customers:
+            # 1. 歷史總應收 (從所有銷貨單加總)
+            total_ar = (
+                DeliveryNote.objects.filter(
+                    is_active=True, customer_info__code=customer.code
+                ).aggregate(total=Sum("grand_total"))["total"]
+                or 0
+            )
+
+            # 2. 歷史總已收 (從金流表加總)
+            total_paid = (
+                PaymentRecord.objects.filter(
+                    is_active=True, partner_type="CUSTOMER", customer=customer
+                ).aggregate(total=Sum("amount"))["total"]
+                or 0
+            )
+
+            # 3. 算出累積欠額
+            debt = float(total_ar) - float(total_paid)
+
+            # 若欠款大於 0 才回傳 (可依需求改為全傳)
+            if debt > 0:
+                debt_list.append(
+                    {
+                        "customer_id": customer.id,
+                        "customer_name": customer.name,
+                        "customer_code": customer.code,
+                        "total_ar": float(total_ar),
+                        "total_paid": float(total_paid),
+                        "accumulated_debt": debt,
+                    }
+                )
+
+        # 依照欠款金額由高到低排序
+        debt_list = sorted(debt_list, key=lambda x: x["accumulated_debt"], reverse=True)
+        return Response(debt_list, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=["get"])
+    def ar_report(self, request):
+        """
+        應收帳款 (Accounts Receivable) 對帳查詢
+        以 DeliveryNote (銷貨單) 為基礎，依據時間區間動態加總。
+        """
+        start_date = request.query_params.get("start_date")
+        end_date = request.query_params.get("end_date")
+        customer_code = request.query_params.get(
+            "customer_code"
+        )  # 可選：依客戶代號過濾
+
+        queryset = DeliveryNote.objects.filter(is_active=True).order_by("note_date")
+
+        if start_date:
+            queryset = queryset.filter(note_date__gte=start_date)
+        if end_date:
+            queryset = queryset.filter(note_date__lte=end_date)
+        if customer_code:
+            queryset = queryset.filter(customer_info__code=customer_code)
+
+        # 依客戶分組加總 (因為 customer_info 是 JSON，在 Python 端做 Grouping 最穩定)
+        ar_data = {}
+        for note in queryset:
+            c_code = note.customer_info.get("code", "UNKNOWN")
+            c_name = note.customer_info.get("name", "未知名稱")
+
+            if c_code not in ar_data:
+                ar_data[c_code] = {
+                    "customer_code": c_code,
+                    "customer_name": c_name,
+                    "total_sales_amount": 0.0,
+                    "total_tax_amount": 0.0,
+                    "grand_total": 0.0,
+                    "delivery_notes": [],
+                }
+
+            # 加總單筆金額
+            total_amt = float(note.total_amount or 0)
+            tax_amt = float(note.tax_amount or 0)
+            grand_total = float(note.grand_total or 0)
+
+            ar_data[c_code]["total_sales_amount"] += total_amt
+            ar_data[c_code]["total_tax_amount"] += tax_amt
+            ar_data[c_code]["grand_total"] += grand_total
+
+            # 將單據明細一併附上，讓前端對帳單有明細可查
+            ar_data[c_code]["delivery_notes"].append(
+                {
+                    "id": note.id,
+                    "note_number": note.note_number,
+                    "note_date": note.note_date,
+                    "total_amount": total_amt,
+                    "tax_amount": tax_amt,
+                    "grand_total": grand_total,
+                }
+            )
+
+        # 回傳時將 dict 轉為 list
+        return Response(list(ar_data.values()), status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=["get"])
+    def ap_report(self, request):
+        """
+        應付帳款 (Accounts Payable) 對帳查詢
+        以 PurchaseRequisitionItem (已入庫請購單) 為基礎，依據時間區間動態加總。
+        """
+        start_date = request.query_params.get("start_date")
+        end_date = request.query_params.get("end_date")
+        provider_id = request.query_params.get("provider_id")  # 可選：依供應商過濾
+
+        # 只抓已入庫且有效的請購單明細
+        queryset = (
+            PurchaseRequisitionItem.objects.filter(
+                is_active=True,
+                requisition__status="stocked",
+                requisition__is_active=True,
+            )
+            .select_related("material_provider", "material", "requisition")
+            .order_by("requisition__request_date")
+        )
+
+        if start_date:
+            queryset = queryset.filter(requisition__request_date__gte=start_date)
+        if end_date:
+            queryset = queryset.filter(requisition__request_date__lte=end_date)
+        if provider_id:
+            queryset = queryset.filter(material_provider_id=provider_id)
+
+        ap_data = {}
+        for item in queryset:
+            p_id = item.material_provider.id if item.material_provider else "UNKNOWN"
+            p_name = (
+                item.material_provider.name if item.material_provider else "未知廠商"
+            )
+
+            if p_id not in ap_data:
+                ap_data[p_id] = {
+                    "provider_id": p_id,
+                    "provider_name": p_name,
+                    "grand_total": 0.0,
+                    "items": [],
+                }
+
+            # 應付金額 = 實際數量 * 採購單價
+            qty = float(item.quantity or 0)
+            price = float(item.purchased_price or 0)
+            item_total = qty * price
+
+            ap_data[p_id]["grand_total"] += item_total
+
+            ap_data[p_id]["items"].append(
+                {
+                    "item_id": item.id,
+                    "requisition_id": item.requisition.id,
+                    "request_date": item.requisition.request_date,
+                    "material_name": item.material.name,
+                    "quantity": qty,
+                    "purchased_price": price,
+                    "item_total": item_total,
+                    "remark": item.remark or "",
+                }
+            )
+
+        return Response(list(ap_data.values()), status=status.HTTP_200_OK)
+
+
+class MiscTransactionRecordViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
+    """管理公司雜支、零用金提領紀錄"""
+
+    queryset = MiscTransactionRecord.objects.filter(is_active=True).order_by(
+        "-transaction_date", "-id"
+    )
+    serializer_class = MiscTransactionRecordSerializer
+
+    def get_permissions(self):
+        return [IsAuthenticated()]
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.get_queryset()
+        start_date = request.query_params.get("start_date")
+        end_date = request.query_params.get("end_date")
+
+        if start_date:
+            queryset = queryset.filter(transaction_date__gte=start_date)
+        if end_date:
+            queryset = queryset.filter(transaction_date__lte=end_date)
+
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+
+
+class PaymentRecordViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
+    """管理客戶收款與廠商付款、支票紀錄"""
+
+    queryset = PaymentRecord.objects.filter(is_active=True).order_by(
+        "-payment_date", "-id"
+    )
+    serializer_class = PaymentRecordSerializer
+
+    def get_permissions(self):
+        return [IsAuthenticated()]
+
+    @action(detail=False, methods=["get"])
+    def pending_checks(self, request):
+        """取得尚未兌現的支票列表"""
+        # 利用 Django 的 JSONField 查詢語法
+        checks = self.get_queryset().filter(
+            payment_method="CHECK", check_info__is_cleared=False
+        )
+        serializer = self.get_serializer(checks, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=["post"])
+    def clear_check(self, request, pk=None):
+        """將支票標記為已兌現"""
+        record = self.get_object()
+        if record.payment_method != "CHECK":
+            return Response(
+                {"error": "此紀錄並非支票"}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        check_info = record.check_info or {}
+        check_info["is_cleared"] = True
+        record.check_info = check_info
+        record.save(update_fields=["check_info"])
+
+        user = self.get_valid_user()
+        self._record_db_log(
+            record, user, f"{user.last_name}{user.first_name} 將此支票標記為已兌現"
+        )
+
+        return Response({"message": "支票已成功兌現"}, status=status.HTTP_200_OK)

@@ -1454,3 +1454,127 @@ class MaterialIngredient(models.Model):
     class Meta:
         db_table = "material_ingredients"
         verbose_name = "原物料成分明細"
+
+
+# ==========================================
+# 會計模組：雜支與零用金紀錄
+# ==========================================
+class MiscTransactionRecord(models.Model):
+    TRANSACTION_TYPES = (
+        ("INCOME", "收入 (如: 提領零用金)"),
+        ("EXPENSE", "支出 (如: 雜支、電話費)"),
+    )
+
+    id = models.AutoField(primary_key=True)
+    transaction_date = models.DateField(verbose_name="交易日期")
+    transaction_type = models.CharField(
+        max_length=20, choices=TRANSACTION_TYPES, verbose_name="收支類型"
+    )
+    amount = models.DecimalField(max_digits=15, decimal_places=2, verbose_name="金額")
+    category = models.CharField(
+        max_length=100, verbose_name="類別", help_text="如：電話費、維修費、提領零用金"
+    )
+    note = models.TextField(blank=True, null=True, verbose_name="備註")
+
+    is_active = models.BooleanField(default=True, verbose_name="是否啟用")
+    created_by = models.ForeignKey(User, on_delete=models.DO_NOTHING)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "misc_transaction_records"
+        verbose_name = "雜支與零用金紀錄"
+
+
+class MiscTransactionRecordLog(models.Model):
+    id = models.AutoField(primary_key=True)
+    transaction_record = models.ForeignKey(
+        MiscTransactionRecord, related_name="logs", on_delete=models.DO_NOTHING
+    )
+    user = models.ForeignKey(User, on_delete=models.DO_NOTHING)
+    action_detail = models.TextField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "misc_transaction_record_logs"
+
+
+# ==========================================
+# 會計模組：金流與票據收付款紀錄
+# ==========================================
+class PaymentRecord(models.Model):
+    PARTNER_TYPES = (
+        ("CUSTOMER", "客戶 (收款)"),
+        ("VENDOR", "廠商 (付款)"),
+    )
+    PAYMENT_METHODS = (
+        ("CASH", "現金"),
+        ("TRANSFER", "匯款"),
+        ("CHECK", "支票/票據"),
+    )
+
+    id = models.AutoField(primary_key=True)
+    payment_date = models.DateField(verbose_name="收付款日期")
+    partner_type = models.CharField(
+        max_length=20, choices=PARTNER_TYPES, verbose_name="對象類型"
+    )
+
+    # 對象 (擇一填寫)
+    customer = models.ForeignKey(
+        "Vendor",
+        on_delete=models.DO_NOTHING,
+        null=True,
+        blank=True,
+        verbose_name="客戶",
+        help_text="若為客戶收款請填此欄",
+        related_name="payments",
+    )
+    provider = models.ForeignKey(
+        "MaterialProvider",
+        on_delete=models.DO_NOTHING,
+        null=True,
+        blank=True,
+        verbose_name="廠商",
+        help_text="若為廠商付款請填此欄",
+        related_name="payments",
+    )
+
+    amount = models.DecimalField(max_digits=15, decimal_places=2, verbose_name="金額")
+    payment_method = models.CharField(
+        max_length=20, choices=PAYMENT_METHODS, verbose_name="付款方式"
+    )
+
+    # 支票專用 JSON 欄位 (免去開一堆不常用的實體欄位)
+    # 格式預期：{"target_bank": "玉山銀行", "title": "基香食品", "cash_date": "2026-11-25", "is_cleared": false}
+    check_info = models.JSONField(
+        blank=True, null=True, default=dict, verbose_name="支票與票據資訊"
+    )
+
+    reference_notes = models.TextField(
+        blank=True,
+        null=True,
+        verbose_name="沖銷與備註",
+        help_text="會計可輸入沖銷的銷貨單號或發票號碼",
+    )
+
+    is_active = models.BooleanField(default=True, verbose_name="是否啟用")
+    created_by = models.ForeignKey(User, on_delete=models.DO_NOTHING)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "payment_records"
+        verbose_name = "金流收付款紀錄"
+
+
+class PaymentRecordLog(models.Model):
+    id = models.AutoField(primary_key=True)
+    payment_record = models.ForeignKey(
+        PaymentRecord, related_name="logs", on_delete=models.DO_NOTHING
+    )
+    user = models.ForeignKey(User, on_delete=models.DO_NOTHING)
+    action_detail = models.TextField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "payment_record_logs"
