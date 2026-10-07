@@ -1,5 +1,5 @@
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
 from django.db import models, transaction
@@ -76,7 +76,7 @@ from .serializers import (
     PurchaseRequisitionSerializer,
     VendorSerializer,
 )
-from .services import UtilsFuncService
+from .services import TFDALoopUpService, UtilsFuncService
 
 
 class CRUDAuditMixin:
@@ -349,7 +349,6 @@ class ProductionOrderViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 | models.Q(product__code__icontains=search_keyword)
             )
 
-        # 🌟 1. 新增：依產品名稱篩選
         product_keyword = request.query_params.get("product")
         if product_keyword:
             queryset = queryset.filter(
@@ -357,7 +356,6 @@ class ProductionOrderViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 | models.Q(product__code__icontains=product_keyword)
             )
 
-        # 🌟 2. 新增：依客戶(Vendor)名稱篩選 (搜尋 JSON 內部的 name)
         vendor_keyword = request.query_params.get("vendor")
         if vendor_keyword:
             queryset = queryset.filter(vendor_info__name__icontains=vendor_keyword)
@@ -370,6 +368,36 @@ class ProductionOrderViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         if is_root == "true":
             queryset = queryset.filter(models.Q(parent_id__isnull=True))
 
+        start_date_str = request.query_params.get("start_date")
+        end_date_str = request.query_params.get("end_date")
+
+        if start_date_str:
+            try:
+                start_date = datetime.strptime(start_date_str, "%Y-%m-%d").replace(
+                    hour=0,
+                    minute=0,
+                    second=0,
+                    microsecond=0,
+                    tzinfo=UTC,
+                )
+
+                queryset = queryset.filter(created_at__gte=start_date)
+            except ValueError:
+                pass
+
+        if end_date_str:
+            try:
+                end_date = datetime.strptime(end_date_str, "%Y-%m-%d").replace(
+                    hour=23,
+                    minute=59,
+                    second=59,
+                    microsecond=999999,
+                    tzinfo=UTC,
+                )
+
+                queryset = queryset.filter(created_at__lte=end_date)
+            except ValueError:
+                pass
         page = self.paginate_queryset(queryset)
         if page is not None:
             serializer = self.get_serializer(page, many=True)
@@ -725,6 +753,25 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         if self.request.query_params.get("lite") == "true":
             return BOMMaterialDropdownSerializer
         return MaterialSerializer
+
+    @action(detail=False, methods=["get"], url_path="tfda_lookup")
+    def tfda_lookup(self, request):
+        search_term = request.query_params.get("q", "").strip()
+        if not search_term:
+            return Response(
+                {"message": "error", "error": "請提供搜尋關鍵字 (參數: q)"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            results = TFDALoopUpService.import_tfda_open_data(search_term)
+            return Response(results, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            return Response(
+                {"message": "error", "data": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
     @action(detail=True, methods=["get"])
     def historical_prices(self, request, pk=None):
@@ -2334,4 +2381,55 @@ class IngredientViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         return Ingredient.objects.all().order_by("-id")
 
     def perform_create(self, serializer):
-        serializer.save(created_by=self.get_valid_user())
+        user = self.get_valid_user()
+        instance = serializer.save(created_by=user)
+        self._sync_to_raw_material(instance, user)
+
+    def perform_update(self, serializer):
+        user = self.get_valid_user()
+        super().perform_update(serializer)
+        instance = serializer.instance
+        self._sync_to_raw_material(instance, user)
+
+    def _sync_to_raw_material(self, ingredient, user):
+        """
+        當成分 (Ingredient) 帶有 source_material 且為 RAW 時，
+        自動將營養標示、過敏原寫回該物料，並建立成分綁定，以共享添加物屬性。
+        """
+        mat = ingredient.source_material
+
+        # 若沒有來源物料，或來源不是 RAW，則不需要雙向寫回
+        if not mat or mat.type != "RAW":
+            return
+
+        is_updated = False
+
+        # 1. 同步營養標示與法定過敏原
+        if mat.nutrition_fact != ingredient.nutrition_fact:
+            mat.nutrition_fact = ingredient.nutrition_fact
+            is_updated = True
+
+        if mat.allergen_info != ingredient.allergen_info:
+            mat.allergen_info = ingredient.allergen_info
+            is_updated = True
+
+        if is_updated:
+            mat.save(update_fields=["nutrition_fact", "allergen_info"])
+            self._record_db_log(
+                mat,
+                user,
+                f"系統自動動作：因關聯成分「{ingredient.name}」被設定，自動同步其營養標示與過敏原",
+            )
+
+        # 2. 自動綁定此 Ingredient，讓 RAW 物料完美繼承法定添加物屬性
+        if not MaterialIngredient.objects.filter(
+            material=mat, ingredient=ingredient, is_active=True
+        ).exists():
+            MaterialIngredient.objects.create(
+                material=mat, ingredient=ingredient, is_active=True
+            )
+            self._record_db_log(
+                mat,
+                user,
+                f"系統自動動作：自動綁定關聯成分「{ingredient.name}」以共享其法定添加物屬性",
+            )

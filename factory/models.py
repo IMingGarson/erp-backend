@@ -237,8 +237,9 @@ class Material(models.Model):
 
     def recalculate_from_ingredients(self):
         """
-        根據關聯的成分 或 BOM下層配方，重新計算營養素並聯集過敏原。
-        使用由下而上 (Bottom-Up) 的遞迴展算：確保半成品先算完，成品再算。
+        重新計算營養素並聯集過敏原。
+        - 營養素：如果有 BOM (SEMI/PRODUCT)，100% 由 BOM 展算。如果沒有 BOM (RAW)，則由關聯成分帶入。
+        - 過敏原：永遠聯集 BOM 與手動宣告成分。
         """
         calc_nutrition = {
             "energy_kcal": 0.0,
@@ -251,22 +252,81 @@ class Material(models.Model):
             "sodium": 0.0,
         }
         allergens = set()
+        has_active_boms = False
 
         # ---------------------------------------------------------
-        # 1. 處理「手動綁定」的成分 (通常是 RAW，但有時 SEMI 也會手動補)
+        # 1. 處理「配方 (BOM)」下層的子物料 (適用於 SEMI, PRODUCT)
+        # ---------------------------------------------------------
+        if self.type in {"SEMI", "PRODUCT"}:
+            active_boms = self.main_product.filter(is_active=True).select_related(
+                "child"
+            )
+            if active_boms.exists():
+                has_active_boms = True
+                for bom in active_boms:
+                    child_mat = bom.child
+                    if not child_mat:
+                        continue
+
+                    # 確保最底層優先更新 (Bottom-Up)
+                    if child_mat.type == "SEMI":
+                        child_mat.recalculate_from_ingredients()
+
+                    child_mat.refresh_from_db(
+                        fields=["nutrition_fact", "allergen_info"]
+                    )
+
+                    base_qty = float(bom.base_quantity) if bom.base_quantity else 1.0
+                    req_qty = (
+                        float(bom.quantity_required) if bom.quantity_required else 0.0
+                    )
+                    ratio = req_qty / base_qty if base_qty > 0 else 0
+
+                    child_nut = child_mat.nutrition_fact or {}
+                    # 防呆：確保不被 JSON 字串化陷阱卡住
+                    if isinstance(child_nut, str):
+                        import json
+
+                        try:
+                            child_nut = json.loads(child_nut)
+                        except:
+                            child_nut = {}
+
+                    for key in calc_nutrition:
+                        val = float(child_nut.get(key) or 0)
+                        calc_nutrition[key] += val * ratio
+
+                    if child_mat.allergen_info:
+                        parsed_allergens = [
+                            a.strip()
+                            for a in child_mat.allergen_info.split(",")
+                            if a.strip()
+                        ]
+                        allergens.update(parsed_allergens)
+
+        # ---------------------------------------------------------
+        # 2. 處理「手動綁定」的成分 (適用於 RAW)
         # ---------------------------------------------------------
         m_ingredients = self.material_ingredients.filter(is_active=True).select_related(
             "ingredient"
         )
         for mi in m_ingredients:
-            ing_nut = mi.ingredient.nutrition_fact or {}
+            # 🌟 修正：只有在「沒有 BOM」的情況下，才允許由單一成分貢獻營養素！(防雙重計算)
+            if not has_active_boms:
+                ing_nut = mi.ingredient.nutrition_fact or {}
+                if isinstance(ing_nut, str):
+                    import json
 
-            # 加總營養素
-            for key in calc_nutrition:
-                val = float(ing_nut.get(key) or 0)
-                calc_nutrition[key] += val
+                    try:
+                        ing_nut = json.loads(ing_nut)
+                    except:
+                        ing_nut = {}
 
-            # 聯集過敏原
+                for key in calc_nutrition:
+                    val = float(ing_nut.get(key) or 0)
+                    calc_nutrition[key] += val
+
+            # 🌟 過敏原不論有沒有 BOM 都必須宣告聯集
             if mi.ingredient.allergen_info:
                 parsed_allergens = [
                     a.strip()
@@ -276,64 +336,16 @@ class Material(models.Model):
                 allergens.update(parsed_allergens)
 
         # ---------------------------------------------------------
-        # 2. 處理「配方 (BOM)」下層的子物料 (適用於 SEMI, PRODUCT)
-        # ---------------------------------------------------------
-        if self.type in {"SEMI", "PRODUCT"}:
-            active_boms = self.main_product.filter(is_active=True).select_related(
-                "child"
-            )
-
-            for bom in active_boms:
-                child_mat = bom.child
-                if not child_mat:
-                    continue
-
-                # 🌟 關鍵修復：強制子物料先重算自己！(Bottom-Up)
-                # 如果子物料也是 SEMI，它會再往下觸發，直到挖到最底層的 RAW
-                if child_mat.type == "SEMI":
-                    child_mat.recalculate_from_ingredients()
-
-                # 重新讀取子物料身上的最新資料
-                child_mat.refresh_from_db(fields=["nutrition_fact", "allergen_info"])
-
-                # 計算比例
-                base_qty = float(bom.base_quantity) if bom.base_quantity else 1.0
-                req_qty = float(bom.quantity_required) if bom.quantity_required else 0.0
-                ratio = req_qty / base_qty if base_qty > 0 else 0
-
-                # 依比例加總子物料的營養素 (若有)
-                child_nut = child_mat.nutrition_fact or {}
-                for key in calc_nutrition:
-                    val = float(child_nut.get(key) or 0)
-                    calc_nutrition[key] += val * ratio
-
-                # 直接聯集子物料的過敏原
-                if child_mat.allergen_info:
-                    parsed_allergens = [
-                        a.strip()
-                        for a in child_mat.allergen_info.split(",")
-                        if a.strip()
-                    ]
-                    allergens.update(parsed_allergens)
-
-        # ---------------------------------------------------------
         # 3. 格式化後存回資料庫
         # ---------------------------------------------------------
         formatted_nutrition = {k: str(round(v, 2)) for k, v in calc_nutrition.items()}
 
         is_all_zero = all(float(v) == 0.0 for v in formatted_nutrition.values())
-        if (
-            not is_all_zero
-            or m_ingredients
-            or (self.type in {"SEMI", "PRODUCT"} and self.main_product.exists())
-        ):
+        if not is_all_zero or m_ingredients or has_active_boms:
             self.nutrition_fact = formatted_nutrition
 
         if allergens:
             self.allergen_info = ",".join(sorted(allergens))
-        else:
-            # 原本有設定，但算出來是空的，不主動清空以防手動設定被洗掉
-            pass
 
         self.save(update_fields=["nutrition_fact", "allergen_info"])
 
@@ -766,7 +778,7 @@ class ProductionOrder(models.Model):
     )
     qc_passed = models.BooleanField(null=True, blank=True, verbose_name="品管是否合格")
     is_active = models.BooleanField(default=True, verbose_name="是否啟用")
-
+    manufacture_date = models.DateField(null=True, blank=True, verbose_name="製造日期")
     created_by = models.ForeignKey(User, on_delete=models.DO_NOTHING)
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -1398,6 +1410,14 @@ class Ingredient(models.Model):
     )
     allergen_info = models.CharField(
         max_length=100, blank=True, null=True, verbose_name="法定過敏原"
+    )
+    source_material = models.ForeignKey(
+        "Material",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="derived_ingredients",
+        verbose_name="來源物料",
     )
     is_active = models.BooleanField(default=True, verbose_name="是否啟用")
     created_by = models.ForeignKey(

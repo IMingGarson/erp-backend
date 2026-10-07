@@ -158,6 +158,8 @@ class UserUpdateSerializer(serializers.ModelSerializer):
 class ProductProfileSerializer(serializers.ModelSerializer):
     outer_pack_id = serializers.IntegerField(read_only=True)
     inner_pack_id = serializers.IntegerField(read_only=True)
+    outer_pack_capacity = serializers.SerializerMethodField()
+    inner_pack_capacity = serializers.SerializerMethodField()
 
     class Meta:
         model = ProductProfile
@@ -169,6 +171,8 @@ class ProductProfileSerializer(serializers.ModelSerializer):
             "inner_pack",
             "outer_pack_id",
             "inner_pack_id",
+            "outer_pack_capacity",
+            "inner_pack_capacity",
             "spec",
             "sales_unit",
             "sales_pack_unit",
@@ -176,6 +180,16 @@ class ProductProfileSerializer(serializers.ModelSerializer):
             "sales_pack_quantity",
             "sales_price",
         ]
+
+    def get_outer_pack_capacity(self, obj):
+        if obj.outer_pack and obj.outer_pack.pack_capacity is not None:
+            return float(obj.outer_pack.pack_capacity)
+        return None
+
+    def get_inner_pack_capacity(self, obj):
+        if obj.inner_pack and obj.inner_pack.pack_capacity is not None:
+            return float(obj.inner_pack.pack_capacity)
+        return None
 
 
 class MaterialProviderSerializer(serializers.ModelSerializer):
@@ -213,6 +227,14 @@ class MaterialProviderSerializer(serializers.ModelSerializer):
 
 
 class IngredientSerializer(serializers.ModelSerializer):
+    source_material_id = serializers.PrimaryKeyRelatedField(
+        queryset=Material.objects.all(),
+        source="source_material",
+        required=False,
+        allow_null=True,
+        write_only=True,
+    )
+
     class Meta:
         model = Ingredient
         fields = "__all__"
@@ -436,12 +458,16 @@ class MaterialSerializer(serializers.ModelSerializer):
     def update(self, instance, validated_data):
         ingredients_data = validated_data.pop("material_ingredients", None)
 
+        # 🌟 1. 在更新前，先擷取舊的 QC 標準
         old_qc_standards = instance.qc_standards or []
 
+        # 執行原本的更新動作
         instance = super().update(instance, validated_data)
 
+        # 🌟 2. 取得更新後的新 QC 標準
         new_qc_standards = instance.qc_standards or []
 
+        # 🌟 3. 比對 ID，找出「名稱被修改」的項目
         name_changes = {}
         for new_qc in new_qc_standards:
             new_id = new_qc.get("id")
@@ -456,6 +482,7 @@ class MaterialSerializer(serializers.ModelSerializer):
                         name_changes[old_name] = new_name
                     break
 
+        # 🌟 4. 如果有發現名稱異動，執行聯動更新 (Cascade Update)
         if name_changes:
             production_orders = ProductionOrder.objects.filter(product=instance)
             po_to_update = []
@@ -475,8 +502,6 @@ class MaterialSerializer(serializers.ModelSerializer):
             if po_to_update:
                 ProductionOrder.objects.bulk_update(po_to_update, ["qc_metrics"])
 
-            # (B) 聯動更新所有相關的「進貨批號品管紀錄 (BatchQCRecord)」
-            # (如果是原物料或半成品，會有對應的進貨或自製批號檢驗紀錄)
             batch_qc_records = BatchQCRecord.objects.filter(material=instance)
             qc_to_update = []
             for qc_record in batch_qc_records:
@@ -911,10 +936,14 @@ class SimpleProductSerializer(serializers.ModelSerializer):
             "sales_unit_quantity",
             "sales_pack_quantity",
             "qc_standards",
+            "storage_life",
+            "allergen_info",
+            "storage_method",
+            "nutrition_fact",
+            "origin",
         ]
 
     def _get_profile(self, obj):
-        # 抓取第一筆設定的 Profile
         return obj.product_profiles.first()
 
     def get_spec(self, obj):
