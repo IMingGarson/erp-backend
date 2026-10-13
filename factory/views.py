@@ -190,6 +190,7 @@ class CRUDAuditMixin:
     def perform_update(self, serializer):
         user = self.get_valid_user()
         old_instance = serializer.instance
+        full_username = f"{user.last_name}{user.first_name}"
 
         changes = []
         for field_name, new_val in serializer.validated_data.items():
@@ -199,20 +200,21 @@ class CRUDAuditMixin:
             try:
                 field = old_instance._meta.get_field(field_name)
                 old_val = getattr(old_instance, field_name)
+                verbose_name = getattr(field, "verbose_name", field_name)
+
+                # 🌟 修正：移除多餘的 path，改用最乾淨的人類可讀格式
                 if isinstance(field, models.JSONField) or isinstance(
                     old_val, (dict, list)
                 ):
-                    verbose_name = getattr(field, "verbose_name", field_name)
                     json_diffs = self.get_json_diff(old_val or {}, new_val or {})
-
                     if json_diffs:
-                        diff_str = "，".join(json_diffs)
-                        changes.append(f"「{verbose_name}」細節異動: {diff_str}")
-
+                        for diff in json_diffs:
+                            changes.append(
+                                f"修改 ID {old_instance.pk} 的 {verbose_name}，{diff}"
+                            )
                     continue
 
                 if old_val != new_val:
-                    verbose_name = getattr(field, "verbose_name", field_name)
                     old_display = self._get_field_display_value(
                         old_instance, field, old_val
                     )
@@ -221,7 +223,7 @@ class CRUDAuditMixin:
                     )
 
                     changes.append(
-                        f"「{verbose_name}」由 '{old_display}' 改為 '{new_display}'"
+                        f"修改 ID {old_instance.pk} 的 {verbose_name}，把 '{old_display}' 改成 '{new_display}'"
                     )
             except Exception:
                 pass
@@ -231,10 +233,9 @@ class CRUDAuditMixin:
             save_kwargs["updated_by"] = user
 
         instance = serializer.save(**save_kwargs)
-        full_username = f"{user.last_name}{user.first_name}"
 
         if changes:
-            action_detail = f"{full_username} 更新了: " + "，".join(changes)
+            action_detail = f"{full_username} " + "；".join(changes)
             self._record_db_log(instance, user, action_detail)
 
     def perform_destroy(self, instance):
@@ -299,38 +300,34 @@ class CRUDAuditMixin:
         if user and action_detail:
             self._record_db_log(instance, user, action_detail)
 
-    def get_json_diff(self, old_obj, new_obj, path=""):
+    # 🌟 修正：移除遞迴 Path 的追蹤，只比對值的變化
+    def get_json_diff(self, old_obj, new_obj):
         local_changes = []
 
         if isinstance(old_obj, dict) and isinstance(new_obj, dict):
             all_keys = set(old_obj.keys()).union(set(new_obj.keys()))
             for k in all_keys:
-                current_path = f"{path}.{k}" if path else str(k)
                 if k not in old_obj:
-                    local_changes.append(f"新增了 '{current_path}': '{new_obj[k]}'")
+                    local_changes.append(f"新增了 '{new_obj[k]}'")
                 elif k not in new_obj:
-                    local_changes.append(f"移除了 '{current_path}'")
+                    local_changes.append(f"移除了 '{old_obj[k]}'")
                 else:
-                    local_changes.extend(
-                        self.get_json_diff(old_obj[k], new_obj[k], current_path)
-                    )
+                    local_changes.extend(self.get_json_diff(old_obj[k], new_obj[k]))
 
         elif isinstance(old_obj, list) and isinstance(new_obj, list):
             max_len = max(len(old_obj), len(new_obj))
             for i in range(max_len):
-                current_path = f"{path}[{i}]"
                 if i >= len(old_obj):
-                    local_changes.append(f"新增了 '{current_path}': '{new_obj[i]}'")
+                    local_changes.append(f"新增了 '{new_obj[i]}'")
                 elif i >= len(new_obj):
-                    local_changes.append(f"移除了 '{current_path}'")
+                    local_changes.append(f"移除了 '{old_obj[i]}'")
                 else:
-                    local_changes.extend(
-                        self.get_json_diff(old_obj[i], new_obj[i], current_path)
-                    )
+                    local_changes.extend(self.get_json_diff(old_obj[i], new_obj[i]))
 
         else:
+            # 只有當值真的不同時才記錄，避免紀錄空的字串與 None 等價的變化
             if str(old_obj or "") != str(new_obj or ""):
-                local_changes.append(f"'{path}' 由 '{old_obj}' 改為 '{new_obj}'")
+                local_changes.append(f"把 '{old_obj}' 改成 '{new_obj}'")
 
         return local_changes
 
@@ -341,7 +338,185 @@ class ProductionOrderViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
     def get_permissions(self):
         return [IsAuthenticated()]
-        # return [IsAuthenticated(), IsAdminOrEmployerOrReadOnly()]
+
+    @action(detail=True, methods=["post"], url_path="replace_batch")
+    @transaction.atomic
+    def replace_batch(self, request, pk=None):
+        """
+        替換生產單與 MRP 中的原物料批號
+        並依據新舊使用量歸還與扣除庫存 (使用 select_for_update 避免 Race Condition)
+        包含嚴謹的 Try-Except 與 Rollback 機制。
+        """
+        user = self.get_valid_user()
+        po = self.get_object()
+
+        material_code = request.data.get("material_code")
+        old_batch_number = request.data.get("old_batch_number")
+        new_batch_number = request.data.get("new_batch_number")
+
+        try:
+            old_used_qty = Decimal(str(request.data.get("old_used_qty", 0)))
+            new_used_qty = Decimal(str(request.data.get("new_used_qty", 0)))
+        except (InvalidOperation, ValueError, TypeError):
+            return Response(
+                {"error": "數量格式錯誤"}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if not all([material_code, old_batch_number, new_batch_number]):
+            return Response(
+                {"error": "缺少必要參數"}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if old_batch_number == new_batch_number:
+            return Response(
+                {"error": "新舊批號相同，無需替換"}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if old_used_qty < 0 or new_used_qty <= 0:
+            return Response(
+                {"error": "替換的新使用量必須大於零"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            # 1. 鎖定舊批號與新批號庫存
+            try:
+                old_batch = BatchInventory.objects.select_for_update().get(
+                    batch_number=old_batch_number,
+                    material__code=material_code,
+                    is_active=True,
+                )
+            except BatchInventory.DoesNotExist:
+                return Response(
+                    {"error": f"找不到舊批號庫存: {old_batch_number}"},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+            try:
+                new_batch = BatchInventory.objects.select_for_update().get(
+                    batch_number=new_batch_number,
+                    material__code=material_code,
+                    is_active=True,
+                )
+            except BatchInventory.DoesNotExist:
+                return Response(
+                    {"error": f"找不到新批號庫存: {new_batch_number}"},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+            # 2. 驗證新批號的庫存是否足夠扣除
+            if new_batch.remaining_qty < new_used_qty:
+                return Response(
+                    {
+                        "error": f"新批號 {new_batch_number} 庫存不足 (當前剩餘: {new_batch.remaining_qty})"
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # 3. 執行庫存增減
+            old_batch.remaining_qty += old_used_qty
+            new_batch.remaining_qty -= new_used_qty
+
+            old_batch.save(update_fields=["remaining_qty"])
+            new_batch.save(update_fields=["remaining_qty"])
+
+            # 4. 安全重建 JSON 陣列邏輯 (避免 remove 造成的重複或跳號)
+            def update_json_materials(materials_list):
+                for mat in materials_list:
+                    if mat.get("code") == material_code:
+                        batches = mat.get("batches", [])
+
+                        # 確認新批號是否已經在清單內
+                        exists_new = any(
+                            b.get("batch_number") == new_batch_number for b in batches
+                        )
+                        updated_batches = []
+
+                        for b in batches:
+                            current_b_num = b.get("batch_number")
+
+                            if current_b_num == old_batch_number:
+                                if exists_new:
+                                    # 情況 A: 新批號已在列表中，直接拋棄這個舊批號的節點 (合併效果)
+                                    pass
+                                else:
+                                    # 情況 B: 新批號不在列表中，將舊批號節點原址更新為新批號
+                                    b["id"] = new_batch.id
+                                    b["batch_number"] = new_batch.batch_number
+                                    b["used"] = str(new_used_qty)
+                                    b["available"] = float(new_batch.remaining_qty)
+                                    b["received_date"] = (
+                                        new_batch.received_date.strftime("%Y-%m-%d")
+                                        if new_batch.received_date
+                                        else None
+                                    )
+                                    updated_batches.append(b)
+
+                            elif current_b_num == new_batch_number:
+                                # 累加到已存在的新批號節點上
+                                curr_used = Decimal(
+                                    str(b.get("used", "0")).strip() or "0"
+                                )
+                                b["used"] = str(curr_used + new_used_qty)
+                                b["available"] = float(new_batch.remaining_qty)
+                                b["received_date"] = (
+                                    new_batch.received_date.strftime("%Y-%m-%d")
+                                    if new_batch.received_date
+                                    else None
+                                )
+                                updated_batches.append(b)
+
+                            else:
+                                # 其他無關的批號，原封不動保留
+                                updated_batches.append(b)
+
+                        mat["batches"] = updated_batches
+
+            # 5. 更新 ProductionOrder 的 materials_info JSON
+            po_materials = po.materials_info or []
+            update_json_materials(po_materials)
+            po.materials_info = po_materials
+            po.save(update_fields=["materials_info"])
+
+            # 6. 同步更新關聯的 MRP JSON
+            try:
+                mrp = MaterialRequirementPlan.objects.get(
+                    mrp_id=po.order_number, is_active=True
+                )
+                mrp_info = mrp.batch_inventory_info or []
+                update_json_materials(mrp_info)
+                mrp.batch_inventory_info = mrp_info
+                mrp.save(update_fields=["batch_inventory_info"])
+                self._record_db_log(
+                    mrp,
+                    user,
+                    f"{user.last_name}{user.first_name} 同步更新了 MRP {mrp.mrp_id} 的批號分配",
+                )
+            except MaterialRequirementPlan.DoesNotExist:
+                pass
+
+            # 7. 寫入生產單修改日誌
+            self._record_db_log(
+                po,
+                user,
+                f"{user.last_name}{user.first_name} 替換了生產單 {po.order_number} 內物料 [{material_code}] 的批號，將 {old_batch_number} (用量 {old_used_qty}) 替換為 {new_batch_number} (用量 {new_used_qty})",
+            )
+
+            return Response(
+                {"message": "批號替換與庫存更新成功"}, status=status.HTTP_200_OK
+            )
+
+        except Exception as e:
+            # 發生任何未預期的 Error，強制觸發 Rollback，確保庫存不被錯誤寫入
+            transaction.set_rollback(True)
+            import logging
+
+            logger = logging.getLogger(__name__)
+            logger.error(f"Replace batch API failed: {e!s}")
+            return Response(
+                {"error": f"系統發生未預期錯誤，已自動還原庫存 ({e!s})"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
     def list(self, request, *args, **kwargs):
         """
@@ -1367,7 +1542,42 @@ class BatchInventoryViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     serializer_class = BatchInventorySerializer
 
     def get_permissions(self):
-        return [IsAuthenticated(), IsAdminOrEmployerOrReadOnly()]
+        # return [IsAuthenticated(), IsAdminOrEmployerOrReadOnly()]
+        return [IsAuthenticated()]
+
+    @action(detail=False, methods=["get"], url_path="replaceable_batches")
+    def replaceable_batches(self, request):
+        """
+        取得特定物料可用來替換的批號清單
+        需傳入 material_id，並可選傳入 required_qty 以過濾庫存足夠的批號，
+        並可用 exclude_batch 排除目前正在使用的批號
+        """
+        material_id = request.query_params.get("material_id")
+        required_qty = request.query_params.get("required_qty", 0)
+        exclude_batch = request.query_params.get("exclude_batch")
+
+        if not material_id:
+            return Response(
+                {"error": "必須提供 material_id 參數"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            req_qty_val = Decimal(str(required_qty))
+        except InvalidOperation:
+            req_qty_val = Decimal(0)
+
+        queryset = self.get_queryset().filter(
+            material_id=material_id, remaining_qty__gte=req_qty_val, remaining_qty__gt=0
+        )
+
+        if exclude_batch:
+            queryset = queryset.exclude(batch_number=exclude_batch)
+
+        queryset = queryset.order_by("received_date", "id")
+
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=["post"], url_path="adjustment")
     @transaction.atomic
