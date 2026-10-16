@@ -24,6 +24,7 @@ from .models import (
     MaterialProviderQuotation,
     MaterialRequirementPlan,
     MiscTransactionRecord,
+    PackageOrder,
     PaymentRecord,
     ProductionLog,
     ProductionOrder,
@@ -158,10 +159,17 @@ class UserUpdateSerializer(serializers.ModelSerializer):
 
 
 class ProductProfileSerializer(serializers.ModelSerializer):
-    outer_pack_id = serializers.IntegerField(read_only=True)
-    inner_pack_id = serializers.IntegerField(read_only=True)
+    outer_pack = serializers.SerializerMethodField()
+    inner_pack = serializers.SerializerMethodField()
+    outer_pack_id = serializers.SerializerMethodField()
+    inner_pack_id = serializers.SerializerMethodField()
     outer_pack_capacity = serializers.SerializerMethodField()
     inner_pack_capacity = serializers.SerializerMethodField()
+    spec = serializers.SerializerMethodField()
+    sales_unit = serializers.SerializerMethodField()
+    sales_pack_unit = serializers.SerializerMethodField()
+    sales_unit_quantity = serializers.SerializerMethodField()
+    sales_pack_quantity = serializers.SerializerMethodField()
 
     class Meta:
         model = ProductProfile
@@ -183,15 +191,65 @@ class ProductProfileSerializer(serializers.ModelSerializer):
             "sales_price",
         ]
 
+    def _get_po(self, obj):
+        if hasattr(obj, "_cached_po"):
+            return obj._cached_po
+        po = obj.material.product.first() if obj.material else None
+        obj._cached_po = po
+        return po
+
+    def _get_pack(self, obj, layer):
+        po = self._get_po(obj)
+        if po and isinstance(po.packaging_info, list):
+            for p in po.packaging_info:
+                if p.get("layer") == layer:
+                    return p.get("material_id")
+        return None
+
+    def get_outer_pack(self, obj):
+        return self._get_pack(obj, "outer")
+
+    def get_inner_pack(self, obj):
+        return self._get_pack(obj, "inner")
+
+    def get_outer_pack_id(self, obj):
+        return self._get_pack(obj, "outer")
+
+    def get_inner_pack_id(self, obj):
+        return self._get_pack(obj, "inner")
+
     def get_outer_pack_capacity(self, obj):
-        if obj.outer_pack and obj.outer_pack.pack_capacity is not None:
-            return float(obj.outer_pack.pack_capacity)
+        pack_id = self._get_pack(obj, "outer")
+        if pack_id:
+            mat = Material.objects.filter(id=pack_id).first()
+            return float(mat.pack_capacity) if mat and mat.pack_capacity else None
         return None
 
     def get_inner_pack_capacity(self, obj):
-        if obj.inner_pack and obj.inner_pack.pack_capacity is not None:
-            return float(obj.inner_pack.pack_capacity)
+        pack_id = self._get_pack(obj, "inner")
+        if pack_id:
+            mat = Material.objects.filter(id=pack_id).first()
+            return float(mat.pack_capacity) if mat and mat.pack_capacity else None
         return None
+
+    def get_spec(self, obj):
+        return self._get_po(obj).spec if self._get_po(obj) else None
+
+    def get_sales_unit(self, obj):
+        return self._get_po(obj).sales_unit if self._get_po(obj) else "箱"
+
+    def get_sales_pack_unit(self, obj):
+        return self._get_po(obj).sales_pack_unit if self._get_po(obj) else "-"
+
+    def get_sales_unit_quantity(self, obj):
+        return (
+            float(self._get_po(obj).sales_unit_quantity) if self._get_po(obj) else 1.0
+        )
+
+    def get_sales_pack_quantity(self, obj):
+        return (
+            float(self._get_po(obj).sales_pack_quantity) if self._get_po(obj) else 0.0
+        )
 
 
 class MaterialProviderSerializer(serializers.ModelSerializer):
@@ -945,32 +1003,35 @@ class SimpleProductSerializer(serializers.ModelSerializer):
             "origin",
         ]
 
+    def _get_po(self, obj):
+        return obj.product.first()
+
     def _get_profile(self, obj):
         return obj.product_profiles.first()
 
     def get_spec(self, obj):
-        profile = self._get_profile(obj)
-        return profile.spec if profile else None
+        po = self._get_po(obj)
+        return po.spec if po else None
 
     def get_sales_price(self, obj):
         profile = self._get_profile(obj)
         return str(profile.sales_price) if profile and profile.sales_price else None
 
     def get_sales_unit(self, obj):
-        profile = self._get_profile(obj)
-        return profile.sales_unit if profile else "-"
+        po = self._get_po(obj)
+        return po.sales_unit if po else "-"
 
     def get_sales_pack_unit(self, obj):
-        profile = self._get_profile(obj)
-        return profile.sales_pack_unit if profile else "-"
+        po = self._get_po(obj)
+        return po.sales_pack_unit if po else "-"
 
     def get_sales_unit_quantity(self, obj):
-        profile = self._get_profile(obj)
-        return str(profile.sales_unit_quantity) if profile else "0"
+        po = self._get_po(obj)
+        return str(po.sales_unit_quantity) if po else "0"
 
     def get_sales_pack_quantity(self, obj):
-        profile = self._get_profile(obj)
-        return str(profile.sales_pack_quantity) if profile else "0"
+        po = self._get_po(obj)
+        return str(po.sales_pack_quantity) if po else "0"
 
 
 class ProductionOrderSerializer(serializers.ModelSerializer):
@@ -1257,6 +1318,7 @@ class CustomerQuotationSerializer(serializers.ModelSerializer):
             "created_by_name",
             "created_at",
             "updated_at",
+            "is_active",
             "items",
         ]
         read_only_fields = [
@@ -1274,71 +1336,43 @@ class CustomerQuotationSerializer(serializers.ModelSerializer):
 
     def _sync_product_profile(self, item_data, customer):
         """
-        🌟 同步更新或建立 ProductProfile
+        🌟 同步更新或建立 ProductProfile 的專屬銷售價格
         """
         material = item_data.get("product")
         if not material:
             return
 
-        spec = item_data.get("spec", "")
-        sales_unit = item_data.get("sales_unit", "箱")
-        sales_unit_quantity = item_data.get("sales_unit_quantity", 1)
-        sales_pack_unit = item_data.get("sales_pack_unit", "-")
-        sales_pack_quantity = item_data.get("sales_pack_quantity", 0)
         sales_price = item_data.get("final_price_per_kg", None)
-
-        outer_pack = item_data.get("outer_pack", None)
-        inner_pack = item_data.get("inner_pack", None)
 
         profile = ProductProfile.objects.filter(
             material=material, vendor=customer
         ).first()
 
         if profile:
-            profile.spec = spec
-            profile.sales_unit = sales_unit
-            profile.sales_unit_quantity = sales_unit_quantity
-            profile.sales_pack_unit = sales_pack_unit
-            profile.sales_pack_quantity = sales_pack_quantity
             profile.sales_price = sales_price
-            profile.outer_pack = outer_pack
-            profile.inner_pack = inner_pack
-            profile.save()
+            profile.save(update_fields=["sales_price"])
         else:
             ProductProfile.objects.create(
                 material=material,
                 vendor=customer,
-                spec=spec,
-                sales_unit=sales_unit,
-                sales_unit_quantity=sales_unit_quantity,
-                sales_pack_unit=sales_pack_unit,
-                sales_pack_quantity=sales_pack_quantity,
                 sales_price=sales_price,
-                outer_pack=outer_pack,
-                inner_pack=inner_pack,
             )
 
     @transaction.atomic
     def create(self, validated_data):
         items_data = validated_data.pop("items", [])
         customer = validated_data.get("customer")
-
         quotation = super().create(validated_data)
-
         for item_data in items_data:
             self._sync_product_profile(item_data, customer)
-
             item_data.pop("id", None)
-
             CustomerQuotationItem.objects.create(quotation=quotation, **item_data)
-
         return quotation
 
     @transaction.atomic
     def update(self, instance, validated_data):
         items_data = validated_data.pop("items", None)
         customer = validated_data.get("customer", instance.customer)
-
         instance = super().update(instance, validated_data)
 
         if items_data is not None:
@@ -1351,16 +1385,13 @@ class CustomerQuotationSerializer(serializers.ModelSerializer):
 
             for item_data in items_data:
                 item_id = item_data.get("id")
-
                 self._sync_product_profile(item_data, customer)
 
                 if item_id and item_id in existing_items:
                     incoming_ids.add(item_id)
                     existing_item = existing_items[item_id]
-
                     for attr, value in item_data.items():
                         setattr(existing_item, attr, value)
-
                     items_to_update.append(existing_item)
                 else:
                     item_data.pop("id", None)
@@ -1629,3 +1660,40 @@ class PaymentRecordSerializer(serializers.ModelSerializer):
                 "當對象類型為廠商(付款)時，請指定對應的廠商。"
             )
         return data
+
+
+class PackageOrderSerializer(serializers.ModelSerializer):
+    product_name = serializers.ReadOnlyField(source="product.name")
+    product_code = serializers.ReadOnlyField(source="product.code")
+    semi_material_name = serializers.ReadOnlyField(source="semi_material.name")
+    semi_material_code = serializers.ReadOnlyField(source="semi_material.code")
+
+    outer_pack = serializers.SerializerMethodField()
+    inner_pack = serializers.SerializerMethodField()
+
+    outer_pack_id = serializers.IntegerField(
+        write_only=True, required=False, allow_null=True
+    )
+    inner_pack_id = serializers.IntegerField(
+        write_only=True, required=False, allow_null=True
+    )
+    new_product_code = serializers.CharField(
+        write_only=True, required=False, allow_null=True
+    )
+
+    class Meta:
+        model = PackageOrder
+        fields = "__all__"
+        read_only_fields = ["product", "created_by", "created_at", "updated_at"]
+
+    def get_outer_pack(self, obj):
+        for p in obj.packaging_info:
+            if p.get("layer") == "outer":
+                return p.get("material_id")
+        return None
+
+    def get_inner_pack(self, obj):
+        for p in obj.packaging_info:
+            if p.get("layer") == "inner":
+                return p.get("material_id")
+        return None

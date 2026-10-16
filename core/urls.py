@@ -26,6 +26,7 @@ from factory.views import (
     MaterialRequirementPlanViewSet,
     MaterialViewSet,
     MiscTransactionRecordViewSet,
+    PackageOrderViewSet,
     PaymentRecordViewSet,
     ProductionOrderViewSet,
     ProductProfileViewSet,
@@ -69,6 +70,7 @@ router.register(
     r"misc_trans_record", MiscTransactionRecordViewSet, basename="misc-trans-record"
 )
 router.register(r"payment_record", PaymentRecordViewSet, basename="payment-record")
+router.register(r"package_orders", PackageOrderViewSet, basename="package-orders")
 
 urlpatterns = [
     path("admin/", admin.site.urls),

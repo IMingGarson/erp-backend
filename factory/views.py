@@ -50,6 +50,8 @@ from .models import (
     MaterialRequirementPlanLog,
     MiscTransactionRecord,
     MiscTransactionRecordLog,
+    PackageOrder,
+    PackageOrderLog,
     PaymentRecord,
     PaymentRecordLog,
     ProductionLog,
@@ -76,6 +78,7 @@ from .serializers import (
     MaterialRequirementPlanSerializer,
     MaterialSerializer,
     MiscTransactionRecordSerializer,
+    PackageOrderSerializer,
     PaymentRecordSerializer,
     ProductionOrderSerializer,
     ProductProfileSerializer,
@@ -99,6 +102,7 @@ class CRUDAuditMixin:
         CustomerQuotation: (CustomerQuotationLog, "quotation"),
         MiscTransactionRecord: (MiscTransactionRecordLog, "transaction_record"),
         PaymentRecord: (PaymentRecordLog, "payment_record"),
+        PackageOrder: (PackageOrderLog, "package_order"),
     }
 
     def get_valid_user(self):
@@ -182,6 +186,9 @@ class CRUDAuditMixin:
         elif model_name == "CustomerQuotation":
             action_detail = f"{full_username} 建立了報價單 #{instance.quotation_number} (客戶: {instance.customer.name})"
 
+        elif model_name == "PackageOrder":
+            action_detail = f"{full_username} 建立了包裝單 #{instance.order_number}"
+
         else:
             action_detail = f"{full_username} 建立了此筆資料 (ID: {instance.pk})"
 
@@ -202,7 +209,6 @@ class CRUDAuditMixin:
                 old_val = getattr(old_instance, field_name)
                 verbose_name = getattr(field, "verbose_name", field_name)
 
-                # 🌟 修正：移除多餘的 path，改用最乾淨的人類可讀格式
                 if isinstance(field, models.JSONField) or isinstance(
                     old_val, (dict, list)
                 ):
@@ -294,6 +300,18 @@ class CRUDAuditMixin:
             instance.is_active = False
             instance.save(update_fields=["is_active"])
             action_detail = f"{full_username} 停用了配方 ({instance.parent.name} #{instance.parent.code} -> {instance.child.name} #{instance.child.code})"
+
+        elif model_name == "PackageOrder":
+            instance.is_active = False
+            instance.save(update_fields=["is_active"])
+            action_detail = f"{full_username} 刪除了包裝單 #{instance.order_number}"
+
+        elif model_name == "CustomerQuotation":
+            instance.is_active = False
+            instance.save(update_fields=["is_active"])
+            instance.items.update(is_active=False)
+            action_detail = f"{full_username} 刪除了報價單 #{instance.quotation_number}"
+
         else:
             action_detail = f"{full_username} 停用此筆資料 (ID: {instance.pk})"
 
@@ -922,11 +940,24 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         )
 
 
+class CharInFilter(filters.BaseInFilter, filters.CharFilter):
+    pass
+
+
+class MaterialFilter(filters.FilterSet):
+    type__in = CharInFilter(field_name="type", lookup_expr="in")
+    type = filters.CharFilter(field_name="type", lookup_expr="exact")
+
+    class Meta:
+        model = Material
+        fields = ["code", "type", "phase", "is_active"]
+
+
 class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     serializer_class = MaterialSerializer
     filter_backends = [filters.DjangoFilterBackend, SearchFilter]
 
-    filterset_fields = ["code", "type", "phase", "is_active"]
+    filterset_class = MaterialFilter
     search_fields = ["name", "code", "english_name"]
 
     def get_permissions(self):
@@ -1850,6 +1881,175 @@ class BOMViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         if parent_mat:
             parent_mat.recalculate_from_ingredients()
 
+    @action(detail=False, methods=["get"], url_path="mapping")
+    def mapping(self, request):
+        import math
+
+        # 1. 取得 PRODUCT 到 SEMI 的對應表
+        package_orders = PackageOrder.objects.filter(is_active=True).values(
+            "product_id", "semi_material_id"
+        )
+        product_to_semi = {
+            str(po["product_id"]): str(po["semi_material_id"])
+            for po in package_orders
+            if po["product_id"]
+        }
+
+        # 2. 拉出所有物料的 Annotated 成本
+        today = timezone.now().date()
+        three_months_ago = today - timedelta(days=90)
+
+        recent_items = PurchaseRequisitionItem.objects.filter(
+            material=OuterRef("pk"),
+            is_active=True,
+            requisition__is_active=True,
+            requisition__status="stocked",
+            requisition__request_date__gte=three_months_ago,
+        ).values("material")
+
+        recent_avg_cost = recent_items.annotate(
+            total_qty=Sum("quantity"),
+            total_val=Sum(
+                ExpressionWrapper(
+                    F("quantity") * F("purchased_price"), output_field=FloatField()
+                )
+            ),
+        ).values(
+            avg_cost=ExpressionWrapper(
+                F("total_val") / F("total_qty"), output_field=FloatField()
+            )
+        )[:1]
+
+        fallback_latest_cost = (
+            PurchaseRequisitionItem.objects.filter(
+                material=OuterRef("pk"),
+                is_active=True,
+                requisition__is_active=True,
+                requisition__status="stocked",
+            )
+            .order_by("-requisition__request_date", "-id")
+            .values("purchased_price")[:1]
+        )
+
+        cost_annotation = Coalesce(
+            Subquery(recent_avg_cost, output_field=FloatField()),
+            Subquery(fallback_latest_cost, output_field=FloatField()),
+            0.0,
+            output_field=FloatField(),
+        )
+
+        # 抓出所有有效物料，並預先載入第一層 BOM
+        all_materials = (
+            Material.objects.filter(is_active=True)
+            .annotate(annotated_estimated_cost=cost_annotation)
+            .prefetch_related("main_product")
+        )
+
+        # 建立快查字典
+        mat_dict = {m.id: m for m in all_materials}
+        cost_cache = {}
+
+        # 🌟 記憶體級別的精準成本計算，徹底消滅 N+1
+        def calculate_cost_in_memory(mat_id):
+            if mat_id in cost_cache:
+                return cost_cache[mat_id]
+
+            mat = mat_dict.get(mat_id)
+            if not mat:
+                return 0
+
+            if mat.type == "PRODUCT":
+                semi_id = product_to_semi.get(str(mat.id))
+                if semi_id:
+                    cost = calculate_cost_in_memory(int(semi_id))
+                    cost_cache[mat.id] = math.ceil(cost)
+                    return cost_cache[mat.id]
+                cost_cache[mat.id] = 0
+                return 0
+
+            if mat.type == "SEMI":
+                boms = [bom for bom in mat.main_product.all() if bom.is_active]
+                if not boms:
+                    cost_cache[mat.id] = 0
+                    return 0
+
+                total_cost = sum(
+                    calculate_cost_in_memory(bom.child_id)
+                    * float(bom.quantity_required)
+                    for bom in boms
+                )
+                base_qty = float(boms[0].base_quantity)
+                cost = math.ceil(total_cost / base_qty) if base_qty > 0 else 0
+                cost_cache[mat.id] = cost
+                return cost
+
+            # RAW / PACK: 無條件進位
+            raw_cost = math.ceil(getattr(mat, "annotated_estimated_cost", 0) or 0)
+            cost_cache[mat.id] = raw_cost
+            return raw_cost
+
+        # 遞迴展開所有配方
+        def get_expanded_boms(mat_id, current_ratio=1.0):
+            results = []
+            mat = mat_dict.get(mat_id)
+            if not mat:
+                return results
+
+            for bom in mat.main_product.all():
+                if not bom.is_active:
+                    continue
+
+                child = mat_dict.get(bom.child_id)
+                if not child:
+                    continue
+
+                base_qty = float(bom.base_quantity) if bom.base_quantity else 1.0
+                req_qty = float(bom.quantity_required) if bom.quantity_required else 0.0
+
+                step_ratio = (req_qty / base_qty) if base_qty > 0 else 0
+                acc_ratio = current_ratio * step_ratio
+
+                if child.type == "SEMI":
+                    results.extend(get_expanded_boms(child.id, acc_ratio))
+                elif child.type not in ["PACK", "STICKER", "OTHER", "PRODUCT"]:
+                    # 取得這支原料算完無條件進位的單位成本
+                    raw_cost = calculate_cost_in_memory(child.id)
+                    results.append(
+                        {
+                            "childCode": child.code,
+                            "childName": child.name,
+                            "childUnit": child.unit,
+                            "cost": raw_cost,
+                            "qty": acc_ratio,
+                            "total_cost": raw_cost
+                            * acc_ratio,  # 前端無腦加總用的精準浮點數
+                        }
+                    )
+            return results
+
+        # 3. 生成 SEMI 到 展開後 BOMs 的字典
+        semi_to_boms = {}
+        for mat_id, mat in mat_dict.items():
+            if mat.type == "SEMI":
+                raw_items = get_expanded_boms(mat_id, 1.0)
+
+                # 合併相同的原料
+                merged = {}
+                for item in raw_items:
+                    code = item["childCode"]
+                    if code in merged:
+                        merged[code]["qty"] += item["qty"]
+                        merged[code]["total_cost"] += item["total_cost"]
+                    else:
+                        merged[code] = item.copy()
+
+                semi_to_boms[str(mat_id)] = list(merged.values())
+
+        return Response(
+            {"product_to_semi": product_to_semi, "semi_to_boms": semi_to_boms},
+            status=status.HTTP_200_OK,
+        )
+
 
 class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     serializer_class = PurchaseRequisitionSerializer
@@ -2348,15 +2548,19 @@ class TraceViewSet(viewsets.ViewSet):
 
 
 class CustomerQuotationViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
-    queryset = CustomerQuotation.objects.prefetch_related(
-        Prefetch(
-            "items",
-            queryset=CustomerQuotationItem.objects.filter(
-                is_active=True
-            ).select_related("product"),
-        ),
-        "customer",
-    ).order_by("-issue_date", "-id")
+    queryset = (
+        CustomerQuotation.objects.filter(is_active=True)
+        .prefetch_related(
+            Prefetch(
+                "items",
+                queryset=CustomerQuotationItem.objects.filter(
+                    is_active=True
+                ).select_related("product"),
+            ),
+            "customer",
+        )
+        .order_by("-issue_date", "-id")
+    )
 
     serializer_class = CustomerQuotationSerializer
     filter_backends = [filters.DjangoFilterBackend, SearchFilter]
@@ -2903,3 +3107,71 @@ class PaymentRecordViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         )
 
         return Response({"message": "支票已成功兌現"}, status=status.HTTP_200_OK)
+
+
+class PackageOrderViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
+    queryset = (
+        PackageOrder.objects.filter(is_active=True)
+        .select_related("product", "semi_material")
+        .order_by("-id")
+    )
+    serializer_class = PackageOrderSerializer
+    filter_backends = [filters.DjangoFilterBackend, SearchFilter]
+    search_fields = ["order_number", "product__name", "semi_material__name"]
+
+    def get_permissions(self):
+        return [IsAuthenticated()]
+
+    @transaction.atomic
+    def perform_create(self, serializer):
+        try:
+            user = self.get_valid_user()
+            data = serializer.validated_data
+
+            order_number = data.get("order_number")
+            semi_mat = data.get("semi_material")
+            product_code = data.pop("new_product_code", None)
+            if not product_code:
+                raise ValidationError("請輸入成品代碼")
+
+            if Material.objects.filter(code=product_code).exists():
+                raise ValidationError(f"物料代號 {product_code} 已存在")
+
+            if PackageOrder.objects.filter(order_number=order_number).exists():
+                raise ValidationError(f"包裝單號 {order_number} 已存在")
+
+            new_product = Material.objects.create(
+                code=product_code,
+                name=semi_mat.name,
+                type="PRODUCT",
+                unit=semi_mat.unit,  # 複製 unit
+                is_active=semi_mat.is_active,  # 複製 is_active
+                allergen_info=semi_mat.allergen_info,  # 複製 allergen_info
+                description=semi_mat.description,  # 複製 description
+                english_name=semi_mat.english_name,  # 複製 english_name
+                origin="台灣",  # 固定為台灣
+                phase="IN_DEV",  # 預設 IN_DEV
+                product_registration_no=semi_mat.product_registration_no,  # 複製產品登錄號
+                storage_life=semi_mat.storage_life,  # 複製保存期限
+                pack_capacity=None,  # 固定為 null
+                nutrition_fact=semi_mat.nutrition_fact,  # 複製營養標示
+                dietary_type=semi_mat.dietary_type,  # 複製素食類別
+                storage_method=semi_mat.storage_method,  # 複製保存方式
+                qc_standards=semi_mat.qc_standards,  # 複製品管標準
+                created_by=user,
+            )
+            self._record_db_log(
+                new_product,
+                user,
+                f"{user.last_name}{user.first_name} 透過包裝單自動建立了成品 {new_product.name}",
+            )
+
+            serializer.validated_data["product"] = new_product
+            super().perform_create(serializer)
+            return Response(serializer.data)
+
+        except Exception as e:
+            return Response(
+                {"message": str(e), "data": None},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )

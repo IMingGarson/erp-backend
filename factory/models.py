@@ -1,3 +1,4 @@
+import math
 from datetime import timedelta
 from decimal import Decimal
 
@@ -356,28 +357,42 @@ class Material(models.Model):
     @property
     def estimated_cost(self):
         """
-        計算預估成本：
-        - 若為 PRODUCT 或 SEMI：依據 BOM 展開，計算 (Σ(子物料成本 * 需求量)) / 配方基數。
-        - 若為 RAW/PACK：優先取「有效供應商報價」 -> 「三個月加權平均」 -> 「最新採購價」。
+        計算預估成本 (無條件進位至整數)：
+        - 若為 PRODUCT：依據 PackageOrder 對應到的 SEMI 原料成本，無條件進位。
+        - 若為 SEMI：依據 BOM 展開，計算 (Σ(子物料成本 * 需求量)) / 配方基數，並無條件進位。
+        - 若為 RAW/PACK：優先取「三個月加權平均」 -> 「最新採購價」，並無條件進位。
         """
-        if self.type in {"PRODUCT", "SEMI"}:
+        if self.type == "PRODUCT":
+            pkg_orders = [p for p in self.product.all() if p.is_active]
+            pkg_order = pkg_orders[0] if pkg_orders else None
+
+            if pkg_order and pkg_order.semi_material:
+                return math.ceil(pkg_order.semi_material.estimated_cost)
+
+            return 0
+
+        if self.type == "SEMI":
             boms = [bom for bom in self.main_product.all() if bom.is_active]
             if not boms:
-                return 0.0
+                return 0
+
+            # 🌟 關鍵修正：成本為整數，乘上浮點數數量的需求量
             total_cost = sum(
-                float(bom.child.estimated_cost if bom.child else 0)
+                (bom.child.estimated_cost if bom.child else 0)
                 * float(bom.quantity_required)
                 for bom in boms
             )
             base_qty = float(boms[0].base_quantity)
-            return round(total_cost / base_qty, 4) if base_qty > 0 else 0.0
 
+            # 總成本除以基數後，無條件進位
+            return math.ceil(total_cost / base_qty) if base_qty > 0 else 0
+
+        # 若透過 ViewSet annotate 預先載入，一樣無條件進位
         annotated_cost = getattr(self, "annotated_estimated_cost", None)
         if annotated_cost is not None:
-            return round(annotated_cost, 4)
+            return math.ceil(annotated_cost)
 
         today = timezone.now().date()
-
         three_months_ago = today - timedelta(days=90)
         recent_purchases = self.purchase_items.filter(
             is_active=True,
@@ -399,7 +414,8 @@ class Material(models.Model):
         total_val = aggregates.get("total_value")
 
         if total_qty and total_qty > 0 and total_val is not None:
-            return float(round(total_val / total_qty, 4))
+            # 採購平均成本，無條件進位
+            return math.ceil(float(total_val / total_qty))
 
         latest_purchase = (
             self.purchase_items.filter(
@@ -411,7 +427,10 @@ class Material(models.Model):
             .first()
         )
 
-        return float(latest_purchase.purchased_price) if latest_purchase else 0.0
+        # 最新採購價，無條件進位
+        return (
+            math.ceil(float(latest_purchase.purchased_price)) if latest_purchase else 0
+        )
 
     def __str__(self):
         return f"{self.code} - {self.name}"
@@ -499,51 +518,6 @@ class ProductProfile(models.Model):
         verbose_name="關聯成品",
     )
 
-    outer_pack = models.ForeignKey(
-        Material,
-        on_delete=models.SET_NULL,
-        related_name="outer_pack_profiles",
-        verbose_name="外層包材 (MAJOR)",
-        help_text="對應 sales_unit (如: 5號標準外箱)。負責定義『箱/桶』的實體物料。",
-        blank=True,
-        null=True,
-    )
-
-    inner_pack = models.ForeignKey(
-        Material,
-        on_delete=models.SET_NULL,
-        related_name="inner_pack_profiles",
-        verbose_name="內層包材 (AUX)",
-        help_text="對應 sales_pack_unit (如: 1KG用厚鋁箔袋)。負責定義『包/袋』的實體物料。",
-        blank=True,
-        null=True,
-    )
-
-    spec = models.TextField(
-        blank=True,
-        null=True,
-        verbose_name="產品規格",
-        help_text="如: 1KG*25包/箱",
-    )
-    sales_unit = models.CharField(max_length=10, default="箱", verbose_name="銷售單位")
-    sales_unit_quantity = models.DecimalField(
-        max_digits=10,
-        decimal_places=2,
-        default=1,
-        verbose_name="銷售單位數量",
-        help_text="如: 1KG*25包/箱，則填1(箱)",
-    )
-    sales_pack_unit = models.CharField(
-        max_length=10, default="箱", verbose_name="銷售輔助單位"
-    )
-    sales_pack_quantity = models.DecimalField(
-        max_digits=10,
-        decimal_places=2,
-        default=1,
-        verbose_name="銷售輔助單位數量",
-        help_text="如: 1KG*25包/箱，則填25(包)",
-    )
-
     sales_price = models.DecimalField(
         max_digits=15, decimal_places=2, null=True, blank=True, verbose_name="銷售單價"
     )
@@ -567,7 +541,7 @@ class ProductProfile(models.Model):
         verbose_name = "成品專屬資訊"
 
     def __str__(self):
-        return f"{self.material.name} - {self.spec}"
+        return f"{self.material.name} - 客戶設定"
 
 
 class BOM(models.Model):
@@ -1578,3 +1552,83 @@ class PaymentRecordLog(models.Model):
 
     class Meta:
         db_table = "payment_record_logs"
+
+
+class PackageOrder(models.Model):
+    id = models.AutoField(primary_key=True)
+    order_number = models.CharField(max_length=50, unique=True, verbose_name="包裝單號")
+
+    product = models.ForeignKey(
+        Material,
+        on_delete=models.DO_NOTHING,
+        related_name="product",
+        verbose_name="關聯成品",
+    )
+
+    semi_material = models.ForeignKey(
+        Material,
+        on_delete=models.DO_NOTHING,
+        related_name="semi",
+        verbose_name="關聯半成品",
+    )
+
+    spec = models.TextField(
+        blank=True,
+        null=True,
+        verbose_name="產品規格",
+        help_text="如: 1KG*25包/箱",
+    )
+    sales_unit = models.CharField(
+        max_length=10, blank=True, null=True, verbose_name="銷售單位"
+    )
+    sales_unit_quantity = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=1,
+        verbose_name="銷售單位數量",
+        help_text="如: 1KG*25包/箱，則填1(箱)",
+    )
+    sales_pack_unit = models.CharField(
+        max_length=10, blank=True, null=True, verbose_name="銷售輔助單位"
+    )
+    sales_pack_quantity = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=1,
+        verbose_name="銷售輔助單位數量",
+        help_text="如: 1KG*25包/箱，則填25(包)",
+    )
+
+    tag_id = models.CharField(
+        max_length=50, blank=True, null=True, verbose_name="標籤關聯代號"
+    )
+
+    packaging_info = models.JSONField(default=list, verbose_name="包材設定資訊")
+
+    is_active = models.BooleanField(default=True, verbose_name="是否啟用")
+    created_by = models.ForeignKey(User, on_delete=models.DO_NOTHING)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "package_orders"
+        verbose_name = "包裝單"
+        indexes = [
+            models.Index(fields=["order_number"]),
+        ]
+
+    def __str__(self):
+        return f"{self.order_number} ({self.product.name})"
+
+
+class PackageOrderLog(models.Model):
+    id = models.AutoField(primary_key=True)
+    package_order = models.ForeignKey(
+        PackageOrder, related_name="logs", on_delete=models.DO_NOTHING
+    )
+    user = models.ForeignKey(User, on_delete=models.DO_NOTHING)
+    action_detail = models.TextField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "package_order_logs"
