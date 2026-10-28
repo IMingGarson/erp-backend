@@ -642,7 +642,7 @@ class BatchInventorySerializer(serializers.ModelSerializer):
             "aux_quantity",
             "note",
         ]
-        read_only_fields = ["id", "created_at", "updated_at"]
+        read_only_fields = ["id", "created_at", "updated_at", "created_by"]
 
 
 class BOMMaterialMinimalSerializer(serializers.ModelSerializer):
@@ -867,10 +867,55 @@ class CustomerOrderSerializer(serializers.ModelSerializer):
         allow_null=True,
     )
 
+    package_items = serializers.SerializerMethodField()
+    logistics_info = serializers.JSONField(required=False, default=dict)
+
     class Meta:
         model = CustomerOrder
         fields = "__all__"
         read_only_fields = ["created_by", "product", "mrp"]
+
+    def get_package_items(self, obj):
+        """
+        展開該訂單的包材明細：
+        以產品對應的 PackageOrder 為基底，若訂單有特別指定內外箱，則覆蓋之。
+        """
+        if not obj.product or obj.product.type != "PRODUCT":
+            return []
+
+        po = obj.product.product.filter(is_active=True).first()
+        if not po or not po.packaging_info:
+            return []
+
+        logistics = obj.logistics_info or {}
+        custom_outer_id = logistics.get("outer_pack_id")
+        custom_inner_id = logistics.get("inner_pack_id")
+
+        results = []
+        for item in po.packaging_info:
+            layer = item.get("layer")
+            mat_id = item.get("material_id")
+
+            # 若訂單有選擇覆蓋的外/內箱規格，則以此為主
+            if layer == "outer" and custom_outer_id:
+                mat_id = custom_outer_id
+            elif layer == "inner" and custom_inner_id:
+                mat_id = custom_inner_id
+
+            qty_per_unit = float(item.get("qty") or 1)
+
+            if mat_id:
+                mat = Material.objects.filter(id=mat_id).first()
+                if mat and mat.type in ["PACK", "STICKER", "OTHER"]:
+                    results.append(
+                        {
+                            "product_code": mat.code,
+                            "product_name": mat.name,
+                            "quantity": float(obj.quantity or 0) * qty_per_unit,
+                            "unit": mat.unit,
+                        }
+                    )
+        return results
 
 
 class MaterialRequirementPlanSerializer(serializers.ModelSerializer):

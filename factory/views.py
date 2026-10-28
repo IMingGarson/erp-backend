@@ -743,6 +743,14 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         user = self.get_valid_user()
         mrp_id = request.data.get("mrp_id")
 
+        # 🌟 直接從 Frontend payload 接收精確的包裝、規格與報價單資訊
+        outer_pack_id = request.data.get("outer_pack_id")
+        inner_pack_id = request.data.get("inner_pack_id")
+        spec = request.data.get("spec", "")
+        sales_unit = request.data.get("sales_unit", "")
+        sales_pack_unit = request.data.get("sales_pack_unit", "")
+        quotation_id = request.data.get("quotation_id")
+
         if not mrp_id:
             return Response({"error": "Invalid ID"})
 
@@ -756,7 +764,7 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 {"error": "找不到此 MRP 母單"}, status=status.HTTP_404_NOT_FOUND
             )
 
-        # 🌟 2. 遞迴撈出對應的所有層級子單
+        # 2. 遞迴撈出對應的所有層級子單
         children_mrps = []
         current_parent_ids = [parent_mrp.mrp_id]
 
@@ -823,17 +831,14 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 metrics.append(metric)
             return metrics
 
-        # 🌟 新增：智慧排序邏輯 Helper Function
         def _smart_sort_key(item):
             seq = item.get("sequence_num")
             seq_str = str(seq).strip() if seq is not None else ""
             req_qty = float(item.get("requiredQty", 0))
 
             if seq_str:
-                # 若有序號：按照字串自然排列
                 return (0, seq_str, -req_qty)
             else:
-                # 若無序號：退回預設，依照需求量倒序
                 return (1, "", -req_qty)
 
         created_pos = []
@@ -845,15 +850,31 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 children_by_parent[child.parent_id] = []
             children_by_parent[child.parent_id].append(child)
 
-        # 🌟 修改 1：母單套用智慧排序
         other_materials = sorted(parent_mrp.batch_inventory_info, key=_smart_sort_key)
+
+        # 🌟 將 Frontend 傳入的包裝資訊與報價單ID，直接寫入生產單 vendor_info 以供後續查找
+        parent_vendor_info = (
+            parent_mrp.vendor_info.copy() if parent_mrp.vendor_info else {}
+        )
+        if outer_pack_id is not None:
+            parent_vendor_info["outer_pack_id"] = outer_pack_id
+        if inner_pack_id is not None:
+            parent_vendor_info["inner_pack_id"] = inner_pack_id
+        if spec:
+            parent_vendor_info["spec"] = spec
+        if sales_unit:
+            parent_vendor_info["sales_unit"] = sales_unit
+        if sales_pack_unit:
+            parent_vendor_info["sales_pack_unit"] = sales_pack_unit
+        if quotation_id is not None:
+            parent_vendor_info["quotation_id"] = quotation_id
 
         parent_po = ProductionOrder.objects.create(
             order_number=parent_mrp.mrp_id,
             product=parent_mrp.product,
             target_qty=parent_mrp.required_qty,
             materials_info=other_materials,
-            vendor_info=parent_mrp.vendor_info,
+            vendor_info=parent_vendor_info,
             qc_metrics=_generate_qc_metrics(parent_mrp.product),
             created_by=user,
         )
@@ -871,7 +892,7 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
             )
 
             child_po_infos = []
-            child_product_codes = []  # 🌟 用來記錄已經變成子單據的半成品
+            child_product_codes = []
 
             for child_mrp in layer_children:
                 new_order_number = f"{parent_mrp.mrp_id}-{global_suffix[0]}"
@@ -879,14 +900,12 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 child_product_code = getattr(child_mrp.product, "code", "")
                 child_product_codes.append(child_product_code)
 
-                # 🌟 尋找父單據中，該半成品的序號，讓 CHILD_PRODUCT 完美繼承
                 semi_seq = ""
                 for m in current_po.materials_info:
                     if m.get("code") == child_product_code and m.get("type") == "SEMI":
                         semi_seq = m.get("sequence_num", "")
                         break
 
-                # 🌟 修改 2：子單本身內部的原料也要套用智慧排序
                 sorted_materials = sorted(
                     child_mrp.batch_inventory_info, key=_smart_sort_key
                 )
