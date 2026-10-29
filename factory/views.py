@@ -691,26 +691,31 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         created_mrps = []
 
         def save_mrp_recursive(mrp_data, parent_id=None):
-            batch_info = mrp_data.get("batch_inventory_info", {}).values()
+            # 🌟 防禦性處理：相容 Frontend 傳來的 Object 或 Array
+            batch_info_raw = mrp_data.get("batch_inventory_info", [])
+            if isinstance(batch_info_raw, dict):
+                batch_info = list(batch_info_raw.values())
+            else:
+                batch_info = batch_info_raw
+
             if not batch_info:
                 return False
 
-            if not all(
-                [
-                    mrp_data.get("id", False),
-                    mrp_data.get("productId", False),
-                    mrp_data.get("qty", 0),
-                ]
-            ):
+            mrp_id = mrp_data.get("id")
+            product_id = mrp_data.get("productId")
+            qty = mrp_data.get("qty")
+
+            # 🌟 修正：qty 有可能是 0，所以不能只用 truthy 判斷，需明確檢查 is not None
+            if not mrp_id or not product_id or qty is None:
                 return False
 
             new_mrp = MaterialRequirementPlan.objects.create(
-                mrp_id=mrp_data.get("id"),
+                mrp_id=mrp_id,
                 parent_id=parent_id,
                 vendor_info=v_info_json,
-                batch_inventory_info=list(batch_info),
-                product_id=mrp_data.get("productId"),
-                required_qty=mrp_data.get("qty"),
+                batch_inventory_info=batch_info,
+                product_id=product_id,
+                required_qty=qty,
                 created_by=user,
             )
 
@@ -718,7 +723,7 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 {
                     "id": new_mrp.id,
                     "parent_id": parent_id,
-                    "product_id": mrp_data.get("productId"),
+                    "product_id": product_id,
                 }
             )
             self._record_db_log(
@@ -727,7 +732,7 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
             children = mrp_data.get("children_mrp", [])
             for child in children:
-                save_mrp_recursive(child, parent_id=mrp_data.get("id"))
+                save_mrp_recursive(child, parent_id=mrp_id)
 
             return True
 
@@ -881,8 +886,6 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         created_pos.append(parent_po)
         mrp_to_po_map[parent_mrp.mrp_id] = parent_po
 
-        global_suffix = [1]
-
         def create_child_pos(current_mrp_id, current_po):
             if current_mrp_id not in children_by_parent:
                 return
@@ -892,19 +895,26 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
             )
 
             child_po_infos = []
-            child_product_codes = []
 
             for child_mrp in layer_children:
-                new_order_number = f"{parent_mrp.mrp_id}-{global_suffix[0]}"
-                global_suffix[0] += 1
+                # 🌟 1. 捨棄 global_suffix，直接沿用 MRP 的精準流水號，確保單號完全對齊
+                new_order_number = child_mrp.mrp_id
+
                 child_product_code = getattr(child_mrp.product, "code", "")
-                child_product_codes.append(child_product_code)
 
                 semi_seq = ""
                 for m in current_po.materials_info:
                     if m.get("code") == child_product_code and m.get("type") == "SEMI":
                         semi_seq = m.get("sequence_num", "")
                         break
+
+                # 🌟 2. 判斷此子單是否為「包裝作業節點」 (依據我們寫入的 is_pack 標籤)
+                is_packaging = False
+                if isinstance(child_mrp.batch_inventory_info, list):
+                    for info in child_mrp.batch_inventory_info:
+                        if info.get("is_pack") in [1, "1", True]:
+                            is_packaging = True
+                            break
 
                 sorted_materials = sorted(
                     child_mrp.batch_inventory_info, key=_smart_sort_key
@@ -923,12 +933,20 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 mrp_to_po_map[child_mrp.mrp_id] = child_po
                 created_pos.append(child_po)
 
+                # 🌟 3. 在母單中加入這層子單的追蹤資訊，若為包裝單則換上專屬的標示
+                display_type = "PACKAGING" if is_packaging else "CHILD_PRODUCT"
+                display_name = (
+                    f"{child_mrp.product.name} (包裝作業)"
+                    if is_packaging
+                    else child_mrp.product.name
+                )
+
                 child_po_infos.append(
                     {
-                        "type": "CHILD_PRODUCT",
+                        "type": display_type,
                         "code": child_product_code,
                         "unit": getattr(child_mrp.product, "unit", ""),
-                        "materialName": child_mrp.product.name,
+                        "materialName": display_name,
                         "requiredQty": float(child_mrp.required_qty),
                         "isShortage": False,
                         "child_order_number": new_order_number,
