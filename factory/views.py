@@ -1596,6 +1596,99 @@ class VendorViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
         return Response(self.serializer_class(vendor).data, status=status.HTTP_200_OK)
 
+    @action(detail=True, methods=["get"], url_path="historical_records")
+    def historical_records(self, request, pk=None):
+        """取得指定客戶的歷史訂購與出貨紀錄"""
+        vendor = self.get_object()
+
+        # 1. 抓取下單但未出貨之客戶訂單 (Customer Orders)
+        # 🌟 補上 mrp 關聯查詢
+        co_qs = (
+            CustomerOrder.objects.filter(
+                deleted_at__isnull=True, customer_info__code=vendor.code
+            )
+            .select_related("product", "mrp")
+            .order_by("-order_date")
+        )
+
+        # 2. 抓取已出貨之銷貨單 (Delivery Notes)
+        # 🌟 確保 production_order 有被 prefetch
+        dn_qs = (
+            DeliveryNote.objects.filter(is_active=True, customer_info__code=vendor.code)
+            .select_related("production_order__product")
+            .order_by("-note_date")
+        )
+
+        # 3. 取得目前生效的包裝單 (PackageOrder) 以供對照包裝單號
+        active_pack_orders = PackageOrder.objects.filter(is_active=True).values(
+            "product_id", "order_number"
+        )
+        pack_order_map = {
+            po["product_id"]: po["order_number"] for po in active_pack_orders
+        }
+
+        history = []
+
+        for co in co_qs:
+            prod_id = co.product.id if co.product else None
+            pack_order_num = pack_order_map.get(prod_id, "-") if prod_id else "-"
+
+            # 🌟 替換為未來的生產單號 (MRP ID)
+            po_number = co.mrp.mrp_id if co.mrp else co.order_number
+
+            history.append(
+                {
+                    "type": "ORDER",
+                    "date": co.order_date.strftime("%Y-%m-%d") if co.order_date else "",
+                    "number": po_number,
+                    "product_id": prod_id,
+                    "product_name": co.product.name if co.product else "",
+                    "product_code": co.product.code if co.product else "",
+                    "package_order_number": pack_order_num,
+                    "spec": co.spec,
+                    "quantity": float(co.quantity) if co.quantity else 0,
+                    "unit": co.unit,
+                    "price": float(co.unit_price) if co.unit_price else 0,
+                }
+            )
+
+        for dn in dn_qs:
+            prod = (
+                dn.production_order.product
+                if dn.production_order and dn.production_order.product
+                else None
+            )
+            prod_id = prod.id if prod else None
+            pack_order_num = pack_order_map.get(prod_id, "-") if prod_id else "-"
+
+            # 🌟 替換為實際關聯的生產單號
+            po_number = (
+                dn.production_order.order_number
+                if dn.production_order
+                else dn.note_number
+            )
+
+            history.append(
+                {
+                    "type": "DELIVERY",
+                    "date": dn.note_date.strftime("%Y-%m-%d") if dn.note_date else "",
+                    "number": po_number,
+                    "product_id": prod_id,
+                    "product_name": prod.name if prod else "",
+                    "product_code": prod.code if prod else "",
+                    "package_order_number": pack_order_num,
+                    "spec": dn.spec,
+                    "quantity": float(dn.quantity) if dn.quantity else 0,
+                    "unit": dn.unit,
+                    "price": float(dn.sales_price) if dn.sales_price else 0,
+                }
+            )
+
+        # 依日期降冪排序 (由新到舊)
+        history.sort(key=lambda x: x["date"], reverse=True)
+
+        return Response(history, status=status.HTTP_200_OK)
+
 
 class MaterialProviderViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     queryset = MaterialProvider.objects.filter(is_active=True).order_by("-id")
