@@ -24,6 +24,7 @@ from .models import (
     MaterialProviderQuotation,
     MaterialRequirementPlan,
     MiscTransactionRecord,
+    NutritionSnapshot,
     PackageOrder,
     PaymentRecord,
     ProductionLog,
@@ -386,6 +387,55 @@ class BOMItemSerializer(serializers.ModelSerializer):
         }
 
 
+class NutritionSnapshotSerializer(serializers.ModelSerializer):
+    material_code = serializers.CharField(source="material.code", read_only=True)
+    material_name = serializers.CharField(source="material.name", read_only=True)
+    creator_name = serializers.SerializerMethodField()
+    reviewer_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = NutritionSnapshot
+        fields = [
+            "id",
+            "material",
+            "material_code",
+            "material_name",
+            "version_num",
+            "nutrition_fact",
+            "allergen_info",
+            "ingredients_text",
+            "status",
+            "is_active",
+            "created_by",
+            "creator_name",
+            "reviewed_by",
+            "reviewer_name",
+            "reviewed_at",
+            "review_note",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "id",
+            "version_num",
+            "created_by",
+            "reviewed_by",
+            "reviewed_at",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_creator_name(self, obj):
+        if obj.created_by:
+            return f"{obj.created_by.last_name}{obj.created_by.first_name}"
+        return ""
+
+    def get_reviewer_name(self, obj):
+        if obj.reviewed_by:
+            return f"{obj.reviewed_by.last_name}{obj.reviewed_by.first_name}"
+        return ""
+
+
 class MaterialSerializer(serializers.ModelSerializer):
     is_raw_material = serializers.ReadOnlyField()
     estimated_cost = serializers.ReadOnlyField()
@@ -396,6 +446,7 @@ class MaterialSerializer(serializers.ModelSerializer):
         source="material_ingredients", many=True, required=False
     )
     provider_quotes = serializers.SerializerMethodField()
+    nutrition_snapshots = NutritionSnapshotSerializer(many=True, read_only=True)
 
     class Meta:
         model = Material
@@ -431,6 +482,7 @@ class MaterialSerializer(serializers.ModelSerializer):
             "dietary_type",  # 葷素判斷
             "ingredients",  # 成分
             "provider_quotes",  # 廠商報價資訊
+            "nutrition_snapshots",  # 營養內容歷史紀錄
         ]
         read_only_fields = ["id", "created_by", "created_at", "updated_at"]
 
@@ -1087,6 +1139,16 @@ class ProductionOrderSerializer(serializers.ModelSerializer):
     remaining_qty = serializers.DecimalField(
         max_digits=15, decimal_places=4, read_only=True
     )
+    nutrition_snapshot_id = serializers.PrimaryKeyRelatedField(
+        queryset=NutritionSnapshot.objects.all(),
+        source="nutrition_snapshot",
+        write_only=True,
+        required=False,
+        allow_null=True,
+    )
+    nutrition_snapshot_detail = NutritionSnapshotSerializer(
+        source="nutrition_snapshot", read_only=True
+    )
 
     class Meta:
         model = ProductionOrder
@@ -1111,6 +1173,8 @@ class ProductionOrderSerializer(serializers.ModelSerializer):
             "is_active",
             "qc_metrics",
             "qc_passed",
+            "nutrition_snapshot_id",
+            "nutrition_snapshot_detail",
         ]
 
     def get_creator_name(self, obj):

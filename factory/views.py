@@ -50,6 +50,8 @@ from .models import (
     MaterialRequirementPlanLog,
     MiscTransactionRecord,
     MiscTransactionRecordLog,
+    NutritionSnapshot,
+    NutritionSnapshotLog,
     PackageOrder,
     PackageOrderLog,
     PaymentRecord,
@@ -78,6 +80,7 @@ from .serializers import (
     MaterialRequirementPlanSerializer,
     MaterialSerializer,
     MiscTransactionRecordSerializer,
+    NutritionSnapshotSerializer,
     PackageOrderSerializer,
     PaymentRecordSerializer,
     ProductionOrderSerializer,
@@ -103,6 +106,7 @@ class CRUDAuditMixin:
         MiscTransactionRecord: (MiscTransactionRecordLog, "transaction_record"),
         PaymentRecord: (PaymentRecordLog, "payment_record"),
         PackageOrder: (PackageOrderLog, "package_order"),
+        NutritionSnapshot: (NutritionSnapshotLog, "snapshot"),
     }
 
     def get_valid_user(self):
@@ -188,6 +192,9 @@ class CRUDAuditMixin:
 
         elif model_name == "PackageOrder":
             action_detail = f"{full_username} 建立了包裝單 #{instance.order_number}"
+
+        elif model_name == "NutritionSnapshot":
+            action_detail = f"{full_username} 建立了營養標籤快照版本 {instance.version_num} (物料: {instance.material.code})"
 
         else:
             action_detail = f"{full_username} 建立了此筆資料 (ID: {instance.pk})"
@@ -311,6 +318,13 @@ class CRUDAuditMixin:
             instance.save(update_fields=["is_active"])
             instance.items.update(is_active=False)
             action_detail = f"{full_username} 刪除了報價單 #{instance.quotation_number}"
+
+        elif model_name == "NutritionSnapshot":
+            instance.is_active = False
+            instance.save(update_fields=["is_active"])
+            action_detail = (
+                f"{full_username} 停用了營養標籤快照版本 {instance.version_num}"
+            )
 
         else:
             action_detail = f"{full_username} 停用此筆資料 (ID: {instance.pk})"
@@ -1554,6 +1568,13 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 ).select_related("ingredient"),
             )
 
+            active_snapshots_prefetch = Prefetch(
+                "nutrition_snapshots",
+                queryset=NutritionSnapshot.objects.filter(is_active=True)
+                .select_related("created_by", "reviewed_by")
+                .order_by("-created_at"),
+            )
+
             if is_lite:
                 queryset = queryset.prefetch_related(
                     active_ingredients_prefetch,
@@ -1567,6 +1588,7 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 queryset = queryset.prefetch_related(
                     "product_profiles",
                     active_ingredients_prefetch,
+                    active_snapshots_prefetch,
                     Prefetch("main_product__child", queryset=annotated_material_qs),
                     Prefetch(
                         "main_product__child__main_product__child",
@@ -1575,6 +1597,78 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 )
 
         return queryset
+
+
+class NutritionSnapshotViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
+    queryset = (
+        NutritionSnapshot.objects.filter(is_active=True)
+        .select_related("material", "created_by", "reviewed_by")
+        .order_by("-created_at")
+    )
+    serializer_class = NutritionSnapshotSerializer
+    filter_backends = [filters.DjangoFilterBackend, SearchFilter]
+    filterset_fields = ["material", "status"]
+    search_fields = ["version_num", "material__name", "material__code"]
+
+    def get_permissions(self):
+        return [IsAuthenticated(), IsRDOrReadOnly()]
+
+    @transaction.atomic
+    def perform_create(self, serializer):
+        today_str = timezone.localtime(timezone.now()).strftime("%Y%m%d")
+
+        # 嚴謹的併發控制，取得當日最大流水號
+        last_snap = (
+            NutritionSnapshot.objects.select_for_update()
+            .filter(version_num__startswith=f"V{today_str}")
+            .order_by("-version_num")
+            .first()
+        )
+
+        sequence = int(last_snap.version_num.split("-")[1]) + 1 if last_snap else 1
+        new_version_num = f"V{today_str}-{sequence:03d}"
+
+        serializer.validated_data["version_num"] = new_version_num
+        super().perform_create(serializer)
+
+    @action(detail=True, methods=["post"], url_path="review")
+    @transaction.atomic
+    def review_snapshot(self, request, pk=None):
+        """處理研發主管的審核動作 (核准/退回)"""
+        user = self.get_valid_user()
+        snapshot = self.get_object()
+
+        action_type = request.data.get("action")  # 預期: 'approve' 或 'reject'
+        review_note = request.data.get("review_note", "").strip()
+
+        if snapshot.status != "PENDING":
+            raise ValidationError("只能審核狀態為「待審核」的快照。")
+
+        if action_type == "approve":
+            snapshot.status = "APPROVED"
+            action_text = "核准"
+        elif action_type == "reject":
+            snapshot.status = "REJECTED"
+            action_text = "退回"
+        else:
+            raise ValidationError("未知的審核動作，請傳入 'approve' 或 'reject'。")
+
+        snapshot.reviewed_by = user
+        snapshot.reviewed_at = timezone.now()
+        snapshot.review_note = review_note
+        snapshot.save(
+            update_fields=["status", "reviewed_by", "reviewed_at", "review_note"]
+        )
+
+        self._record_db_log(
+            snapshot,
+            user,
+            f"{user.last_name}{user.first_name} {action_text}了標籤紀錄 {snapshot.version_num}。備註: {review_note or '無'}",
+        )
+
+        return Response(
+            {"message": f"已成功{action_text}該標籤內容"}, status=status.HTTP_200_OK
+        )
 
 
 class VendorViewSet(CRUDAuditMixin, viewsets.ModelViewSet):

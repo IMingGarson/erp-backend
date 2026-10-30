@@ -720,6 +720,89 @@ class BatchInventory(models.Model):
         verbose_name = "批號庫存"
 
 
+class NutritionSnapshot(models.Model):
+    STATUS_CHOICES = (
+        ("PENDING", "待審核"),
+        ("APPROVED", "已核准"),
+        ("REJECTED", "已退回"),
+        ("ARCHIVED", "已封存 (歷史版本)"),
+    )
+
+    id = models.AutoField(primary_key=True)
+    material = models.ForeignKey(
+        "Material",
+        on_delete=models.CASCADE,
+        related_name="nutrition_snapshots",
+        verbose_name="關聯成品/半成品",
+    )
+    version_num = models.CharField(
+        max_length=50, verbose_name="版本編號", help_text="例如: V20261030-01"
+    )
+
+    # 標籤快照核心內容 (因為包材上的成分文字與過敏原也會跟著配方變動，一併快照是最安全的)
+    nutrition_fact = models.JSONField(default=dict, verbose_name="八大營養素快照")
+    allergen_info = models.CharField(
+        max_length=255, blank=True, null=True, verbose_name="過敏原快照"
+    )
+    ingredients_text = models.TextField(
+        blank=True, null=True, verbose_name="成分展開文字快照"
+    )
+
+    # 審核流控制
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default="PENDING",
+        verbose_name="審核狀態",
+    )
+    is_active = models.BooleanField(
+        default=True, db_index=True, verbose_name="是否啟用"
+    )
+
+    created_by = models.ForeignKey(
+        User,
+        on_delete=models.DO_NOTHING,
+        related_name="created_snapshots",
+        verbose_name="建立者",
+    )
+    reviewed_by = models.ForeignKey(
+        User,
+        on_delete=models.DO_NOTHING,
+        null=True,
+        blank=True,
+        related_name="reviewed_snapshots",
+        verbose_name="審核者",
+    )
+    reviewed_at = models.DateTimeField(null=True, blank=True, verbose_name="審核時間")
+    review_note = models.TextField(blank=True, null=True, verbose_name="審核備註")
+
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "nutrition_snapshots"
+        verbose_name = "營養價值標籤快照"
+        indexes = [
+            models.Index(fields=["material", "status"]),
+        ]
+
+    def __str__(self):
+        return f"{self.material.code} - {self.version_num}"
+
+
+class NutritionSnapshotLog(models.Model):
+    id = models.AutoField(primary_key=True)
+    snapshot = models.ForeignKey(
+        NutritionSnapshot, related_name="logs", on_delete=models.DO_NOTHING
+    )
+    user = models.ForeignKey(User, on_delete=models.DO_NOTHING)
+    action_detail = models.TextField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "nutrition_snapshot_logs"
+
+
 class ProductionOrder(models.Model):
     id = models.AutoField(primary_key=True)
     order_number = models.CharField(
@@ -749,6 +832,14 @@ class ProductionOrder(models.Model):
         default=list,
         verbose_name="品管檢驗與批號紀錄",
         help_text="存放當次生產的各項檢測數值與結果",
+    )
+    nutrition_snapshot = models.ForeignKey(
+        NutritionSnapshot,
+        on_delete=models.DO_NOTHING,
+        null=True,
+        blank=True,
+        verbose_name="營養標籤內容",
+        help_text="用以決定此張生產單與最終出貨標籤要印哪一個版本的營養價值",
     )
     qc_passed = models.BooleanField(null=True, blank=True, verbose_name="品管是否合格")
     is_active = models.BooleanField(default=True, verbose_name="是否啟用")
