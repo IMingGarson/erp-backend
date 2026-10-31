@@ -358,18 +358,40 @@ class Material(models.Model):
     def estimated_cost(self):
         """
         計算預估成本 (無條件進位至整數)：
-        - 若為 PRODUCT：依據 PackageOrder 對應到的 SEMI 原料成本，無條件進位。
+        - 若為 PRODUCT：依據 ProductPackageOrderRelation 找出對應的 SEMI 原料成本與包材成本加總，無條件進位。
         - 若為 SEMI：依據 BOM 展開，計算 (Σ(子物料成本 * 需求量)) / 配方基數，並無條件進位。
         - 若為 RAW/PACK：優先取「三個月加權平均」 -> 「最新採購價」，並無條件進位。
         """
         if self.type == "PRODUCT":
-            pkg_orders = [p for p in self.product.all() if p.is_active]
-            pkg_order = pkg_orders[0] if pkg_orders else None
+            # 1. 透過中介表找出該成品的半成品與包裝單配置
+            relation = self.package_relations.filter(is_active=True).first()
+            if not relation:
+                return 0
 
-            if pkg_order and pkg_order.semi_material:
-                return math.ceil(pkg_order.semi_material.estimated_cost)
+            # 2. 取得底層半成品成本
+            semi_cost = (
+                float(relation.semi_material.estimated_cost)
+                if relation.semi_material
+                else 0
+            )
 
-            return 0
+            # 3. 加上包裝單內的各項包材成本
+            pack_cost = 0
+            if relation.package_order:
+                po = relation.package_order
+                pkg_info = (
+                    po.packaging_info if isinstance(po.packaging_info, list) else []
+                )
+                for p_item in pkg_info:
+                    p_mat_id = p_item.get("material_id")
+                    p_qty = float(p_item.get("qty") or 0)
+                    if p_mat_id:
+                        # 迴避 Circular import，直接在此 Query (未來可透過 annotate 優化)
+                        p_mat = type(self).objects.filter(id=p_mat_id).first()
+                        if p_mat:
+                            pack_cost += float(p_mat.estimated_cost) * p_qty
+
+            return math.ceil(semi_cost + pack_cost)
 
         if self.type == "SEMI":
             boms = [bom for bom in self.main_product.all() if bom.is_active]
@@ -1649,20 +1671,6 @@ class PackageOrder(models.Model):
     id = models.AutoField(primary_key=True)
     order_number = models.CharField(max_length=50, unique=True, verbose_name="包裝單號")
 
-    product = models.ForeignKey(
-        Material,
-        on_delete=models.DO_NOTHING,
-        related_name="product",
-        verbose_name="關聯成品",
-    )
-
-    semi_material = models.ForeignKey(
-        Material,
-        on_delete=models.DO_NOTHING,
-        related_name="semi",
-        verbose_name="關聯半成品",
-    )
-
     spec = models.TextField(
         blank=True,
         null=True,
@@ -1723,3 +1731,56 @@ class PackageOrderLog(models.Model):
 
     class Meta:
         db_table = "package_order_logs"
+
+
+class ProductPackageOrderRelation(models.Model):
+    id = models.AutoField(primary_key=True)
+
+    package_order = models.ForeignKey(
+        PackageOrder,
+        on_delete=models.DO_NOTHING,
+        related_name="product_relations",
+        verbose_name="包裝單",
+    )
+
+    product = models.ForeignKey(
+        "Material",
+        on_delete=models.DO_NOTHING,
+        related_name="package_relations",
+        verbose_name="關聯成品",
+    )
+
+    semi_material = models.ForeignKey(
+        "Material",
+        on_delete=models.DO_NOTHING,
+        related_name="semi_package_relations",
+        verbose_name="關聯半成品",
+    )
+
+    is_active = models.BooleanField(default=True, verbose_name="是否啟用")
+    created_by = models.ForeignKey(User, on_delete=models.DO_NOTHING)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "product_package_relations"
+        verbose_name = "成品與包裝單關聯"
+        indexes = [
+            models.Index(fields=["product", "is_active"]),
+        ]
+
+    def __str__(self):
+        return f"{self.product.name} = {self.semi_material.name} + {self.package_order.order_number}"
+
+
+class ProductPackageOrderRelationLog(models.Model):
+    id = models.AutoField(primary_key=True)
+    relation = models.ForeignKey(
+        ProductPackageOrderRelation, related_name="logs", on_delete=models.DO_NOTHING
+    )
+    user = models.ForeignKey(User, on_delete=models.DO_NOTHING)
+    action_detail = models.TextField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "product_package_relation_logs"

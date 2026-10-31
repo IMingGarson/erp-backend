@@ -58,6 +58,8 @@ from .models import (
     PaymentRecordLog,
     ProductionLog,
     ProductionOrder,
+    ProductPackageOrderRelation,
+    ProductPackageOrderRelationLog,
     ProductProfile,
     PurchaseRequisition,
     PurchaseRequisitionItem,
@@ -84,6 +86,7 @@ from .serializers import (
     PackageOrderSerializer,
     PaymentRecordSerializer,
     ProductionOrderSerializer,
+    ProductPackageOrderRelationSerializer,
     ProductProfileSerializer,
     PurchaseRequisitionSerializer,
     VendorSerializer,
@@ -107,6 +110,7 @@ class CRUDAuditMixin:
         PaymentRecord: (PaymentRecordLog, "payment_record"),
         PackageOrder: (PackageOrderLog, "package_order"),
         NutritionSnapshot: (NutritionSnapshotLog, "snapshot"),
+        ProductPackageOrderRelation: (ProductPackageOrderRelationLog, "relation"),
     }
 
     def get_valid_user(self):
@@ -1695,8 +1699,6 @@ class VendorViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         """取得指定客戶的歷史訂購與出貨紀錄"""
         vendor = self.get_object()
 
-        # 1. 抓取下單但未出貨之客戶訂單 (Customer Orders)
-        # 🌟 補上 mrp 關聯查詢
         co_qs = (
             CustomerOrder.objects.filter(
                 deleted_at__isnull=True, customer_info__code=vendor.code
@@ -1705,20 +1707,20 @@ class VendorViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
             .order_by("-order_date")
         )
 
-        # 2. 抓取已出貨之銷貨單 (Delivery Notes)
-        # 🌟 確保 production_order 有被 prefetch
         dn_qs = (
             DeliveryNote.objects.filter(is_active=True, customer_info__code=vendor.code)
             .select_related("production_order__product")
             .order_by("-note_date")
         )
 
-        # 3. 取得目前生效的包裝單 (PackageOrder) 以供對照包裝單號
-        active_pack_orders = PackageOrder.objects.filter(is_active=True).values(
-            "product_id", "order_number"
-        )
+        # 🌟 修正：透過中介表取得 PRODUCT 與對應包裝單號的 mapping
+        active_relations = ProductPackageOrderRelation.objects.filter(
+            is_active=True
+        ).select_related("package_order")
         pack_order_map = {
-            po["product_id"]: po["order_number"] for po in active_pack_orders
+            rel.product_id: rel.package_order.order_number
+            for rel in active_relations
+            if rel.package_order
         }
 
         history = []
@@ -1727,7 +1729,6 @@ class VendorViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
             prod_id = co.product.id if co.product else None
             pack_order_num = pack_order_map.get(prod_id, "-") if prod_id else "-"
 
-            # 🌟 替換為未來的生產單號 (MRP ID)
             po_number = co.mrp.mrp_id if co.mrp else co.order_number
 
             history.append(
@@ -1755,7 +1756,6 @@ class VendorViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
             prod_id = prod.id if prod else None
             pack_order_num = pack_order_map.get(prod_id, "-") if prod_id else "-"
 
-            # 🌟 替換為實際關聯的生產單號
             po_number = (
                 dn.production_order.order_number
                 if dn.production_order
@@ -1778,7 +1778,6 @@ class VendorViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 }
             )
 
-        # 依日期降冪排序 (由新到舊)
         history.sort(key=lambda x: x["date"], reverse=True)
 
         return Response(history, status=status.HTTP_200_OK)
@@ -2109,14 +2108,13 @@ class BOMViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     def mapping(self, request):
         import math
 
-        # 1. 取得 PRODUCT 到 SEMI 的對應表
-        package_orders = PackageOrder.objects.filter(is_active=True).values(
+        relations = ProductPackageOrderRelation.objects.filter(is_active=True).values(
             "product_id", "semi_material_id"
         )
         product_to_semi = {
-            str(po["product_id"]): str(po["semi_material_id"])
-            for po in package_orders
-            if po["product_id"]
+            str(r["product_id"]): str(r["semi_material_id"])
+            for r in relations
+            if r["product_id"]
         }
 
         # 2. 拉出所有物料的 Annotated 成本
@@ -3333,69 +3331,33 @@ class PaymentRecordViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         return Response({"message": "支票已成功兌現"}, status=status.HTTP_200_OK)
 
 
-class PackageOrderViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
-    queryset = (
-        PackageOrder.objects.filter(is_active=True)
-        .select_related("product", "semi_material")
-        .order_by("-id")
+class ProductPackageOrderRelationViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
+    queryset = ProductPackageOrderRelation.objects.filter(is_active=True).order_by(
+        "-id"
     )
-    serializer_class = PackageOrderSerializer
-    filter_backends = [filters.DjangoFilterBackend, SearchFilter]
-    search_fields = ["order_number", "product__name", "semi_material__name"]
+    serializer_class = ProductPackageOrderRelationSerializer
 
     def get_permissions(self):
         return [IsAuthenticated()]
 
-    @transaction.atomic
-    def perform_create(self, serializer):
-        try:
-            user = self.get_valid_user()
-            data = serializer.validated_data
 
-            order_number = data.get("order_number")
-            semi_mat = data.get("semi_material")
-            product_code = data.pop("new_product_code", None)
-            if not product_code:
-                raise ValidationError("請輸入成品代碼")
+class PackageOrderViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
+    queryset = (
+        PackageOrder.objects.filter(is_active=True)
+        .prefetch_related(
+            "product_relations__product", "product_relations__semi_material"
+        )
+        .order_by("-id")
+    )
+    serializer_class = PackageOrderSerializer
+    filter_backends = [filters.DjangoFilterBackend, SearchFilter]
 
-            if Material.objects.filter(code=product_code).exists():
-                raise ValidationError(f"物料代號 {product_code} 已存在")
+    search_fields = [
+        "order_number",
+        "product_relations__product__name",
+        "product_relations__semi_material__name",
+        "product_relations__semi_material__code",
+    ]
 
-            if PackageOrder.objects.filter(order_number=order_number).exists():
-                raise ValidationError(f"包裝單號 {order_number} 已存在")
-
-            new_product = Material.objects.create(
-                code=product_code,
-                name=semi_mat.name,
-                type="PRODUCT",
-                unit=semi_mat.unit,  # 複製 unit
-                is_active=semi_mat.is_active,  # 複製 is_active
-                allergen_info=semi_mat.allergen_info,  # 複製 allergen_info
-                description=semi_mat.description,  # 複製 description
-                english_name=semi_mat.english_name,  # 複製 english_name
-                origin="台灣",  # 固定為台灣
-                phase="IN_DEV",  # 預設 IN_DEV
-                product_registration_no=semi_mat.product_registration_no,  # 複製產品登錄號
-                storage_life=semi_mat.storage_life,  # 複製保存期限
-                pack_capacity=None,  # 固定為 null
-                nutrition_fact=semi_mat.nutrition_fact,  # 複製營養標示
-                dietary_type=semi_mat.dietary_type,  # 複製素食類別
-                storage_method=semi_mat.storage_method,  # 複製保存方式
-                qc_standards=semi_mat.qc_standards,  # 複製品管標準
-                created_by=user,
-            )
-            self._record_db_log(
-                new_product,
-                user,
-                f"{user.last_name}{user.first_name} 透過包裝單自動建立了成品 {new_product.name}",
-            )
-
-            serializer.validated_data["product"] = new_product
-            super().perform_create(serializer)
-            return Response(serializer.data)
-
-        except Exception as e:
-            return Response(
-                {"message": str(e), "data": None},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
+    def get_permissions(self):
+        return [IsAuthenticated()]

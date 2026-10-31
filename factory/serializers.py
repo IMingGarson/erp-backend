@@ -29,6 +29,7 @@ from .models import (
     PaymentRecord,
     ProductionLog,
     ProductionOrder,
+    ProductPackageOrderRelation,
     ProductProfile,
     PurchaseRequisition,
     PurchaseRequisitionItem,
@@ -195,7 +196,14 @@ class ProductProfileSerializer(serializers.ModelSerializer):
     def _get_po(self, obj):
         if hasattr(obj, "_cached_po"):
             return obj._cached_po
-        po = obj.material.product.first() if obj.material else None
+
+        relation = (
+            obj.material.package_relations.filter(is_active=True).first()
+            if obj.material
+            else None
+        )
+        po = relation.package_order if relation else None
+
         obj._cached_po = po
         return po
 
@@ -935,7 +943,10 @@ class CustomerOrderSerializer(serializers.ModelSerializer):
         if not obj.product or obj.product.type != "PRODUCT":
             return []
 
-        po = obj.product.product.filter(is_active=True).first()
+        # 🌟 修正：透過中介表找出對應的包裝單
+        relation = obj.product.package_relations.filter(is_active=True).first()
+        po = relation.package_order if relation else None
+
         if not po or not po.packaging_info:
             return []
 
@@ -948,7 +959,6 @@ class CustomerOrderSerializer(serializers.ModelSerializer):
             layer = item.get("layer")
             mat_id = item.get("material_id")
 
-            # 若訂單有選擇覆蓋的外/內箱規格，則以此為主
             if layer == "outer" and custom_outer_id:
                 mat_id = custom_outer_id
             elif layer == "inner" and custom_inner_id:
@@ -1101,7 +1111,8 @@ class SimpleProductSerializer(serializers.ModelSerializer):
         ]
 
     def _get_po(self, obj):
-        return obj.product.first()
+        relation = obj.package_relations.filter(is_active=True).first()
+        return relation.package_order if relation else None
 
     def _get_profile(self, obj):
         return obj.product_profiles.first()
@@ -1641,6 +1652,7 @@ class BOMMaterialDropdownSerializer(serializers.ModelSerializer):
             "id",
             "code",
             "name",
+            "pack_capacity",
             "type",
             "unit",
             "estimated_cost",
@@ -1771,29 +1783,22 @@ class PaymentRecordSerializer(serializers.ModelSerializer):
         return data
 
 
-class PackageOrderSerializer(serializers.ModelSerializer):
-    product_name = serializers.ReadOnlyField(source="product.name")
-    product_code = serializers.ReadOnlyField(source="product.code")
-    semi_material_name = serializers.ReadOnlyField(source="semi_material.name")
-    semi_material_code = serializers.ReadOnlyField(source="semi_material.code")
+class ProductPackageOrderRelationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProductPackageOrderRelation
+        fields = "__all__"
+        read_only_fields = ["created_by", "created_at", "updated_at"]
 
+
+# 🌟 整理：找到原有的 PackageOrderSerializer，把用不到的 write_only 欄位拔除
+class PackageOrderSerializer(serializers.ModelSerializer):
     outer_pack = serializers.SerializerMethodField()
     inner_pack = serializers.SerializerMethodField()
-
-    outer_pack_id = serializers.IntegerField(
-        write_only=True, required=False, allow_null=True
-    )
-    inner_pack_id = serializers.IntegerField(
-        write_only=True, required=False, allow_null=True
-    )
-    new_product_code = serializers.CharField(
-        write_only=True, required=False, allow_null=True
-    )
 
     class Meta:
         model = PackageOrder
         fields = "__all__"
-        read_only_fields = ["product", "created_by", "created_at", "updated_at"]
+        read_only_fields = ["created_by", "created_at", "updated_at"]
 
     def get_outer_pack(self, obj):
         for p in obj.packaging_info:
@@ -1806,3 +1811,36 @@ class PackageOrderSerializer(serializers.ModelSerializer):
             if p.get("layer") == "inner":
                 return p.get("material_id")
         return None
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+
+        relation = (
+            instance.product_relations.filter(is_active=True)
+            .select_related("product", "semi_material")
+            .first()
+        )
+
+        if relation:
+            data["product_id"] = relation.product.id if relation.product else None
+            data["product_code"] = relation.product.code if relation.product else ""
+            data["product_name"] = relation.product.name if relation.product else ""
+
+            data["semi_material"] = (
+                relation.semi_material.id if relation.semi_material else None
+            )
+            data["semi_material_code"] = (
+                relation.semi_material.code if relation.semi_material else ""
+            )
+            data["semi_material_name"] = (
+                relation.semi_material.name if relation.semi_material else ""
+            )
+        else:
+            data["product_id"] = None
+            data["product_code"] = ""
+            data["product_name"] = ""
+            data["semi_material"] = None
+            data["semi_material_code"] = ""
+            data["semi_material_name"] = ""
+
+        return data
