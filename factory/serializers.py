@@ -26,11 +26,16 @@ from .models import (
     MiscTransactionRecord,
     NutritionSnapshot,
     PackageOrder,
+    PaymentCheck,
+    PaymentMethodDetail,
     PaymentRecord,
+    PaymentWriteOff,
     ProductionLog,
     ProductionOrder,
     ProductPackageOrderRelation,
     ProductProfile,
+    PurchaseInvoice,
+    PurchaseInvoiceItem,
     PurchaseRequisition,
     PurchaseRequisitionItem,
     UserProfile,
@@ -1323,15 +1328,168 @@ class PurchaseRequisitionItemSerializer(serializers.ModelSerializer):
         return ""
 
 
+class PurchaseInvoiceItemSerializer(serializers.ModelSerializer):
+    id = serializers.IntegerField(required=False, allow_null=True)
+
+    class Meta:
+        model = PurchaseInvoiceItem
+        fields = [
+            "id",
+            "item_name",
+            "quantity",
+            "unit",
+            "unit_price",
+            "subtotal",
+            "remark",
+            "is_active",
+        ]
+
+
+class PurchaseInvoiceSerializer(serializers.ModelSerializer):
+    items = PurchaseInvoiceItemSerializer(many=True, required=False)
+    provider_name = serializers.CharField(source="provider.name", read_only=True)
+    creator_name = serializers.SerializerMethodField()
+
+    requisition_ids = serializers.PrimaryKeyRelatedField(
+        queryset=PurchaseRequisition.objects.filter(is_active=True),
+        source="requisitions",
+        many=True,
+        required=False,
+    )
+
+    class Meta:
+        model = PurchaseInvoice
+        fields = [
+            "id",
+            "invoice_number",
+            "invoice_date",
+            "buyer_title",
+            "buyer_tax_id",
+            "provider",
+            "provider_name",
+            "requisition_ids",
+            "untaxed_amount",
+            "tax_amount",
+            "total_amount",
+            "note",
+            "items",
+            "is_active",
+            "created_by",
+            "creator_name",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "created_by", "created_at", "updated_at"]
+
+    def get_creator_name(self, obj):
+        if obj.created_by:
+            return f"{obj.created_by.last_name}{obj.created_by.first_name}"
+        return "系統產生"
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data["items"] = PurchaseInvoiceItemSerializer(
+            instance.items.filter(is_active=True), many=True
+        ).data
+        return data
+
+    @transaction.atomic
+    def create(self, validated_data):
+        items_data = validated_data.pop("items", [])
+        requisitions = validated_data.pop("requisitions", [])
+
+        # 若整月多張進貨單開同一張發票號碼，自動查找既有發票並追加綁定進貨單
+        invoice_number = validated_data.get("invoice_number", "").strip()
+        existing_invoice = PurchaseInvoice.objects.filter(
+            invoice_number=invoice_number, is_active=True
+        ).first()
+
+        if existing_invoice:
+            for attr, val in validated_data.items():
+                setattr(existing_invoice, attr, val)
+            existing_invoice.save()
+            if requisitions:
+                existing_invoice.requisitions.add(*requisitions)
+            invoice = existing_invoice
+        else:
+            invoice = PurchaseInvoice.objects.create(**validated_data)
+            if requisitions:
+                invoice.requisitions.set(requisitions)
+
+        if items_data:
+            for item_data in items_data:
+                item_data.pop("id", None)
+                PurchaseInvoiceItem.objects.create(invoice=invoice, **item_data)
+
+        return invoice
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        items_data = validated_data.pop("items", None)
+        requisitions = validated_data.pop("requisitions", None)
+
+        instance = super().update(instance, validated_data)
+
+        if requisitions is not None:
+            instance.requisitions.set(requisitions)
+
+        if items_data is not None:
+            existing_items = {
+                item.id: item for item in instance.items.filter(is_active=True)
+            }
+            incoming_ids = set()
+
+            for item_data in items_data:
+                item_id = item_data.get("id")
+                if item_id and item_id in existing_items:
+                    incoming_ids.add(item_id)
+                    existing_item = existing_items[item_id]
+                    for attr, val in item_data.items():
+                        setattr(existing_item, attr, val)
+                    existing_item.save()
+                else:
+                    item_data.pop("id", None)
+                    PurchaseInvoiceItem.objects.create(invoice=instance, **item_data)
+
+            for existing_id, existing_item in existing_items.items():
+                if existing_id not in incoming_ids:
+                    existing_item.is_active = False
+                    existing_item.save(update_fields=["is_active"])
+
+        return instance
+
+
 class PurchaseRequisitionSerializer(serializers.ModelSerializer):
     items = PurchaseRequisitionItemSerializer(many=True)
+    grand_total = serializers.DecimalField(
+        max_digits=15, decimal_places=2, read_only=True
+    )
+    unpaid_amount = serializers.DecimalField(
+        max_digits=15, decimal_places=2, read_only=True
+    )
+    is_fully_paid = serializers.BooleanField(read_only=True)
+
+    invoices = serializers.SerializerMethodField(read_only=True)
+    invoices_payload = PurchaseInvoiceSerializer(
+        many=True, write_only=True, required=False
+    )
 
     class Meta:
         model = PurchaseRequisition
         fields = "__all__"
 
+    def get_invoices(self, obj):
+        active_invoices = obj.invoices.filter(is_active=True).prefetch_related("items")
+        return PurchaseInvoiceSerializer(active_invoices, many=True).data
+
 
 class DeliveryNoteSerializer(serializers.ModelSerializer):
+    unpaid_amount = serializers.DecimalField(
+        max_digits=15, decimal_places=2, read_only=True
+    )
+    is_fully_paid = serializers.BooleanField(read_only=True)
+    payment_status = serializers.CharField(read_only=True)
+
     class Meta:
         model = DeliveryNote
         fields = "__all__"
@@ -1720,6 +1878,7 @@ class MiscTransactionRecordSerializer(serializers.ModelSerializer):
             "id",
             "transaction_date",
             "transaction_type",
+            "sub_category",  # 🌟 新增：次項分類
             "amount",
             "category",
             "note",
@@ -1737,10 +1896,110 @@ class MiscTransactionRecordSerializer(serializers.ModelSerializer):
         return "系統產生"
 
 
+class PaymentMethodDetailSerializer(serializers.ModelSerializer):
+    id = serializers.IntegerField(required=False, allow_null=True)
+
+    class Meta:
+        model = PaymentMethodDetail
+        fields = [
+            "id",
+            "payment_method",
+            "amount",
+            "fee",
+            "company_bank_account",
+            "note",
+        ]
+
+
+class PaymentCheckSerializer(serializers.ModelSerializer):
+    id = serializers.IntegerField(required=False, allow_null=True)
+    partner_name = serializers.SerializerMethodField(read_only=True)
+    partner_type = serializers.CharField(
+        source="payment_record.partner_type", read_only=True
+    )
+
+    class Meta:
+        model = PaymentCheck
+        fields = [
+            "id",
+            "payment_record",
+            "partner_type",
+            "partner_name",
+            "check_number",
+            "received_date",
+            "due_date",
+            "cleared_date",
+            "is_cleared",
+            "amount",
+            "note",
+            "fee",
+            "issuer_bank",
+            "deposit_bank_account",
+            "title",
+            "is_active",
+        ]
+        read_only_fields = ["payment_record"]
+
+    def get_partner_name(self, obj):
+        pr = obj.payment_record
+        if not pr:
+            return ""
+        if pr.partner_type == "CUSTOMER" and pr.customer:
+            return pr.customer.name
+        if pr.partner_type == "VENDOR" and pr.provider:
+            return pr.provider.name
+        return ""
+
+
+class PaymentWriteOffSerializer(serializers.ModelSerializer):
+    id = serializers.IntegerField(required=False, allow_null=True)
+    delivery_note_number = serializers.CharField(
+        source="delivery_note.note_number", read_only=True
+    )
+    delivery_note_date = serializers.DateField(
+        source="delivery_note.note_date", read_only=True
+    )
+    delivery_note_grand_total = serializers.DecimalField(
+        source="delivery_note.grand_total",
+        max_digits=15,
+        decimal_places=2,
+        read_only=True,
+    )
+    purchase_requisition_date = serializers.DateField(
+        source="purchase_requisition.request_date", read_only=True
+    )
+    allocated_amount = serializers.DecimalField(
+        max_digits=15,
+        decimal_places=2,
+        required=False,
+        default=Decimal("0.00"),
+    )
+
+    class Meta:
+        model = PaymentWriteOff
+        fields = [
+            "id",
+            "payment_method",
+            "delivery_note",
+            "delivery_note_number",
+            "delivery_note_date",
+            "delivery_note_grand_total",
+            "purchase_requisition",
+            "purchase_requisition_date",
+            "allocated_amount",
+            "created_at",
+        ]
+        read_only_fields = ["id", "created_at"]
+
+
 class PaymentRecordSerializer(serializers.ModelSerializer):
     creator_name = serializers.SerializerMethodField()
     customer_name = serializers.CharField(source="customer.name", read_only=True)
     provider_name = serializers.CharField(source="provider.name", read_only=True)
+
+    method_details = PaymentMethodDetailSerializer(many=True, required=False)
+    checks = PaymentCheckSerializer(many=True, required=False)
+    write_offs = PaymentWriteOffSerializer(many=True, required=False)
 
     class Meta:
         model = PaymentRecord
@@ -1753,9 +2012,16 @@ class PaymentRecordSerializer(serializers.ModelSerializer):
             "provider",
             "provider_name",
             "amount",
+            "total_fee",
+            "other_deduction",
+            "other_deduction_note",
+            "total_write_off_amount",
             "payment_method",
             "check_info",
             "reference_notes",
+            "method_details",
+            "checks",
+            "write_offs",
             "is_active",
             "created_by",
             "creator_name",
@@ -1769,18 +2035,210 @@ class PaymentRecordSerializer(serializers.ModelSerializer):
             return f"{obj.created_by.last_name}{obj.created_by.first_name}"
         return "系統產生"
 
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data["checks"] = PaymentCheckSerializer(
+            instance.checks.filter(is_active=True), many=True
+        ).data
+        return data
+
     def validate(self, data):
         """簡單防呆：確認類型與對象是否有對應"""
-        partner_type = data.get("partner_type")
-        if partner_type == "CUSTOMER" and not data.get("customer"):
+        partner_type = data.get(
+            "partner_type", getattr(self.instance, "partner_type", None)
+        )
+        customer = data.get("customer", getattr(self.instance, "customer", None))
+        provider = data.get("provider", getattr(self.instance, "provider", None))
+
+        if partner_type == "CUSTOMER" and not customer:
             raise serializers.ValidationError(
                 "當對象類型為客戶(收款)時，請指定對應的客戶。"
             )
-        if partner_type == "VENDOR" and not data.get("provider"):
+        if partner_type == "VENDOR" and not provider:
             raise serializers.ValidationError(
                 "當對象類型為廠商(付款)時，請指定對應的廠商。"
             )
         return data
+
+    @transaction.atomic
+    def create(self, validated_data):
+        method_details_data = validated_data.pop("method_details", [])
+        checks_data = validated_data.pop("checks", [])
+        write_offs_data = validated_data.pop("write_offs", [])
+
+        total_actual_amount = Decimal("0.00")
+        total_fee = Decimal("0.00")
+        active_methods = set()
+
+        method_available_pool = {
+            "CASH": Decimal("0.00"),
+            "TRANSFER": Decimal("0.00"),
+            "CHECK": Decimal("0.00"),
+            "OTHER": Decimal(str(validated_data.get("other_deduction") or "0.00")),
+        }
+
+        for md in method_details_data:
+            m_type = md.get("payment_method")
+            m_amt = Decimal(str(md.get("amount") or "0.00"))
+            m_fee = Decimal(str(md.get("fee") or "0.00"))
+            if m_amt > 0 or m_fee > 0:
+                active_methods.add(m_type)
+                total_actual_amount += m_amt
+                total_fee += m_fee
+                if m_type in method_available_pool:
+                    method_available_pool[m_type] += m_amt + m_fee
+
+        checks_amt_sum = sum(
+            (Decimal(str(c.get("amount") or "0.00")) for c in checks_data),
+            Decimal("0.00"),
+        )
+        checks_fee_sum = sum(
+            (Decimal(str(c.get("fee") or "0.00")) for c in checks_data),
+            Decimal("0.00"),
+        )
+        if checks_data and "CHECK" not in active_methods:
+            active_methods.add("CHECK")
+            total_actual_amount += checks_amt_sum
+            total_fee += checks_fee_sum
+            method_available_pool["CHECK"] += checks_amt_sum + checks_fee_sum
+            method_details_data.append(
+                {
+                    "payment_method": "CHECK",
+                    "amount": checks_amt_sum,
+                    "fee": checks_fee_sum,
+                    "company_bank_account": checks_data[0].get(
+                        "deposit_bank_account", ""
+                    ),
+                    "note": f"共 {len(checks_data)} 張支票",
+                }
+            )
+
+        if method_details_data or checks_data:
+            if len(active_methods) > 1:
+                validated_data["payment_method"] = "MIXED"
+            elif len(active_methods) == 1:
+                validated_data["payment_method"] = list(active_methods)[0]
+
+            validated_data["amount"] = total_actual_amount
+            validated_data["total_fee"] = total_fee
+
+        other_deduction = Decimal(str(validated_data.get("other_deduction") or "0.00"))
+        validated_data["total_write_off_amount"] = (
+            Decimal(str(validated_data.get("amount") or "0.00"))
+            + Decimal(str(validated_data.get("total_fee") or "0.00"))
+            + other_deduction
+        )
+
+        payment_record = PaymentRecord.objects.create(**validated_data)
+
+        for md in method_details_data:
+            md.pop("id", None)
+            if (
+                Decimal(str(md.get("amount") or 0)) > 0
+                or Decimal(str(md.get("fee") or 0)) > 0
+            ):
+                PaymentMethodDetail.objects.create(payment_record=payment_record, **md)
+
+        for chk in checks_data:
+            chk.pop("id", None)
+            if not chk.get("received_date"):
+                chk["received_date"] = payment_record.payment_date
+            PaymentCheck.objects.create(payment_record=payment_record, **chk)
+
+        legacy_chk = validated_data.get("check_info")
+        if (
+            not checks_data
+            and isinstance(legacy_chk, dict)
+            and legacy_chk.get("cash_date")
+        ):
+            PaymentCheck.objects.create(
+                payment_record=payment_record,
+                check_number=legacy_chk.get("check_number", "未填票號"),
+                received_date=payment_record.payment_date,
+                due_date=legacy_chk.get("cash_date"),
+                is_cleared=bool(legacy_chk.get("is_cleared", False)),
+                amount=payment_record.amount,
+                issuer_bank=legacy_chk.get("target_bank", ""),
+                deposit_bank_account=legacy_chk.get("deposit_bank_account", ""),
+                title=legacy_chk.get("title", "基香食品"),
+            )
+
+        written_off_notes = []
+
+        for wo in write_offs_data:
+            wo.pop("id", None)
+            p_method = wo.get("payment_method", "TRANSFER")
+            dn_obj = wo.get("delivery_note")
+            pr_obj = wo.get("purchase_requisition")
+            req_allocated = Decimal(str(wo.get("allocated_amount") or "0.00"))
+
+            if dn_obj:
+                dn = DeliveryNote.objects.select_for_update().get(id=dn_obj.id)
+                unpaid = dn.unpaid_amount
+
+                if req_allocated > 0:
+                    actual_alloc = min(req_allocated, unpaid)
+                else:
+                    avail = method_available_pool.get(p_method, Decimal("0.00"))
+                    actual_alloc = min(unpaid, avail) if avail > 0 else unpaid
+
+                if actual_alloc > 0:
+                    dn.paid_amount = (dn.paid_amount or Decimal("0.00")) + actual_alloc
+                    dn.save(update_fields=["paid_amount"])
+
+                    if p_method in method_available_pool:
+                        method_available_pool[p_method] = max(
+                            method_available_pool[p_method] - actual_alloc,
+                            Decimal("0.00"),
+                        )
+
+                    PaymentWriteOff.objects.create(
+                        payment_record=payment_record,
+                        payment_method=p_method,
+                        delivery_note=dn,
+                        allocated_amount=actual_alloc,
+                    )
+                    status_tag = (
+                        "結清" if dn.is_fully_paid else f"部分沖銷:${actual_alloc}"
+                    )
+                    written_off_notes.append(f"{dn.note_number}({status_tag})")
+
+            elif pr_obj:
+                pr = PurchaseRequisition.objects.select_for_update().get(id=pr_obj.id)
+                unpaid = pr.unpaid_amount
+
+                if req_allocated > 0:
+                    actual_alloc = min(req_allocated, unpaid)
+                else:
+                    avail = method_available_pool.get(p_method, Decimal("0.00"))
+                    actual_alloc = min(unpaid, avail) if avail > 0 else unpaid
+
+                if actual_alloc > 0:
+                    pr.paid_amount = (pr.paid_amount or Decimal("0.00")) + actual_alloc
+                    pr.save(update_fields=["paid_amount"])
+
+                    if p_method in method_available_pool:
+                        method_available_pool[p_method] = max(
+                            method_available_pool[p_method] - actual_alloc,
+                            Decimal("0.00"),
+                        )
+
+                    PaymentWriteOff.objects.create(
+                        payment_record=payment_record,
+                        payment_method=p_method,
+                        purchase_requisition=pr,
+                        allocated_amount=actual_alloc,
+                    )
+                    status_tag = (
+                        "結清" if pr.is_fully_paid else f"部分沖銷:${actual_alloc}"
+                    )
+                    written_off_notes.append(f"PR#{pr.id}({status_tag})")
+
+        if written_off_notes and not payment_record.reference_notes:
+            payment_record.reference_notes = "沖銷單據: " + ", ".join(written_off_notes)
+            payment_record.save(update_fields=["reference_notes"])
+
+        return payment_record
 
 
 class ProductPackageOrderRelationSerializer(serializers.ModelSerializer):

@@ -61,6 +61,8 @@ from .models import (
     ProductPackageOrderRelation,
     ProductPackageOrderRelationLog,
     ProductProfile,
+    PurchaseInvoice,
+    PurchaseInvoiceLog,
     PurchaseRequisition,
     PurchaseRequisitionItem,
     PurchaseRequisitionLog,
@@ -88,6 +90,7 @@ from .serializers import (
     ProductionOrderSerializer,
     ProductPackageOrderRelationSerializer,
     ProductProfileSerializer,
+    PurchaseInvoiceSerializer,
     PurchaseRequisitionSerializer,
     VendorSerializer,
 )
@@ -111,6 +114,7 @@ class CRUDAuditMixin:
         PackageOrder: (PackageOrderLog, "package_order"),
         NutritionSnapshot: (NutritionSnapshotLog, "snapshot"),
         ProductPackageOrderRelation: (ProductPackageOrderRelationLog, "relation"),
+        PurchaseInvoice: (PurchaseInvoiceLog, "invoice"),
     }
 
     def get_valid_user(self):
@@ -199,6 +203,9 @@ class CRUDAuditMixin:
 
         elif model_name == "NutritionSnapshot":
             action_detail = f"{full_username} 建立了營養標籤快照版本 {instance.version_num} (物料: {instance.material.code})"
+
+        elif model_name == "PurchaseInvoice":
+            action_detail = f"{full_username} 建立了進貨發票 {instance.invoice_number}"
 
         else:
             action_detail = f"{full_username} 建立了此筆資料 (ID: {instance.pk})"
@@ -328,6 +335,13 @@ class CRUDAuditMixin:
             instance.save(update_fields=["is_active"])
             action_detail = (
                 f"{full_username} 停用了營養標籤快照版本 {instance.version_num}"
+            )
+
+        elif model_name == "PurchaseInvoice":
+            instance.is_active = False
+            instance.save(update_fields=["is_active"])
+            action_detail = (
+                f"{full_username} 刪除/作廢了進貨發票 {instance.invoice_number}"
             )
 
         else:
@@ -2278,180 +2292,43 @@ class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
     def get_permissions(self):
         return [IsAuthenticated()]
-        # return [IsAuthenticated(), IsAdminOrEmployerOrReadOnly()]
-
-    @action(detail=False, methods=["get"], url_path="prev_purchase_price")
-    def get_latest_price(self, request):
-        material_id = request.query_params.get("material_id")
-        provider_id = request.query_params.get("provider_id")
-
-        if not material_id:
-            raise ValidationError("必須提供 material_id 參數")
-
-        today = timezone.now().date()
-
-        stock_agg = BatchInventory.objects.filter(
-            material_id=material_id, is_active=True, remaining_qty__gt=0
-        ).aggregate(total_stock=Sum("remaining_qty"))
-        current_stock = stock_agg["total_stock"] or 0.0
-
-        price_query = MaterialProviderPrice.objects.filter(
-            material_id=material_id,
-            is_active=True,
-            quotation__is_active=True,
-            quotation__effective_date__lte=today,
-        ).order_by("-quotation__effective_date", "-id")
-
-        if provider_id:
-            price_query = price_query.filter(quotation__provider_id=provider_id)
-
-        latest_provider_price = price_query.first()
-        PROVIDER_QUOTATION = None
-        if latest_provider_price:
-            PROVIDER_QUOTATION = {
-                "latest_price": latest_provider_price.price,
-                "latest_spec": latest_provider_price.spec_text or "",
-                "latest_aux_unit": latest_provider_price.aux_unit or "",
-                "latest_aux_quantity": latest_provider_price.aux_quantity or "",
-                "is_tax_included": latest_provider_price.quotation.is_tax_included,
-                "current_stock": current_stock,
-                "quote_date": latest_provider_price.quotation.quote_date,
-                "valid_until": latest_provider_price.quotation.valid_until,
-                "source": "PROVIDER",
-            }
-
-        item_query = PurchaseRequisitionItem.objects.filter(
-            material_id=material_id,
-            is_active=True,
-            purchased_price__isnull=False,
-            requisition__status="stocked",
-            requisition__is_active=True,
-        ).select_related("requisition")
-
-        if provider_id:
-            item_query = item_query.filter(material_provider_id=provider_id)
-
-        latest_item = item_query.order_by("-requisition__request_date", "-id").first()
-
-        latest_batch = (
-            BatchInventory.objects.filter(material_id=material_id, is_active=True)
-            .order_by("-received_date", "-id")
-            .first()
-        )
-
-        latest_spec = getattr(latest_batch, "in_stock_spec", None) or getattr(
-            latest_item, "in_stock_spec", ""
-        )
-        latest_aux_unit = getattr(latest_batch, "aux_unit", None) or getattr(
-            latest_item, "aux_unit", ""
-        )
-        latest_aux_qty = getattr(latest_batch, "aux_quantity", None) or getattr(
-            latest_item, "aux_quantity", ""
-        )
-
-        HISTORICAL_PR_DATA = {
-            "latest_price": latest_item.purchased_price if latest_item else None,
-            "latest_spec": latest_spec,
-            "latest_aux_unit": latest_aux_unit,
-            "latest_aux_quantity": latest_aux_qty,
-            "current_stock": current_stock,
-            "quote_date": None,
-            "valid_until": None,
-            "is_tax_included": True,
-            "source": "HISTORY",
-        }
-
-        return Response(
-            {
-                "from_provider": PROVIDER_QUOTATION,
-                "from_historical_pr": HISTORICAL_PR_DATA,
-            },
-            status=status.HTTP_200_OK,
-        )
-
-    def _create_batches_from_incoming_data(
-        self, instance, user, items_data, existing_items
-    ):
-        today = timezone.now().date()
-        date_str = today.strftime("%Y%m%d")
-
-        for item_data in items_data:
-            item_id = item_data.get("id")
-            pr_item = existing_items.get(item_id)
-            if not pr_item:
-                continue
-
-            material = pr_item.material
-
-            # 1. 計算該 Material 在今天的最大流水號
-            existing_batches = BatchInventory.objects.filter(
-                material=material, batch_number__startswith=date_str
-            ).values_list("batch_number", flat=True)
-
-            max_seq = 0
-            for b_num in existing_batches:
-                try:
-                    seq = int(b_num.replace(date_str, ""))
-                    max_seq = max(max_seq, seq)
-                except ValueError:
-                    continue
-
-            new_batch_number = f"{date_str}{max_seq + 1:03d}"
-
-            # 2. 建立批號，使用 payload 傳來的「真實驗收資料」，並綁定 source_pr_item
-            BatchInventory.objects.create(
-                material=material,
-                batch_number=new_batch_number,
-                original_qty=item_data.get("quantity", pr_item.quantity),
-                remaining_qty=item_data.get("quantity", pr_item.quantity),
-                received_date=today,
-                in_stock_spec=item_data.get("in_stock_spec", pr_item.in_stock_spec),
-                package_qty=item_data.get("package_qty", pr_item.package_qty),
-                aux_unit=item_data.get("aux_unit", pr_item.aux_unit),
-                aux_quantity=item_data.get("aux_quantity", pr_item.aux_quantity),
-                note=item_data.get("remark", pr_item.remark),
-                created_by=user,
-                source_pr_item=pr_item,  # 🌟 重點綁定
-            )
 
     def get_queryset(self):
         active_items_prefetch = Prefetch(
             "items", queryset=PurchaseRequisitionItem.objects.filter(is_active=True)
         )
 
+        # 預載 items 以及綁定的 invoices，避免 N+1
         queryset = PurchaseRequisition.objects.filter(is_active=True).prefetch_related(
-            active_items_prefetch
+            active_items_prefetch, "invoices"
         )
 
         if self.action == "list":
             today = timezone.now().date()
-
             start_date_str = self.request.query_params.get("start_date")
             end_date_str = self.request.query_params.get("end_date")
+            unpaid_only = self.request.query_params.get("unpaid_only")
 
-            if start_date_str or end_date_str:
-                if start_date_str:
-                    try:
-                        start_date = datetime.strptime(
-                            start_date_str, "%Y-%m-%d"
-                        ).replace(tzinfo=timezone.utc)
-                        queryset = queryset.filter(request_date__gte=start_date)
-                    except ValueError:
-                        pass
-
-                if end_date_str:
-                    try:
-                        end_date = datetime.strptime(end_date_str, "%Y-%m-%d").replace(
-                            tzinfo=timezone.utc
-                        )
-                        end_date = min(end_date, today)
-                        queryset = queryset.filter(request_date__lte=end_date)
-                    except ValueError:
-                        pass
-
-            else:
+            if start_date_str:
+                queryset = queryset.filter(request_date__gte=start_date_str)
+            if end_date_str:
+                queryset = queryset.filter(request_date__lte=end_date_str)
+            if not start_date_str and not end_date_str:
                 two_weeks_ago = today - timedelta(days=365)
                 queryset = queryset.filter(request_date__range=[two_weeks_ago, today])
+
+            # 給會計沖銷用的篩選：只列出尚未付清的單據 (利用 annotate 比較 grand_total 與 paid_amount)
+            if unpaid_only == "true":
+                queryset = queryset.annotate(
+                    calc_grand_total=Sum(
+                        ExpressionWrapper(
+                            F("items__quantity") * F("items__purchased_price"),
+                            output_field=DecimalField(),
+                        )
+                    )
+                ).filter(
+                    calc_grand_total__gt=Coalesce(F("paid_amount"), Decimal("0.00"))
+                )
 
         return queryset.order_by("-created_at")
 
@@ -2463,31 +2340,12 @@ class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         super().perform_create(serializer)
         instance = serializer.instance
 
-        existing_items = {}
         for item_data in items_data:
-            new_item = PurchaseRequisitionItem.objects.create(
-                requisition=instance, **item_data
-            )
-            existing_items[new_item.id] = new_item
-            item_data["id"] = new_item.id
-
-        if instance.status == "stocked":
-            self._create_batches_from_incoming_data(
-                instance, user, items_data, existing_items
-            )
-            self._record_db_log(
-                instance,
-                user,
-                f"{user.last_name}{user.first_name} 建立已入庫請購單，並自動產生批號",
-            )
+            PurchaseRequisitionItem.objects.create(requisition=instance, **item_data)
 
     @transaction.atomic
     def perform_update(self, serializer):
-        user = self.get_valid_user()
         items_data = serializer.validated_data.pop("items", None)
-
-        old_status = serializer.instance.status
-        new_status = serializer.validated_data.get("status", old_status)
 
         super().perform_update(serializer)
         instance = serializer.instance
@@ -2498,34 +2356,20 @@ class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
             }
             incoming_item_ids = []
 
-            if old_status == "waiting" and new_status == "stocked":
-                # 若是入庫動作，不做 PR 更新，拿真實填寫的 payload 去建立 Batch
-                self._create_batches_from_incoming_data(
-                    instance, user, items_data, existing_items
-                )
-                self._record_db_log(
-                    instance,
-                    user,
-                    f"{user.last_name}{user.first_name} 將單據轉為已入庫，自動產生對應批號",
-                )
-                for item_data in items_data:
-                    if item_data.get("id"):
-                        incoming_item_ids.append(item_data.get("id"))
-            else:
-                for item_data in items_data:
-                    item_id = item_data.get("id")
-                    if item_id and item_id in existing_items:
-                        item_instance = existing_items[item_id]
-                        for attr, value in item_data.items():
-                            setattr(item_instance, attr, value)
-                        item_instance.save()
-                        incoming_item_ids.append(item_instance.id)
-                    else:
-                        item_data.pop("id", None)
-                        new_item = PurchaseRequisitionItem.objects.create(
-                            requisition=instance, **item_data
-                        )
-                        incoming_item_ids.append(new_item.id)
+            for item_data in items_data:
+                item_id = item_data.get("id")
+                if item_id and item_id in existing_items:
+                    item_instance = existing_items[item_id]
+                    for attr, value in item_data.items():
+                        setattr(item_instance, attr, value)
+                    item_instance.save()
+                    incoming_item_ids.append(item_instance.id)
+                else:
+                    item_data.pop("id", None)
+                    new_item = PurchaseRequisitionItem.objects.create(
+                        requisition=instance, **item_data
+                    )
+                    incoming_item_ids.append(new_item.id)
 
             for item_id, item_instance in existing_items.items():
                 if item_id not in incoming_item_ids:
@@ -2534,10 +2378,6 @@ class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
 
 class DeliveryNoteFilter(filters.FilterSet):
-    """
-    銷貨單的進階查詢過濾器
-    """
-
     production_order_id = filters.NumberFilter(field_name="production_order_id")
     customer_tax_id = filters.CharFilter(
         field_name="customer_info__tax_id", lookup_expr="exact"
@@ -2549,15 +2389,29 @@ class DeliveryNoteFilter(filters.FilterSet):
         field_name="customer_info__name", lookup_expr="icontains"
     )
 
+    # 支援時間區間
+    note_date__gte = filters.DateFilter(field_name="note_date", lookup_expr="gte")
+    note_date__lte = filters.DateFilter(field_name="note_date", lookup_expr="lte")
+
+    # 未沖銷單據篩選
+    unpaid_only = filters.BooleanFilter(method="filter_unpaid_only")
+
     class Meta:
         model = DeliveryNote
         fields = ["note_number", "note_date"]
+
+    def filter_unpaid_only(self, queryset, name, value):
+        if value:
+            # grand_total 大於 paid_amount 則代表尚有欠款
+            return queryset.filter(
+                grand_total__gt=Coalesce(F("paid_amount"), Decimal("0.00"))
+            )
+        return queryset
 
 
 class DeliveryNoteViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     queryset = DeliveryNote.objects.filter(is_active=True).order_by("-id")
     serializer_class = DeliveryNoteSerializer
-
     filter_backends = [filters.DjangoFilterBackend, SearchFilter]
     filterset_class = DeliveryNoteFilter
     search_fields = ["note_number"]
@@ -3094,7 +2948,6 @@ class AccountingReportViewSet(viewsets.ViewSet):
         取得各客戶的「累積欠額」
         公式：該客戶歷史總應收 (DeliveryNote) - 該客戶歷史總已收 (PaymentRecord)
         """
-        from django.db.models import Sum
 
         customers = Vendor.objects.filter(is_deleted=False)
         debt_list = []
@@ -3271,11 +3124,18 @@ class MiscTransactionRecordViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     )
     serializer_class = MiscTransactionRecordSerializer
 
+    # 支援「名稱(生鮮)」、「備註」的模糊搜尋，以及類別過濾
+    filter_backends = [filters.DjangoFilterBackend, SearchFilter]
+    search_fields = ["category", "note"]
+    filterset_fields = ["transaction_type", "sub_category"]
+
     def get_permissions(self):
         return [IsAuthenticated()]
 
     def list(self, request, *args, **kwargs):
-        queryset = self.get_queryset()
+        queryset = self.filter_queryset(self.get_queryset())
+
+        # 搜尋時間區間
         start_date = request.query_params.get("start_date")
         end_date = request.query_params.get("end_date")
 
@@ -3284,25 +3144,41 @@ class MiscTransactionRecordViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         if end_date:
             queryset = queryset.filter(transaction_date__lte=end_date)
 
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
 
 
 class PaymentRecordViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
-    """管理客戶收款與廠商付款、支票紀錄"""
+    """管理客戶收款與廠商付款、支票紀錄及自動沖銷"""
 
-    queryset = PaymentRecord.objects.filter(is_active=True).order_by(
-        "-payment_date", "-id"
-    )
     serializer_class = PaymentRecordSerializer
+    filter_backends = [filters.DjangoFilterBackend]
+    filterset_fields = ["partner_type", "payment_method"]
 
     def get_permissions(self):
         return [IsAuthenticated()]
 
+    def get_queryset(self):
+        return (
+            PaymentRecord.objects.filter(is_active=True)
+            .select_related("customer", "provider")
+            .prefetch_related(
+                "method_details",
+                "checks",
+                "write_offs__delivery_note",
+                "write_offs__purchase_requisition",
+            )
+            .order_by("-payment_date", "-id")
+        )
+
     @action(detail=False, methods=["get"])
     def pending_checks(self, request):
         """取得尚未兌現的支票列表"""
-        # 利用 Django 的 JSONField 查詢語法
         checks = self.get_queryset().filter(
             payment_method="CHECK", check_info__is_cleared=False
         )
@@ -3361,3 +3237,37 @@ class PackageOrderViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
     def get_permissions(self):
         return [IsAuthenticated()]
+
+
+class PurchaseInvoiceViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
+    """
+    進貨發票管理：
+    處理發票的新增、查詢，以及發票與進貨單 (PurchaseRequisition) 的多對多綁定。
+    """
+
+    serializer_class = PurchaseInvoiceSerializer
+    filter_backends = [filters.DjangoFilterBackend, SearchFilter]
+    search_fields = ["invoice_number", "buyer_title", "buyer_tax_id"]
+
+    def get_permissions(self):
+        return [IsAuthenticated()]
+
+    def get_queryset(self):
+        # 解決 N+1 問題：預載供應商與關聯的發票明細、進貨單
+        queryset = (
+            PurchaseInvoice.objects.filter(is_active=True)
+            .select_related("provider")
+            .prefetch_related("items", "requisitions")
+            .order_by("-invoice_date", "-id")
+        )
+
+        # 支援發票日期區間搜尋
+        start_date = self.request.query_params.get("start_date")
+        end_date = self.request.query_params.get("end_date")
+
+        if start_date:
+            queryset = queryset.filter(invoice_date__gte=start_date)
+        if end_date:
+            queryset = queryset.filter(invoice_date__lte=end_date)
+
+        return queryset

@@ -993,6 +993,12 @@ class PurchaseRequisition(models.Model):
         ("waiting", "待進貨"),
         ("stocked", "已入庫"),
     )
+    paid_amount = models.DecimalField(
+        max_digits=15,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        verbose_name="已付金額",
+    )
     request_date = models.DateField(verbose_name="申請日期")
     applicant = models.CharField(max_length=50, verbose_name="申請人")
     is_active = models.BooleanField(default=True, verbose_name="是否啟用")
@@ -1012,6 +1018,32 @@ class PurchaseRequisition(models.Model):
 
     def __str__(self):
         return f"PR #{self.id} - {self.status}"
+
+    @property
+    def grand_total(self):
+        """動態計算整張進貨單的應付總額"""
+        total = self.items.filter(is_active=True).aggregate(
+            total=Sum(
+                ExpressionWrapper(
+                    F("quantity") * F("purchased_price"),
+                    output_field=DecimalField(max_digits=15, decimal_places=2),
+                )
+            )
+        )["total"]
+        return total or Decimal("0.00")
+
+    @property
+    def unpaid_amount(self):
+        """尚未付款的餘額"""
+        return max(
+            self.grand_total - (self.paid_amount or Decimal("0.00")), Decimal("0.00")
+        )
+
+    @property
+    def is_fully_paid(self):
+        """是否已結清"""
+        total = self.grand_total
+        return total > 0 and (self.paid_amount or Decimal("0.00")) >= total
 
 
 class PurchaseRequisitionItem(models.Model):
@@ -1086,6 +1118,117 @@ class PurchaseRequisitionLog(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
 
+class PurchaseInvoice(models.Model):
+    id = models.AutoField(primary_key=True)
+    invoice_number = models.CharField(
+        max_length=50, db_index=True, verbose_name="發票號碼"
+    )
+    invoice_date = models.DateField(verbose_name="發票日期")
+    buyer_title = models.CharField(
+        max_length=100, default="基香食品", verbose_name="買受人抬頭"
+    )
+    buyer_tax_id = models.CharField(
+        max_length=20,
+        null=True,
+        blank=True,
+        verbose_name="統編",
+    )
+
+    provider = models.ForeignKey(
+        MaterialProvider,
+        on_delete=models.DO_NOTHING,
+        null=True,
+        blank=True,
+        related_name="invoices",
+        verbose_name="開立廠商",
+    )
+
+    # 🌟 多對多關聯：1張進貨單可綁多張發票，1張發票也可綁整月多張進貨單
+    requisitions = models.ManyToManyField(
+        PurchaseRequisition,
+        related_name="invoices",
+        blank=True,
+        verbose_name="關聯進貨單",
+    )
+
+    untaxed_amount = models.DecimalField(
+        max_digits=15,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        verbose_name="未稅金額",
+    )
+    tax_amount = models.DecimalField(
+        max_digits=15, decimal_places=2, default=Decimal("0.00"), verbose_name="稅額"
+    )
+    total_amount = models.DecimalField(
+        max_digits=15,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        verbose_name="含稅總額",
+    )
+
+    note = models.TextField(blank=True, null=True, verbose_name="發票備註")
+    is_active = models.BooleanField(default=True, verbose_name="是否啟用")
+    created_by = models.ForeignKey(User, on_delete=models.DO_NOTHING)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "purchase_invoices"
+        verbose_name = "進貨發票"
+        indexes = [
+            models.Index(fields=["invoice_number", "invoice_date"]),
+        ]
+
+    def __str__(self):
+        return f"{self.invoice_number} ({self.buyer_title})"
+
+
+class PurchaseInvoiceItem(models.Model):
+    id = models.AutoField(primary_key=True)
+    invoice = models.ForeignKey(
+        PurchaseInvoice,
+        on_delete=models.DO_NOTHING,
+        related_name="items",
+        verbose_name="所屬發票",
+    )
+    item_name = models.CharField(max_length=150, verbose_name="品名/摘要")
+    quantity = models.DecimalField(
+        max_digits=12, decimal_places=4, default=Decimal("1.0000"), verbose_name="數量"
+    )
+    unit = models.CharField(max_length=20, blank=True, null=True, verbose_name="單位")
+    unit_price = models.DecimalField(
+        max_digits=15, decimal_places=4, default=Decimal("0.0000"), verbose_name="單價"
+    )
+    subtotal = models.DecimalField(
+        max_digits=15,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        verbose_name="小計金額",
+    )
+    remark = models.CharField(
+        max_length=255, blank=True, null=True, verbose_name="備註"
+    )
+    is_active = models.BooleanField(default=True, verbose_name="是否啟用")
+
+    class Meta:
+        db_table = "purchase_invoice_items"
+        verbose_name = "進貨發票明細"
+
+
+class PurchaseInvoiceLog(models.Model):
+    id = models.AutoField(primary_key=True)
+    invoice = models.ForeignKey(
+        PurchaseInvoice, related_name="logs", on_delete=models.DO_NOTHING
+    )
+    user = models.ForeignKey(User, on_delete=models.DO_NOTHING)
+    action_detail = models.TextField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "purchase_invoice_logs"
+
+
 class DeliveryNote(models.Model):
     id = models.AutoField(primary_key=True)
 
@@ -1122,7 +1265,12 @@ class DeliveryNote(models.Model):
     grand_total = models.DecimalField(
         max_digits=15, decimal_places=2, null=True, blank=True, verbose_name="銷貨總額"
     )
-
+    paid_amount = models.DecimalField(
+        max_digits=15,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        verbose_name="已銷帳金額",
+    )
     document_note = models.TextField(blank=True, null=True, verbose_name="單據備註")
     created_by = models.ForeignKey(User, on_delete=models.DO_NOTHING)
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
@@ -1132,6 +1280,31 @@ class DeliveryNote(models.Model):
     class Meta:
         db_table = "delivery_notes"
         verbose_name = "銷貨單"
+
+    @property
+    def unpaid_amount(self):
+        """計算該銷貨單尚未沖銷的欠款餘額"""
+        total = self.grand_total or Decimal("0.00")
+        paid = self.paid_amount or Decimal("0.00")
+        return max(total - paid, Decimal("0.00"))
+
+    @property
+    def is_fully_paid(self):
+        """是否已完全沖銷"""
+        total = self.grand_total or Decimal("0.00")
+        paid = self.paid_amount or Decimal("0.00")
+        return total > 0 and paid >= total
+
+    @property
+    def payment_status(self):
+        """回傳沖銷狀態：UNPAID(未沖銷) / PARTIAL(部分沖銷) / PAID(已結清)"""
+        paid = self.paid_amount or Decimal("0.00")
+        total = self.grand_total or Decimal("0.00")
+        if paid <= 0:
+            return "UNPAID"
+        if paid >= total:
+            return "PAID"
+        return "PARTIAL"
 
 
 class DeliveryNoteLog(models.Model):
@@ -1548,19 +1721,32 @@ class MaterialIngredient(models.Model):
 # ==========================================
 class MiscTransactionRecord(models.Model):
     TRANSACTION_TYPES = (
-        ("INCOME", "收入 (如: 提領零用金)"),
-        ("EXPENSE", "支出 (如: 雜支、電話費)"),
+        ("EXPENSE", "應付費用 (支出)"),
+        ("INCOME", "應收費用 / 入零用金 (收入)"),
     )
 
     id = models.AutoField(primary_key=True)
-    transaction_date = models.DateField(verbose_name="交易日期")
+    transaction_date = models.DateField(verbose_name="交易日期", db_index=True)
     transaction_type = models.CharField(
-        max_length=20, choices=TRANSACTION_TYPES, verbose_name="收支類型"
+        max_length=20,
+        choices=TRANSACTION_TYPES,
+        default="EXPENSE",
+        verbose_name="大項 (收支類型)",
+    )
+    # 🌟 補上：次項分類 (不綁死 choices，交由前端傳入如 FIX/修繕、FACILITY/水電、LABOR/人事、COMMISSION/佣金 等)
+    sub_category = models.CharField(
+        max_length=50,
+        blank=True,
+        null=True,
+        default="OTHER",
+        verbose_name="次項分類",
+    )
+    category = models.CharField(
+        max_length=100,
+        verbose_name="名稱/類別摘要",
+        help_text="如：生鮮、電話費、維修費、提領零用金",
     )
     amount = models.DecimalField(max_digits=15, decimal_places=2, verbose_name="金額")
-    category = models.CharField(
-        max_length=100, verbose_name="類別", help_text="如：電話費、維修費、提領零用金"
-    )
     note = models.TextField(blank=True, null=True, verbose_name="備註")
 
     is_active = models.BooleanField(default=True, verbose_name="是否啟用")
@@ -1598,10 +1784,11 @@ class PaymentRecord(models.Model):
         ("CASH", "現金"),
         ("TRANSFER", "匯款"),
         ("CHECK", "支票/票據"),
+        ("MIXED", "複合付款"),
     )
 
     id = models.AutoField(primary_key=True)
-    payment_date = models.DateField(verbose_name="收付款日期")
+    payment_date = models.DateField(verbose_name="收付款日期", db_index=True)
     partner_type = models.CharField(
         max_length=20, choices=PARTNER_TYPES, verbose_name="對象類型"
     )
@@ -1626,13 +1813,47 @@ class PaymentRecord(models.Model):
         related_name="payments",
     )
 
-    amount = models.DecimalField(max_digits=15, decimal_places=2, verbose_name="金額")
     payment_method = models.CharField(
-        max_length=20, choices=PAYMENT_METHODS, verbose_name="付款方式"
+        max_length=20,
+        choices=PAYMENT_METHODS,
+        default="TRANSFER",
+        verbose_name="付款方式",
     )
 
-    # 支票專用 JSON 欄位 (免去開一堆不常用的實體欄位)
-    # 格式預期：{"target_bank": "玉山銀行", "title": "基香食品", "cash_date": "2026-11-25", "is_cleared": false}
+    # 🌟 補上：完整金額結構 (實收付金額 + 匯費/手續費 + 其他折讓差額 = 本次總沖銷額度)
+    amount = models.DecimalField(
+        max_digits=15,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        verbose_name="實際收付總金額",
+    )
+    total_fee = models.DecimalField(
+        max_digits=15,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        verbose_name="匯費/手續費總計",
+    )
+    other_deduction = models.DecimalField(
+        max_digits=15,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        verbose_name="其他扣除/折讓金額",
+        help_text="如：扣除標籤貼紙錢後的差額",
+    )
+    other_deduction_note = models.CharField(
+        max_length=255,
+        blank=True,
+        null=True,
+        verbose_name="其他扣除說明",
+    )
+    total_write_off_amount = models.DecimalField(
+        max_digits=15,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        verbose_name="本次可沖銷總額度",
+    )
+
+    # 支票專用 JSON 欄位 (保留相容性)
     check_info = models.JSONField(
         blank=True, null=True, default=dict, verbose_name="支票與票據資訊"
     )
@@ -1784,3 +2005,172 @@ class ProductPackageOrderRelationLog(models.Model):
 
     class Meta:
         db_table = "product_package_relation_logs"
+
+
+class PaymentMethodDetail(models.Model):
+    """
+    三大付款區塊明細 (現金、銀行轉帳、支票)
+    紀錄各區塊填寫的「已付金額」、「匯費/手續費」以及「進入的基香銀行帳戶」
+    """
+
+    METHOD_CHOICES = (
+        ("CASH", "現金"),
+        ("TRANSFER", "銀行轉帳"),
+        ("CHECK", "支票"),
+    )
+
+    id = models.AutoField(primary_key=True)
+    payment_record = models.ForeignKey(
+        PaymentRecord,
+        on_delete=models.CASCADE,
+        related_name="method_details",
+        verbose_name="所屬金流主單",
+    )
+    payment_method = models.CharField(
+        max_length=20, choices=METHOD_CHOICES, verbose_name="付款方式區塊"
+    )
+    amount = models.DecimalField(
+        max_digits=15,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        verbose_name="實收/實付金額",
+    )
+    fee = models.DecimalField(
+        max_digits=15,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        verbose_name="匯費/手續費",
+        help_text="轉帳匯費或支票扣除之手續費，可一併計入沖銷額度",
+    )
+    company_bank_account = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True,
+        verbose_name="入帳/扣款之基香帳戶",
+    )
+    note = models.CharField(
+        max_length=255, blank=True, null=True, verbose_name="區塊備註"
+    )
+
+    class Meta:
+        db_table = "payment_method_details"
+        verbose_name = "付款方式區塊明細"
+
+
+class PaymentCheck(models.Model):
+    """
+    支票詳細資訊表 (支援單次銷帳包含多張支票，例如 700、800 兩張，並追蹤各自兌現狀態)
+    """
+
+    id = models.AutoField(primary_key=True)
+    payment_record = models.ForeignKey(
+        PaymentRecord,
+        on_delete=models.CASCADE,
+        related_name="checks",
+        verbose_name="所屬金流主單",
+    )
+    check_number = models.CharField(max_length=50, db_index=True, verbose_name="票號")
+    received_date = models.DateField(verbose_name="收票日")
+    due_date = models.DateField(
+        verbose_name="到期日 (預計可兌現日)", help_text="對應 YYYY-MM-DD"
+    )
+    cleared_date = models.DateField(
+        null=True,
+        blank=True,
+        verbose_name="實際兌現日",
+        help_text="收到時未兌現，事後回填",
+    )
+    is_cleared = models.BooleanField(
+        default=False, db_index=True, verbose_name="是否已兌現"
+    )
+    note = models.CharField(
+        max_length=255, blank=True, null=True, verbose_name="支票備註"
+    )
+    amount = models.DecimalField(
+        max_digits=15, decimal_places=2, verbose_name="支票面額"
+    )
+    fee = models.DecimalField(
+        max_digits=15,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        verbose_name="手續費",
+        help_text="若開票時已扣除手續費可記錄於此",
+    )
+    issuer_bank = models.CharField(max_length=100, verbose_name="開票人的銀行")
+    deposit_bank_account = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True,
+        verbose_name="存入的銀行帳號 (基香雙帳戶)",
+    )
+    title = models.CharField(
+        max_length=100,
+        default="基香食品",
+        blank=True,
+        null=True,
+        verbose_name="支票抬頭",
+    )
+    is_active = models.BooleanField(default=True, verbose_name="是否啟用")
+
+    class Meta:
+        db_table = "payment_checks"
+        verbose_name = "支票明細紀錄"
+
+
+class PaymentWriteOff(models.Model):
+    """
+    銷帳沖銷橋接表：
+    紀錄「某種付款方式 (CASH / TRANSFER / CHECK / OTHER)」沖銷了「哪張銷貨單 (或進貨單)」多少金額。
+    例如：1000元現金區塊 -> 勾選沖銷了 DeliveryNote A (300元) 與 DeliveryNote B (700元)
+    """
+
+    ALLOCATION_METHOD_CHOICES = (
+        ("CASH", "現金區塊"),
+        ("TRANSFER", "銀行轉帳區塊"),
+        ("CHECK", "支票區塊"),
+        ("OTHER", "其他折讓/差額扣除"),
+    )
+
+    id = models.AutoField(primary_key=True)
+    payment_record = models.ForeignKey(
+        PaymentRecord,
+        on_delete=models.CASCADE,
+        related_name="write_offs",
+        verbose_name="所屬金流主單",
+    )
+    payment_method = models.CharField(
+        max_length=20,
+        choices=ALLOCATION_METHOD_CHOICES,
+        verbose_name="對應沖銷區塊",
+    )
+
+    # 客戶應收沖銷：綁定銷貨單
+    delivery_note = models.ForeignKey(
+        DeliveryNote,
+        on_delete=models.DO_NOTHING,
+        null=True,
+        blank=True,
+        related_name="write_offs",
+        verbose_name="沖銷之銷貨單",
+    )
+    # 廠商應付沖銷：綁定進貨單
+    purchase_requisition = models.ForeignKey(
+        PurchaseRequisition,
+        on_delete=models.DO_NOTHING,
+        null=True,
+        blank=True,
+        related_name="write_offs",
+        verbose_name="沖銷之進貨單",
+    )
+
+    allocated_amount = models.DecimalField(
+        max_digits=15,
+        decimal_places=2,
+        verbose_name="本次沖銷金額",
+        help_text="此區塊分配給該單據的沖銷金額 (支援部分沖銷)",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "payment_write_offs"
+        verbose_name = "單據沖銷明細"

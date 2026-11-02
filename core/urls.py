@@ -32,6 +32,7 @@ from factory.views import (
     ProductionOrderViewSet,
     ProductPackageOrderRelationViewSet,
     ProductProfileViewSet,
+    PurchaseInvoiceViewSet,
     PurchaseRequisitionViewSet,
     TraceViewSet,
     VendorViewSet,
@@ -80,6 +81,9 @@ router.register(
     r"product_package_relations",
     ProductPackageOrderRelationViewSet,
     basename="product-package-order-relation",
+)
+router.register(
+    r"purchase_invoices", PurchaseInvoiceViewSet, basename="purchase-invoices"
 )
 urlpatterns = [
     path("admin/", admin.site.urls),
