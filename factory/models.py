@@ -232,6 +232,15 @@ class Material(models.Model):
         verbose_name="素食類別",
         help_text="如為複合原料，請依據成分中最嚴格的葷素級別標示",
     )
+
+    sticker_info = models.JSONField(
+        blank=True,
+        null=True,
+        default=dict,
+        verbose_name="標籤廠商資訊",
+        help_text="僅標籤(STICKER)適用，預期格式包含 manufacturer, tel, fax, address",
+    )
+
     created_by = models.ForeignKey(User, on_delete=models.DO_NOTHING)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -761,8 +770,10 @@ class NutritionSnapshot(models.Model):
         max_length=50, verbose_name="版本編號", help_text="例如: V20261030-01"
     )
 
-    # 標籤快照核心內容 (因為包材上的成分文字與過敏原也會跟著配方變動，一併快照是最安全的)
     nutrition_fact = models.JSONField(default=dict, verbose_name="八大營養素快照")
+    label_info = models.JSONField(
+        default=dict, blank=True, null=True, verbose_name="完整標籤資訊快照"
+    )
     allergen_info = models.CharField(
         max_length=255, blank=True, null=True, verbose_name="過敏原快照"
     )
@@ -797,6 +808,9 @@ class NutritionSnapshot(models.Model):
     )
     reviewed_at = models.DateTimeField(null=True, blank=True, verbose_name="審核時間")
     review_note = models.TextField(blank=True, null=True, verbose_name="審核備註")
+
+    valid_from = models.DateField(null=True, blank=True, verbose_name="生效起始日")
+    valid_until = models.DateField(null=True, blank=True, verbose_name="生效結束日")
 
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
     updated_at = models.DateTimeField(auto_now=True)

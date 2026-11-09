@@ -1688,6 +1688,35 @@ class NutritionSnapshotViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
             {"message": f"已成功{action_text}該標籤內容"}, status=status.HTTP_200_OK
         )
 
+    @action(detail=True, methods=["patch"], url_path="validity")
+    @transaction.atomic
+    def set_validity(self, request, pk=None):
+        """獨立設定/更新快照的使用效期區間"""
+        user = self.get_valid_user()
+        snapshot = self.get_object()
+
+        valid_from = request.data.get("valid_from")
+        valid_until = request.data.get("valid_until")
+
+        # 允許清空日期，所以直接覆蓋 (前端傳空字串或 null 都視為 None)
+        snapshot.valid_from = valid_from if valid_from else None
+        snapshot.valid_until = valid_until if valid_until else None
+
+        snapshot.save(update_fields=["valid_from", "valid_until"])
+
+        from_str = str(snapshot.valid_from) if snapshot.valid_from else "未指定"
+        until_str = str(snapshot.valid_until) if snapshot.valid_until else "永久有效"
+
+        self._record_db_log(
+            snapshot,
+            user,
+            f"{user.last_name}{user.first_name} 更新了標籤紀錄 {snapshot.version_num} 的使用區間: {from_str} ~ {until_str}",
+        )
+
+        return Response(
+            {"message": "已成功更新標籤使用區間"}, status=status.HTTP_200_OK
+        )
+
 
 class VendorViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     queryset = Vendor.objects.filter(is_deleted=False).order_by("-id")

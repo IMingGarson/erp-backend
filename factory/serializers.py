@@ -417,6 +417,7 @@ class NutritionSnapshotSerializer(serializers.ModelSerializer):
             "nutrition_fact",
             "allergen_info",
             "ingredients_text",
+            "label_info",
             "status",
             "is_active",
             "created_by",
@@ -425,6 +426,8 @@ class NutritionSnapshotSerializer(serializers.ModelSerializer):
             "reviewer_name",
             "reviewed_at",
             "review_note",
+            "valid_from",
+            "valid_until",
             "created_at",
             "updated_at",
         ]
@@ -482,6 +485,7 @@ class MaterialSerializer(serializers.ModelSerializer):
             "is_active",  # 是否啟用
             "is_raw_material",  # 是否為原物料
             "pack_capacity",  # PACK 限定：包材容量（KG）
+            "sticker_info",
             "created_by",  # 建立者
             "creator_name",  # 建立者姓名 (自訂方法)
             "created_at",  # 建立時間
@@ -713,7 +717,16 @@ class BatchInventorySerializer(serializers.ModelSerializer):
 class BOMMaterialMinimalSerializer(serializers.ModelSerializer):
     class Meta:
         model = Material
-        fields = ["id", "code", "name", "type", "unit", "pack_capacity", "qc_standards"]
+        fields = [
+            "id",
+            "code",
+            "name",
+            "type",
+            "unit",
+            "pack_capacity",
+            "qc_standards",
+            "sticker_info",
+        ]
 
 
 class BOMSerializer(serializers.ModelSerializer):
@@ -1815,6 +1828,7 @@ class BOMMaterialDropdownSerializer(serializers.ModelSerializer):
             "unit",
             "estimated_cost",
             "provider_quotes",
+            "sticker_info",
             "ingredients",  # 添加物安全試算需要
             "nutrition_fact",  # 營養素加總需要
             "boms",  # 半成品遞迴計算需要
