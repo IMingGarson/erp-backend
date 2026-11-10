@@ -389,6 +389,24 @@ class ProductionOrderViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     def get_permissions(self):
         return [IsAuthenticated()]
 
+    def get_queryset(self):
+        today = timezone.now().date()
+        active_snapshots_prefetch = Prefetch(
+            "product__nutrition_snapshots",
+            queryset=NutritionSnapshot.objects.filter(
+                Q(valid_until__isnull=True) | Q(valid_until__gte=today),
+                Q(valid_from__isnull=False) & Q(valid_from__lte=today),
+                is_active=True,
+                status="APPROVED",
+            ).order_by("-created_at"),
+        )
+        return (
+            ProductionOrder.objects.filter(is_active=True)
+            .order_by("-created_at")
+            .select_related("product", "created_by")
+            .prefetch_related(active_snapshots_prefetch)
+        )
+
     @action(detail=True, methods=["post"], url_path="replace_batch")
     @transaction.atomic
     def replace_batch(self, request, pk=None):

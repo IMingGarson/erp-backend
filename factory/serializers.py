@@ -1168,16 +1168,8 @@ class ProductionOrderSerializer(serializers.ModelSerializer):
     remaining_qty = serializers.DecimalField(
         max_digits=15, decimal_places=4, read_only=True
     )
-    nutrition_snapshot_id = serializers.PrimaryKeyRelatedField(
-        queryset=NutritionSnapshot.objects.all(),
-        source="nutrition_snapshot",
-        write_only=True,
-        required=False,
-        allow_null=True,
-    )
-    nutrition_snapshot_detail = NutritionSnapshotSerializer(
-        source="nutrition_snapshot", read_only=True
-    )
+    # 🌟 移除原本直接關聯的 serializer，改用 method
+    active_nutrition_snapshot = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = ProductionOrder
@@ -1202,8 +1194,7 @@ class ProductionOrderSerializer(serializers.ModelSerializer):
             "is_active",
             "qc_metrics",
             "qc_passed",
-            "nutrition_snapshot_id",
-            "nutrition_snapshot_detail",
+            "active_nutrition_snapshot",  # 🌟 替換成這個欄位
         ]
 
     def get_creator_name(self, obj):
@@ -1220,6 +1211,42 @@ class ProductionOrderSerializer(serializers.ModelSerializer):
         if batch:
             return batch.batch_number
         return ""
+
+    def get_active_nutrition_snapshot(self, obj):
+        today = timezone.now().date()
+
+        snapshots = NutritionSnapshot.objects.filter(
+            Q(valid_until__isnull=True) | Q(valid_until__gte=today),
+            Q(valid_from__isnull=False) & Q(valid_from__lte=today),
+            material_id=obj.product_id,
+            is_active=True,
+            status="APPROVED",
+        ).order_by("-created_at")
+
+        active_snap = None
+        for snap in snapshots:
+            from_date = snap.valid_from
+            until_date = snap.valid_until
+
+            if from_date and today < from_date:
+                continue
+            if until_date and today > until_date:
+                continue
+
+            active_snap = snap
+            break
+
+        if not active_snap:
+            return None
+
+        return {
+            "id": active_snap.id,
+            "version_num": active_snap.version_num,
+            "nutrition_fact": active_snap.nutrition_fact,
+            "allergen_info": active_snap.allergen_info,
+            "ingredients_text": active_snap.ingredients_text,
+            "label_info": active_snap.label_info or {},
+        }
 
 
 class VendorSerializer(serializers.ModelSerializer):
