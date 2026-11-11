@@ -3026,6 +3026,9 @@ class AccountingReportViewSet(viewsets.ViewSet):
                         "customer_id": customer.id,
                         "customer_name": customer.name,
                         "customer_code": customer.code,
+                        "customer_address": customer.address,
+                        "customer_tax_id": customer.tax_id,
+                        "customer_phone": customer.phone,
                         "total_ar": float(total_ar),
                         "total_paid": float(total_paid),
                         "accumulated_debt": debt,
@@ -3039,16 +3042,19 @@ class AccountingReportViewSet(viewsets.ViewSet):
     @action(detail=False, methods=["get"])
     def ar_report(self, request):
         """
-        應收帳款 (Accounts Receivable) 對帳查詢
-        以 DeliveryNote (銷貨單) 為基礎，依據時間區間動態加總。
+        應收帳款 (Accounts Receivable) 對帳與單一客戶銷貨單狀態查詢
+        以 DeliveryNote (銷貨單) 為基礎，依據時間區間與客戶動態加總並列出明細狀態。
         """
         start_date = request.query_params.get("start_date")
         end_date = request.query_params.get("end_date")
-        customer_code = request.query_params.get(
-            "customer_code"
-        )  # 可選：依客戶代號過濾
+        customer_code = request.query_params.get("customer_code")
+        payment_status_filter = request.query_params.get("payment_status")
 
-        queryset = DeliveryNote.objects.filter(is_active=True).order_by("note_date")
+        queryset = (
+            DeliveryNote.objects.filter(is_active=True)
+            .select_related("production_order__product")
+            .order_by("-note_date", "-id")
+        )
 
         if start_date:
             queryset = queryset.filter(note_date__gte=start_date)
@@ -3057,44 +3063,67 @@ class AccountingReportViewSet(viewsets.ViewSet):
         if customer_code:
             queryset = queryset.filter(customer_info__code=customer_code)
 
-        # 依客戶分組加總 (因為 customer_info 是 JSON，在 Python 端做 Grouping 最穩定)
         ar_data = {}
         for note in queryset:
-            c_code = note.customer_info.get("code", "UNKNOWN")
-            c_name = note.customer_info.get("name", "未知名稱")
+            note_status = note.payment_status
+            if payment_status_filter and note_status != payment_status_filter:
+                continue
 
+            c_code = note.customer_info.get("code", "")
+            c_name = note.customer_info.get("name", "")
             if c_code not in ar_data:
                 ar_data[c_code] = {
                     "customer_code": c_code,
                     "customer_name": c_name,
+                    "customer_address": note.customer_info.get("address", ""),
+                    "customer_tax_id": note.customer_info.get("tax_id", ""),
+                    "customer_phone": note.customer_info.get("phone", ""),
                     "total_sales_amount": 0.0,
                     "total_tax_amount": 0.0,
                     "grand_total": 0.0,
+                    "total_paid_amount": 0.0,
+                    "total_unpaid_amount": 0.0,
                     "delivery_notes": [],
                 }
 
-            # 加總單筆金額
             total_amt = float(note.total_amount or 0)
             tax_amt = float(note.tax_amount or 0)
             grand_total = float(note.grand_total or 0)
+            paid_amt = float(note.paid_amount or 0)
+            unpaid_amt = float(note.unpaid_amount or 0)
 
             ar_data[c_code]["total_sales_amount"] += total_amt
             ar_data[c_code]["total_tax_amount"] += tax_amt
             ar_data[c_code]["grand_total"] += grand_total
+            ar_data[c_code]["total_paid_amount"] += paid_amt
+            ar_data[c_code]["total_unpaid_amount"] += unpaid_amt
 
-            # 將單據明細一併附上，讓前端對帳單有明細可查
+            product_name = (
+                note.production_order.product.name
+                if note.production_order and note.production_order.product
+                else ""
+            )
+
             ar_data[c_code]["delivery_notes"].append(
                 {
                     "id": note.id,
                     "note_number": note.note_number,
-                    "note_date": note.note_date,
+                    "note_date": note.note_date.strftime("%Y-%m-%d")
+                    if note.note_date
+                    else "",
+                    "product_name": product_name,
+                    "spec": note.spec or "",
+                    "quantity": float(note.quantity or 0),
+                    "unit": note.unit or "",
                     "total_amount": total_amt,
                     "tax_amount": tax_amt,
                     "grand_total": grand_total,
+                    "paid_amount": paid_amt,
+                    "unpaid_amount": unpaid_amt,
+                    "payment_status": note_status,  # UNPAID(未付款) / PARTIAL(仍欠款) / PAID(已付款)
                 }
             )
 
-        # 回傳時將 dict 轉為 list
         return Response(list(ar_data.values()), status=status.HTTP_200_OK)
 
     @action(detail=False, methods=["get"])
@@ -3205,7 +3234,7 @@ class PaymentRecordViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
     serializer_class = PaymentRecordSerializer
     filter_backends = [filters.DjangoFilterBackend]
-    filterset_fields = ["partner_type", "payment_method"]
+    filterset_fields = ["partner_type", "payment_method", "customer", "provider"]
 
     def get_permissions(self):
         return [IsAuthenticated()]
@@ -3213,7 +3242,7 @@ class PaymentRecordViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     def get_queryset(self):
         return (
             PaymentRecord.objects.filter(is_active=True)
-            .select_related("customer", "provider")
+            .select_related("customer", "provider", "created_by")
             .prefetch_related(
                 "method_details",
                 "checks",
@@ -3225,33 +3254,86 @@ class PaymentRecordViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
     @action(detail=False, methods=["get"])
     def pending_checks(self, request):
-        """取得尚未兌現的支票列表"""
-        checks = self.get_queryset().filter(
-            payment_method="CHECK", check_info__is_cleared=False
+        """取得含有尚未兌現支票的金流紀錄列表"""
+        records = (
+            self.get_queryset()
+            .filter(checks__is_active=True, checks__is_cleared=False)
+            .distinct()
         )
-        serializer = self.get_serializer(checks, many=True)
+        serializer = self.get_serializer(records, many=True)
         return Response(serializer.data)
 
     @action(detail=True, methods=["post"])
+    @transaction.atomic
     def clear_check(self, request, pk=None):
-        """將支票標記為已兌現"""
+        """將該筆金流底下的支票標記為已兌現 (亦支援傳入 check_id 單張兌現)"""
         record = self.get_object()
-        if record.payment_method != "CHECK":
+        check_id = request.data.get("check_id")
+        clear_date = request.data.get("cleared_date")
+
+        if not clear_date:
             return Response(
-                {"error": "此紀錄並非支票"}, status=status.HTTP_400_BAD_REQUEST
+                {"error": "兌現日期有誤"}, status=status.HTTP_400_BAD_REQUEST
             )
 
-        check_info = record.check_info or {}
-        check_info["is_cleared"] = True
-        record.check_info = check_info
-        record.save(update_fields=["check_info"])
+        checks_qs = record.checks.filter(is_active=True, is_cleared=False)
+        if check_id:
+            checks_qs = checks_qs.filter(id=check_id)
+
+        if not checks_qs.exists():
+            return Response(
+                {"error": "找不到待兌現的支票紀錄"}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        cleared_numbers = list(checks_qs.values_list("check_number", flat=True))
+        checks_qs.update(is_cleared=True, cleared_date=clear_date)
 
         user = self.get_valid_user()
         self._record_db_log(
-            record, user, f"{user.last_name}{user.first_name} 將此支票標記為已兌現"
+            record,
+            user,
+            f"{user.last_name}{user.first_name} 將支票 ({', '.join(cleared_numbers)}) 標記為已兌現",
         )
 
         return Response({"message": "支票已成功兌現"}, status=status.HTTP_200_OK)
+
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        """作廢金流紀錄，並自動回滾關聯銷貨單/進貨單的已付金額"""
+        user = self.get_valid_user()
+        full_username = f"{user.last_name}{user.first_name}"
+
+        for wo in instance.write_offs.select_related(
+            "delivery_note", "purchase_requisition"
+        ).all():
+            if wo.delivery_note:
+                dn = DeliveryNote.objects.select_for_update().get(
+                    id=wo.delivery_note.id
+                )
+                dn.paid_amount = max(
+                    (dn.paid_amount or Decimal("0.00")) - wo.allocated_amount,
+                    Decimal("0.00"),
+                )
+                dn.save(update_fields=["paid_amount"])
+            elif wo.purchase_requisition:
+                pr = PurchaseRequisition.objects.select_for_update().get(
+                    id=wo.purchase_requisition.id
+                )
+                pr.paid_amount = max(
+                    (pr.paid_amount or Decimal("0.00")) - wo.allocated_amount,
+                    Decimal("0.00"),
+                )
+                pr.save(update_fields=["paid_amount"])
+
+        instance.checks.filter(is_active=True).update(is_active=False)
+        instance.is_active = False
+        instance.save(update_fields=["is_active"])
+
+        self._record_db_log(
+            instance,
+            user,
+            f"{full_username} 作廢了金流紀錄 #{instance.id} (金額 ${instance.amount}) 並回滾單據沖銷金額",
+        )
 
 
 class ProductPackageOrderRelationViewSet(CRUDAuditMixin, viewsets.ModelViewSet):

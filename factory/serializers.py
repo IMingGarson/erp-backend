@@ -1508,6 +1508,7 @@ class PurchaseRequisitionSerializer(serializers.ModelSerializer):
         max_digits=15, decimal_places=2, read_only=True
     )
     is_fully_paid = serializers.BooleanField(read_only=True)
+    payment_status = serializers.CharField(read_only=True)
 
     invoices = serializers.SerializerMethodField(read_only=True)
     invoices_payload = PurchaseInvoiceSerializer(
@@ -1946,9 +1947,6 @@ class PaymentMethodDetailSerializer(serializers.ModelSerializer):
             "id",
             "payment_method",
             "amount",
-            "fee",
-            "company_bank_account",
-            "note",
         ]
 
 
@@ -1972,11 +1970,8 @@ class PaymentCheckSerializer(serializers.ModelSerializer):
             "cleared_date",
             "is_cleared",
             "amount",
-            "note",
-            "fee",
             "issuer_bank",
-            "deposit_bank_account",
-            "title",
+            "note",
             "is_active",
         ]
         read_only_fields = ["payment_record"]
@@ -2020,7 +2015,6 @@ class PaymentWriteOffSerializer(serializers.ModelSerializer):
         model = PaymentWriteOff
         fields = [
             "id",
-            "payment_method",
             "delivery_note",
             "delivery_note_number",
             "delivery_note_date",
@@ -2053,12 +2047,7 @@ class PaymentRecordSerializer(serializers.ModelSerializer):
             "provider",
             "provider_name",
             "amount",
-            "total_fee",
-            "other_deduction",
-            "other_deduction_note",
-            "total_write_off_amount",
             "payment_method",
-            "check_info",
             "reference_notes",
             "method_details",
             "checks",
@@ -2084,7 +2073,6 @@ class PaymentRecordSerializer(serializers.ModelSerializer):
         return data
 
     def validate(self, data):
-        """簡單防呆：確認類型與對象是否有對應"""
         partner_type = data.get(
             "partner_type", getattr(self.instance, "partner_type", None)
         )
@@ -2108,76 +2096,46 @@ class PaymentRecordSerializer(serializers.ModelSerializer):
         write_offs_data = validated_data.pop("write_offs", [])
 
         total_actual_amount = Decimal("0.00")
-        total_fee = Decimal("0.00")
         active_methods = set()
 
-        method_available_pool = {
-            "CASH": Decimal("0.00"),
-            "TRANSFER": Decimal("0.00"),
-            "CHECK": Decimal("0.00"),
-            "OTHER": Decimal(str(validated_data.get("other_deduction") or "0.00")),
-        }
-
+        # 1. 統計現金與轉帳明細金額
         for md in method_details_data:
             m_type = md.get("payment_method")
             m_amt = Decimal(str(md.get("amount") or "0.00"))
-            m_fee = Decimal(str(md.get("fee") or "0.00"))
-            if m_amt > 0 or m_fee > 0:
+            if m_amt > 0:
                 active_methods.add(m_type)
                 total_actual_amount += m_amt
-                total_fee += m_fee
-                if m_type in method_available_pool:
-                    method_available_pool[m_type] += m_amt + m_fee
 
+        # 2. 統計支票金額，若 method_details 未包含 CHECK 則自動補入一筆彙整明細
         checks_amt_sum = sum(
             (Decimal(str(c.get("amount") or "0.00")) for c in checks_data),
             Decimal("0.00"),
         )
-        checks_fee_sum = sum(
-            (Decimal(str(c.get("fee") or "0.00")) for c in checks_data),
-            Decimal("0.00"),
-        )
-        if checks_data and "CHECK" not in active_methods:
+        if checks_amt_sum > 0 and "CHECK" not in active_methods:
             active_methods.add("CHECK")
             total_actual_amount += checks_amt_sum
-            total_fee += checks_fee_sum
-            method_available_pool["CHECK"] += checks_amt_sum + checks_fee_sum
             method_details_data.append(
                 {
                     "payment_method": "CHECK",
                     "amount": checks_amt_sum,
-                    "fee": checks_fee_sum,
-                    "company_bank_account": checks_data[0].get(
-                        "deposit_bank_account", ""
-                    ),
-                    "note": f"共 {len(checks_data)} 張支票",
                 }
             )
 
+        # 3. 決定主單的 payment_method 與總金額
         if method_details_data or checks_data:
             if len(active_methods) > 1:
                 validated_data["payment_method"] = "MIXED"
             elif len(active_methods) == 1:
                 validated_data["payment_method"] = list(active_methods)[0]
-
             validated_data["amount"] = total_actual_amount
-            validated_data["total_fee"] = total_fee
 
-        other_deduction = Decimal(str(validated_data.get("other_deduction") or "0.00"))
-        validated_data["total_write_off_amount"] = (
-            Decimal(str(validated_data.get("amount") or "0.00"))
-            + Decimal(str(validated_data.get("total_fee") or "0.00"))
-            + other_deduction
-        )
-
+        available_pool = Decimal(str(validated_data.get("amount") or "0.00"))
         payment_record = PaymentRecord.objects.create(**validated_data)
 
+        # 4. 建立付款方式明細與支票紀錄
         for md in method_details_data:
             md.pop("id", None)
-            if (
-                Decimal(str(md.get("amount") or 0)) > 0
-                or Decimal(str(md.get("fee") or 0)) > 0
-            ):
+            if Decimal(str(md.get("amount") or 0)) > 0:
                 PaymentMethodDetail.objects.create(payment_record=payment_record, **md)
 
         for chk in checks_data:
@@ -2186,29 +2144,14 @@ class PaymentRecordSerializer(serializers.ModelSerializer):
                 chk["received_date"] = payment_record.payment_date
             PaymentCheck.objects.create(payment_record=payment_record, **chk)
 
-        legacy_chk = validated_data.get("check_info")
-        if (
-            not checks_data
-            and isinstance(legacy_chk, dict)
-            and legacy_chk.get("cash_date")
-        ):
-            PaymentCheck.objects.create(
-                payment_record=payment_record,
-                check_number=legacy_chk.get("check_number", "未填票號"),
-                received_date=payment_record.payment_date,
-                due_date=legacy_chk.get("cash_date"),
-                is_cleared=bool(legacy_chk.get("is_cleared", False)),
-                amount=payment_record.amount,
-                issuer_bank=legacy_chk.get("target_bank", ""),
-                deposit_bank_account=legacy_chk.get("deposit_bank_account", ""),
-                title=legacy_chk.get("title", "基香食品"),
-            )
-
+        # 5. 總額水庫依序沖銷單據 (不論哪種付款方式，統一由 available_pool 扣抵)
         written_off_notes = []
 
         for wo in write_offs_data:
+            if available_pool <= Decimal("0.00"):
+                break
+
             wo.pop("id", None)
-            p_method = wo.get("payment_method", "TRANSFER")
             dn_obj = wo.get("delivery_note")
             pr_obj = wo.get("purchase_requisition")
             req_allocated = Decimal(str(wo.get("allocated_amount") or "0.00"))
@@ -2216,67 +2159,69 @@ class PaymentRecordSerializer(serializers.ModelSerializer):
             if dn_obj:
                 dn = DeliveryNote.objects.select_for_update().get(id=dn_obj.id)
                 unpaid = dn.unpaid_amount
+                if unpaid <= Decimal("0.00"):
+                    continue
 
-                if req_allocated > 0:
-                    actual_alloc = min(req_allocated, unpaid)
-                else:
-                    avail = method_available_pool.get(p_method, Decimal("0.00"))
-                    actual_alloc = min(unpaid, avail) if avail > 0 else unpaid
+                actual_alloc = (
+                    min(req_allocated, unpaid, available_pool)
+                    if req_allocated > Decimal("0.00")
+                    else min(unpaid, available_pool)
+                )
 
-                if actual_alloc > 0:
+                if actual_alloc > Decimal("0.00"):
                     dn.paid_amount = (dn.paid_amount or Decimal("0.00")) + actual_alloc
                     dn.save(update_fields=["paid_amount"])
-
-                    if p_method in method_available_pool:
-                        method_available_pool[p_method] = max(
-                            method_available_pool[p_method] - actual_alloc,
-                            Decimal("0.00"),
-                        )
+                    available_pool -= actual_alloc
 
                     PaymentWriteOff.objects.create(
                         payment_record=payment_record,
-                        payment_method=p_method,
                         delivery_note=dn,
                         allocated_amount=actual_alloc,
                     )
                     status_tag = (
-                        "結清" if dn.is_fully_paid else f"部分沖銷:${actual_alloc}"
+                        "已結清"
+                        if dn.is_fully_paid
+                        else f"部分銷帳:${actual_alloc}(尚欠:${dn.unpaid_amount})"
                     )
                     written_off_notes.append(f"{dn.note_number}({status_tag})")
 
             elif pr_obj:
                 pr = PurchaseRequisition.objects.select_for_update().get(id=pr_obj.id)
                 unpaid = pr.unpaid_amount
+                if unpaid <= Decimal("0.00"):
+                    continue
 
-                if req_allocated > 0:
-                    actual_alloc = min(req_allocated, unpaid)
-                else:
-                    avail = method_available_pool.get(p_method, Decimal("0.00"))
-                    actual_alloc = min(unpaid, avail) if avail > 0 else unpaid
+                actual_alloc = (
+                    min(req_allocated, unpaid, available_pool)
+                    if req_allocated > Decimal("0.00")
+                    else min(unpaid, available_pool)
+                )
 
-                if actual_alloc > 0:
+                if actual_alloc > Decimal("0.00"):
                     pr.paid_amount = (pr.paid_amount or Decimal("0.00")) + actual_alloc
                     pr.save(update_fields=["paid_amount"])
-
-                    if p_method in method_available_pool:
-                        method_available_pool[p_method] = max(
-                            method_available_pool[p_method] - actual_alloc,
-                            Decimal("0.00"),
-                        )
+                    available_pool -= actual_alloc
 
                     PaymentWriteOff.objects.create(
                         payment_record=payment_record,
-                        payment_method=p_method,
                         purchase_requisition=pr,
                         allocated_amount=actual_alloc,
                     )
                     status_tag = (
-                        "結清" if pr.is_fully_paid else f"部分沖銷:${actual_alloc}"
+                        "已結清"
+                        if pr.is_fully_paid
+                        else f"部分銷帳:${actual_alloc}(尚欠:${pr.unpaid_amount})"
                     )
                     written_off_notes.append(f"PR#{pr.id}({status_tag})")
 
-        if written_off_notes and not payment_record.reference_notes:
-            payment_record.reference_notes = "沖銷單據: " + ", ".join(written_off_notes)
+        if written_off_notes:
+            auto_summary = "沖銷單據: " + ", ".join(written_off_notes)
+            if payment_record.reference_notes:
+                payment_record.reference_notes = (
+                    f"{payment_record.reference_notes} | {auto_summary}"
+                )
+            else:
+                payment_record.reference_notes = auto_summary
             payment_record.save(update_fields=["reference_notes"])
 
         return payment_record
