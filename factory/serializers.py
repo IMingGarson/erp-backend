@@ -1257,6 +1257,7 @@ class VendorSerializer(serializers.ModelSerializer):
             "name",
             "code",
             "tax_id",
+            "should_impose_tax",
             "address",
             "phone",
             "contact_person",

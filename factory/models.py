@@ -64,6 +64,7 @@ class Vendor(models.Model):
         null=False,
         blank=False,
     )
+    should_impose_tax = models.BooleanField(default=True, verbose_name="是否課營業稅")
     tax_id = models.CharField(
         max_length=8, blank=True, null=True, verbose_name="統一編號"
     )
