@@ -411,43 +411,46 @@ class ProductionOrderViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     @transaction.atomic
     def replace_batch(self, request, pk=None):
         """
-        替換生產單與 MRP 中的原物料批號
-        並依據新舊使用量歸還與扣除庫存 (使用 select_for_update 避免 Race Condition)
-        包含嚴謹的 Try-Except 與 Rollback 機制。
+        替換生產單與 MRP 中的原物料批號 (支援一換多)
         """
         user = self.get_valid_user()
         po = self.get_object()
 
         material_code = request.data.get("material_code")
         old_batch_number = request.data.get("old_batch_number")
-        new_batch_number = request.data.get("new_batch_number")
+        old_used_qty_raw = request.data.get("old_used_qty", 0)
+        replacements = request.data.get(
+            "replacements", []
+        )  # [{ "batch_number": "...", "used_qty": ... }]
+
+        # 兼容舊版單筆 payload 格式
+        if not replacements and request.data.get("new_batch_number"):
+            replacements = [
+                {
+                    "batch_number": request.data.get("new_batch_number"),
+                    "used_qty": request.data.get("new_used_qty", 0),
+                }
+            ]
 
         try:
-            old_used_qty = Decimal(str(request.data.get("old_used_qty", 0)))
-            new_used_qty = Decimal(str(request.data.get("new_used_qty", 0)))
+            old_used_qty = Decimal(str(old_used_qty_raw))
         except (InvalidOperation, ValueError, TypeError):
             return Response(
-                {"error": "數量格式錯誤"}, status=status.HTTP_400_BAD_REQUEST
+                {"error": "舊數量格式錯誤"}, status=status.HTTP_400_BAD_REQUEST
             )
 
-        if not all([material_code, old_batch_number, new_batch_number]):
+        if not material_code or not old_batch_number or not replacements:
             return Response(
                 {"error": "缺少必要參數"}, status=status.HTTP_400_BAD_REQUEST
             )
 
-        if old_batch_number == new_batch_number:
+        if old_used_qty < 0:
             return Response(
-                {"error": "新舊批號相同，無需替換"}, status=status.HTTP_400_BAD_REQUEST
-            )
-
-        if old_used_qty < 0 or new_used_qty <= 0:
-            return Response(
-                {"error": "替換的新使用量必須大於零"},
-                status=status.HTTP_400_BAD_REQUEST,
+                {"error": "舊使用量不能為負數"}, status=status.HTTP_400_BAD_REQUEST
             )
 
         try:
-            # 1. 鎖定舊批號與新批號庫存
+            # 1. 鎖定舊批號庫存並歸還數量
             try:
                 old_batch = BatchInventory.objects.select_for_update().get(
                     batch_number=old_batch_number,
@@ -460,93 +463,120 @@ class ProductionOrderViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                     status=status.HTTP_404_NOT_FOUND,
                 )
 
-            try:
-                new_batch = BatchInventory.objects.select_for_update().get(
-                    batch_number=new_batch_number,
-                    material__code=material_code,
-                    is_active=True,
-                )
-            except BatchInventory.DoesNotExist:
-                return Response(
-                    {"error": f"找不到新批號庫存: {new_batch_number}"},
-                    status=status.HTTP_404_NOT_FOUND,
-                )
-
-            # 2. 驗證新批號的庫存是否足夠扣除
-            if new_batch.remaining_qty < new_used_qty:
-                return Response(
-                    {
-                        "error": f"新批號 {new_batch_number} 庫存不足 (當前剩餘: {new_batch.remaining_qty})"
-                    },
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-            # 3. 執行庫存增減
             old_batch.remaining_qty += old_used_qty
-            new_batch.remaining_qty -= new_used_qty
-
             old_batch.save(update_fields=["remaining_qty"])
-            new_batch.save(update_fields=["remaining_qty"])
 
-            # 4. 安全重建 JSON 陣列邏輯 (避免 remove 造成的重複或跳號)
+            processed_replacements = []
+
+            # 2. 驗證並扣除所有新替換批號的庫存
+            for rep in replacements:
+                new_b_num = rep.get("batch_number")
+                try:
+                    new_q = Decimal(str(rep.get("used_qty", 0)))
+                except (InvalidOperation, ValueError, TypeError):
+                    return Response(
+                        {"error": f"批號 {new_b_num} 數量格式錯誤"},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                if new_q <= 0:
+                    return Response(
+                        {"error": f"新批號 {new_b_num} 的使用量必須大於零"},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                try:
+                    new_batch = BatchInventory.objects.select_for_update().get(
+                        batch_number=new_b_num,
+                        material__code=material_code,
+                        is_active=True,
+                    )
+                except BatchInventory.DoesNotExist:
+                    return Response(
+                        {"error": f"找不到新批號庫存: {new_b_num}"},
+                        status=status.HTTP_404_NOT_FOUND,
+                    )
+
+                if new_batch.remaining_qty < new_q:
+                    return Response(
+                        {
+                            "error": f"新批號 {new_b_num} 庫存不足 (當前剩餘: {new_batch.remaining_qty})"
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                new_batch.remaining_qty -= new_q
+                new_batch.save(update_fields=["remaining_qty"])
+
+                processed_replacements.append(
+                    {"batch_obj": new_batch, "used_qty": new_q}
+                )
+
+            # 3. 更新 ProductionOrder 與 MRP 的 materials_info JSON
             def update_json_materials(materials_list):
                 for mat in materials_list:
                     if mat.get("code") == material_code:
                         batches = mat.get("batches", [])
-
-                        # 確認新批號是否已經在清單內
-                        exists_new = any(
-                            b.get("batch_number") == new_batch_number for b in batches
-                        )
                         updated_batches = []
 
                         for b in batches:
                             current_b_num = b.get("batch_number")
-
                             if current_b_num == old_batch_number:
-                                if exists_new:
-                                    # 情況 A: 新批號已在列表中，直接拋棄這個舊批號的節點 (合併效果)
-                                    pass
-                                else:
-                                    # 情況 B: 新批號不在列表中，將舊批號節點原址更新為新批號
-                                    b["id"] = new_batch.id
-                                    b["batch_number"] = new_batch.batch_number
-                                    b["used"] = str(new_used_qty)
-                                    b["available"] = float(new_batch.remaining_qty)
-                                    b["received_date"] = (
-                                        new_batch.received_date.strftime("%Y-%m-%d")
-                                        if new_batch.received_date
-                                        else None
-                                    )
-                                    updated_batches.append(b)
+                                continue  # 移除舊批號節點
 
-                            elif current_b_num == new_batch_number:
-                                # 累加到已存在的新批號節點上
+                            matched_rep = next(
+                                (
+                                    r
+                                    for r in processed_replacements
+                                    if r["batch_obj"].batch_number == current_b_num
+                                ),
+                                None,
+                            )
+                            if matched_rep:
                                 curr_used = Decimal(
                                     str(b.get("used", "0")).strip() or "0"
                                 )
-                                b["used"] = str(curr_used + new_used_qty)
-                                b["available"] = float(new_batch.remaining_qty)
+                                b["used"] = str(curr_used + matched_rep["used_qty"])
+                                b["available"] = float(
+                                    matched_rep["batch_obj"].remaining_qty
+                                )
                                 b["received_date"] = (
-                                    new_batch.received_date.strftime("%Y-%m-%d")
-                                    if new_batch.received_date
+                                    matched_rep["batch_obj"].received_date.strftime(
+                                        "%Y-%m-%d"
+                                    )
+                                    if matched_rep["batch_obj"].received_date
                                     else None
                                 )
-                                updated_batches.append(b)
+                                matched_rep["handled"] = True
+                            updated_batches.append(b)
 
-                            else:
-                                # 其他無關的批號，原封不動保留
-                                updated_batches.append(b)
+                        for rep in processed_replacements:
+                            if not rep.get("handled"):
+                                updated_batches.append(
+                                    {
+                                        "id": rep["batch_obj"].id,
+                                        "batch_number": rep["batch_obj"].batch_number,
+                                        "used": str(rep["used_qty"]),
+                                        "available": float(
+                                            rep["batch_obj"].remaining_qty
+                                        ),
+                                        "received_date": (
+                                            rep["batch_obj"].received_date.strftime(
+                                                "%Y-%m-%d"
+                                            )
+                                            if rep["batch_obj"].received_date
+                                            else None
+                                        ),
+                                    }
+                                )
 
                         mat["batches"] = updated_batches
 
-            # 5. 更新 ProductionOrder 的 materials_info JSON
             po_materials = po.materials_info or []
             update_json_materials(po_materials)
             po.materials_info = po_materials
             po.save(update_fields=["materials_info"])
 
-            # 6. 同步更新關聯的 MRP JSON
             try:
                 mrp = MaterialRequirementPlan.objects.get(
                     mrp_id=po.order_number, is_active=True
@@ -555,19 +585,19 @@ class ProductionOrderViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 update_json_materials(mrp_info)
                 mrp.batch_inventory_info = mrp_info
                 mrp.save(update_fields=["batch_inventory_info"])
-                self._record_db_log(
-                    mrp,
-                    user,
-                    f"{user.last_name}{user.first_name} 同步更新了 MRP {mrp.mrp_id} 的批號分配",
-                )
             except MaterialRequirementPlan.DoesNotExist:
                 pass
 
-            # 7. 寫入生產單修改日誌
+            rep_summary = ", ".join(
+                [
+                    f"{r['batch_obj'].batch_number} (用量 {r['used_qty']})"
+                    for r in processed_replacements
+                ]
+            )
             self._record_db_log(
                 po,
                 user,
-                f"{user.last_name}{user.first_name} 替換了生產單 {po.order_number} 內物料 [{material_code}] 的批號，將 {old_batch_number} (用量 {old_used_qty}) 替換為 {new_batch_number} (用量 {new_used_qty})",
+                f"{user.last_name}{user.first_name} 替換了生產單 {po.order_number} 內物料 [{material_code}] 的批號，將 {old_batch_number} (用量 {old_used_qty}) 替換為: {rep_summary}",
             )
 
             return Response(
@@ -575,12 +605,7 @@ class ProductionOrderViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
             )
 
         except Exception as e:
-            # 發生任何未預期的 Error，強制觸發 Rollback，確保庫存不被錯誤寫入
             transaction.set_rollback(True)
-            import logging
-
-            logger = logging.getLogger(__name__)
-            logger.error(f"Replace batch API failed: {e!s}")
             return Response(
                 {"error": f"系統發生未預期錯誤，已自動還原庫存 ({e!s})"},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
