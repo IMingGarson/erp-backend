@@ -679,11 +679,35 @@ class MaterialSerializer(serializers.ModelSerializer):
         return instance
 
 
+class PurchaseRequisitionItemSimpleSerializer(serializers.ModelSerializer):
+    requisition_id = serializers.ReadOnlyField(source="requisition.id")
+
+    class Meta:
+        model = PurchaseRequisitionItem
+        fields = [
+            "id",
+            "requisition_id",
+            "total_received_qty",
+            "is_fully_received",
+            "quantity",
+        ]
+
+
 class BatchInventorySerializer(serializers.ModelSerializer):
     material_id = serializers.CharField(source="material.id", read_only=True)
     material_name = serializers.CharField(source="material.name", read_only=True)
     unit = serializers.CharField(source="material.unit", read_only=True)
     material_type = serializers.CharField(source="material.type", read_only=True)
+    source_pr_item_id = serializers.PrimaryKeyRelatedField(
+        queryset=PurchaseRequisitionItem.objects.all(),
+        source="source_pr_item",
+        required=False,
+        allow_null=True,
+        write_only=True,
+    )
+    source_pr_item_detail = PurchaseRequisitionItemSimpleSerializer(
+        source="source_pr_item", read_only=True
+    )
 
     class Meta:
         model = BatchInventory
@@ -710,6 +734,9 @@ class BatchInventorySerializer(serializers.ModelSerializer):
             "aux_unit",
             "aux_quantity",
             "note",
+            "source_pr_item",
+            "source_pr_item_id",
+            "source_pr_item_detail",
         ]
         read_only_fields = ["id", "created_at", "updated_at", "created_by"]
 
