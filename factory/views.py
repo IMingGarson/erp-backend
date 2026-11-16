@@ -56,6 +56,7 @@ from .models import (
     PackageOrderLog,
     PaymentRecord,
     PaymentRecordLog,
+    PaymentWriteOff,
     ProductionLog,
     ProductionOrder,
     ProductPackageOrderRelation,
@@ -69,7 +70,7 @@ from .models import (
     Vendor,
     VendorLog,
 )
-from .permissions import IsAdminOrEmployerOrReadOnly, IsRDOrReadOnly
+from .permissions import IsRDOrReadOnly
 from .serializers import (
     BatchInventorySerializer,
     BatchQCRecordSerializer,
@@ -961,6 +962,17 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         created_pos.append(parent_po)
         mrp_to_po_map[parent_mrp.mrp_id] = parent_po
 
+        BatchInventory.objects.get_or_create(
+            material=parent_po.product,
+            batch_number=parent_po.order_number,
+            defaults={
+                "original_qty": parent_po.target_qty,
+                "remaining_qty": parent_po.target_qty,
+                "received_date": timezone.now().date(),
+                "created_by": user,
+            },
+        )
+
         def create_child_pos(current_mrp_id, current_po):
             if current_mrp_id not in children_by_parent:
                 return
@@ -1007,6 +1019,19 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 )
                 mrp_to_po_map[child_mrp.mrp_id] = child_po
                 created_pos.append(child_po)
+
+                # 只有當子單產品類型為 SEMI (半成品) 時，才額外建立內部批號庫存
+                if child_po.product.type == "SEMI":
+                    BatchInventory.objects.get_or_create(
+                        material=child_po.product,
+                        batch_number=child_po.order_number,
+                        defaults={
+                            "original_qty": child_po.target_qty,
+                            "remaining_qty": child_po.target_qty,
+                            "received_date": timezone.now().date(),
+                            "created_by": user,
+                        },
+                    )
 
                 # 🌟 3. 在母單中加入這層子單的追蹤資訊，若為包裝單則換上專屬的標示
                 display_type = "PACKAGING" if is_packaging else "CHILD_PRODUCT"
@@ -2489,7 +2514,80 @@ class DeliveryNoteViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     search_fields = ["note_number"]
 
     def get_permissions(self):
-        return [IsAuthenticated(), IsAdminOrEmployerOrReadOnly()]
+        return [IsAuthenticated()]
+        # return [IsAuthenticated(), IsAdminOrEmployerOrReadOnly()]
+
+    @action(detail=True, methods=["post"], url_path="goods_movement")
+    @transaction.atomic
+    def goods_movement(self, request, pk=None):
+        """
+        處理銷貨單的貨品異動（退貨或折讓）
+        - 記錄異動類型、應退金額、退回庫存量
+        - 庫存端：自動將退回庫存量加回對應生產批號的 BatchInventory 庫存中
+        - 業務端：透過 ProductionOrder 的屬性連動，退回的數量會自動釋放剩餘可出貨量 (remaining_qty)
+        """
+        note = self.get_object()
+        return_type = request.data.get("return_type")  # 'RETURN' 或 'ALLOWANCE'
+        return_amount = request.data.get("return_amount", 0)
+        return_qty = request.data.get("return_qty", 0)
+
+        if return_type not in ["RETURN", "ALLOWANCE"]:
+            return Response(
+                {"error": "無效的異動類型"}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            amt = Decimal(str(return_amount))
+            qty = Decimal(str(return_qty))
+        except (InvalidOperation, ValueError, TypeError):
+            return Response(
+                {"error": "金額或數量格式錯誤"}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if amt < 0 or qty < 0:
+            return Response(
+                {"error": "金額與數量不得為負數"}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if not note.production_order:
+            return Response(
+                {"error": "找不到關聯的生產單資料"}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        batch_number = note.production_order.order_number
+        product = note.production_order.product
+
+        # 1. 庫存端聯動：若有輸入退回庫存量，將重量加回 BatchInventory
+        if qty > 0:
+            try:
+                batch_inv = BatchInventory.objects.select_for_update().get(
+                    batch_number=batch_number,
+                    material=product,
+                    is_active=True,
+                )
+                batch_inv.remaining_qty += qty
+                batch_inv.save(update_fields=["remaining_qty"])
+            except BatchInventory.DoesNotExist:
+                raise ValidationError(
+                    f"找不到對應的生產批號庫存: {batch_number} (物料: {product.name})，無法執行退回庫存重補。"
+                )
+
+        # 2. 更新銷貨單異動資料 (包含應退金額與退回庫存量)
+        note.return_type = return_type
+        note.return_amount = amt
+        note.return_qty = qty
+        note.save(update_fields=["return_type", "return_amount", "return_qty"])
+
+        user = self.get_valid_user()
+        action_name = "退貨" if return_type == "RETURN" else "折讓"
+        self._record_db_log(
+            note,
+            user,
+            f"{user.last_name}{user.first_name} 對銷貨單 {note.note_number} 執行了{action_name}異動，應退金額: ${amt}，退回庫存量: {qty} (批號: {batch_number})",
+        )
+
+        serializer = self.get_serializer(note)
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
     @transaction.atomic
     def perform_create(self, serializer):
@@ -2510,9 +2608,43 @@ class DeliveryNoteViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
         new_note_number = f"{today_str}{sequence:04d}"
 
-        instance = serializer.save(created_by=user, note_number=new_note_number)
+        # 1. 取得該銷貨單對應的生產單與出貨數量
+        production_order = serializer.validated_data.get("production_order")
+        quantity = serializer.validated_data.get("quantity", Decimal(0))
+        batch_number = production_order.order_number
+
+        # 2. 檢查並扣除對應生產批號庫存 (BatchInventory)
+        product = production_order.product
+        try:
+            batch_inv = BatchInventory.objects.select_for_update().get(
+                batch_number=batch_number,
+                material=product,
+                is_active=True,
+            )
+        except BatchInventory.DoesNotExist:
+            raise ValidationError(
+                f"找不到對應的生產批號庫存: {batch_number} (物料: {product.name})，無法進行出貨扣庫。"
+            )
+
+        if batch_inv.remaining_qty < quantity:
+            raise ValidationError(
+                f"批號 {batch_number} 庫存不足！當前剩餘: {batch_inv.remaining_qty}，但銷貨數量為: {quantity}"
+            )
+
+        batch_inv.remaining_qty -= quantity
+        batch_inv.save(update_fields=["remaining_qty"])
+
+        # 3. 儲存銷貨單，並自動帶入對應的 batch_number
+        instance = serializer.save(
+            created_by=user,
+            note_number=new_note_number,
+            batch_number=batch_number,
+        )
+
         self._record_db_log(
-            instance, user, f"{user.last_name}{user.first_name} 建立了此銷貨單"
+            instance,
+            user,
+            f"{user.last_name}{user.first_name} 建立了銷貨單 {new_note_number}，並扣除生產批號 {batch_number} 庫存量: {quantity}",
         )
 
 
@@ -3025,21 +3157,33 @@ class AccountingReportViewSet(viewsets.ViewSet):
         debt_list = []
 
         for customer in customers:
-            # 1. 歷史總應收 (從所有銷貨單加總)
+            # 1. 歷史總應收 (從所有無異常銷貨單加總)
             total_ar = (
                 DeliveryNote.objects.filter(
-                    is_active=True, customer_info__code=customer.code
+                    is_active=True,
+                    customer_info__code=customer.code,
+                    return_type__isnull=True,
                 ).aggregate(total=Sum("grand_total"))["total"]
                 or 0
             )
 
             # 2. 歷史總已收 (從金流表加總)
-            total_paid = (
-                PaymentRecord.objects.filter(
-                    is_active=True, partner_type="CUSTOMER", customer=customer
-                ).aggregate(total=Sum("amount"))["total"]
-                or 0
-            )
+            # total_paid = (
+            #     PaymentRecord.objects.filter(
+            #         is_active=True, partner_type="CUSTOMER", customer=customer
+            #     ).aggregate(total=Sum("amount"))["total"]
+            #     or 0
+            # )
+
+            total_paid = PaymentWriteOff.objects.filter(
+                payment_record__is_active=True,
+                payment_record__partner_type="CUSTOMER",
+                payment_record__customer=customer,
+                delivery_note__customer_info__code=customer.code,
+            ).exclude(
+                delivery_note__return_type__isnull=False,
+                delivery_note__return_amount__gt=0,
+            ).aggregate(total=Sum("allocated_amount"))["total"] or Decimal("0.00")
 
             # 3. 算出累積欠額
             debt = float(total_ar) - float(total_paid)
@@ -3103,6 +3247,9 @@ class AccountingReportViewSet(viewsets.ViewSet):
                     "customer_address": note.customer_info.get("address", ""),
                     "customer_tax_id": note.customer_info.get("tax_id", ""),
                     "customer_phone": note.customer_info.get("phone", ""),
+                    "customer_should_impose_tax": note.customer_info.get(
+                        "should_impose_tax", True
+                    ),
                     "total_sales_amount": 0.0,
                     "total_tax_amount": 0.0,
                     "grand_total": 0.0,
@@ -3111,15 +3258,23 @@ class AccountingReportViewSet(viewsets.ViewSet):
                     "delivery_notes": [],
                 }
 
-            total_amt = float(note.total_amount or 0)
-            tax_amt = float(note.tax_amount or 0)
-            grand_total = float(note.grand_total or 0)
-            paid_amt = float(note.paid_amount or 0)
-            unpaid_amt = float(note.unpaid_amount or 0)
+            total_amt = float(note.total_amount or 0) if note.return_type == None else 0
+            tax_amt = float(note.tax_amount or 0) if note.return_type == None else 0
+            net_grand_total = float(note.net_grand_total)
+            # 付款金額：異常狀態訂單則是為 paid_amount - return_amount
+            paid_amt = (
+                float(note.paid_amount or 0)
+                if note.return_type == None
+                else float(note.paid_amount or 0) - float(note.return_amount or 0)
+            )
+            # 尚未付款金額：有異常直接設定為0
+            unpaid_amt = (
+                float(note.unpaid_amount or 0) if note.return_type == None else 0
+            )
 
+            ar_data[c_code]["grand_total"] += net_grand_total
             ar_data[c_code]["total_sales_amount"] += total_amt
             ar_data[c_code]["total_tax_amount"] += tax_amt
-            ar_data[c_code]["grand_total"] += grand_total
             ar_data[c_code]["total_paid_amount"] += paid_amt
             ar_data[c_code]["total_unpaid_amount"] += unpaid_amt
 
@@ -3140,12 +3295,13 @@ class AccountingReportViewSet(viewsets.ViewSet):
                     "spec": note.spec or "",
                     "quantity": float(note.quantity or 0),
                     "unit": note.unit or "",
-                    "total_amount": total_amt,
-                    "tax_amount": tax_amt,
-                    "grand_total": grand_total,
+                    "grand_total": net_grand_total,  # 帶入淨總額
                     "paid_amount": paid_amt,
                     "unpaid_amount": unpaid_amt,
-                    "payment_status": note_status,  # UNPAID(未付款) / PARTIAL(仍欠款) / PAID(已付款)
+                    "payment_status": note_status,
+                    "return_type": note.return_type,
+                    "return_amount": float(note.return_amount or 0),
+                    "return_qty": float(note.return_qty or 0),
                 }
             )
 

@@ -894,23 +894,23 @@ class ProductionOrder(models.Model):
 
     @property
     def active_delivered_qty(self):
-        """計算當前有效的累計出貨量"""
-        return (
-            self.delivery_notes.filter(is_active=True).aggregate(total=Sum("quantity"))[
-                "total"
-            ]
-            or 0
+        """計算當前有效的累計淨出貨量（總出貨量 - 退貨量）"""
+        aggregates = self.delivery_notes.filter(is_active=True).aggregate(
+            total_qty=Sum("quantity"), total_return=Sum("return_qty")
         )
+        total_qty = aggregates["total_qty"] or Decimal("0.0000")
+        total_return = aggregates["total_return"] or Decimal("0.0000")
+        return max(total_qty - total_return, Decimal("0.0000"))
 
     @property
     def is_fully_delivered(self):
-        """檢查該生產單的累計出貨量是否已經達到 target_qty"""
+        """檢查該生產單的累計淨出貨量是否已經達到 target_qty"""
         return self.active_delivered_qty >= self.target_qty
 
     @property
     def remaining_qty(self):
-        """計算還剩下多少數量未出貨"""
-        return max(self.target_qty - self.active_delivered_qty, 0)
+        """計算還剩下多少數量未出貨（若有退貨會自動加回額度）"""
+        return max(self.target_qty - self.active_delivered_qty, Decimal("0.0000"))
 
 
 class LogisticsOrder(models.Model):
@@ -1297,6 +1297,22 @@ class DeliveryNote(models.Model):
         default=Decimal("0.00"),
         verbose_name="已銷帳金額",
     )
+    # 貨品異動（退貨/折讓）相關欄位
+    return_type = models.CharField(
+        max_length=20, blank=True, null=True, verbose_name="異動類型"
+    )
+    return_amount = models.DecimalField(
+        max_digits=15,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        verbose_name="應退金額",
+    )
+    return_qty = models.DecimalField(
+        max_digits=15,
+        decimal_places=4,
+        default=Decimal("0.00"),
+        verbose_name="退回庫存量",
+    )
     document_note = models.TextField(blank=True, null=True, verbose_name="單據備註")
     created_by = models.ForeignKey(User, on_delete=models.DO_NOTHING)
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
@@ -1308,11 +1324,32 @@ class DeliveryNote(models.Model):
         verbose_name = "銷貨單"
 
     @property
-    def unpaid_amount(self):
-        """計算該銷貨單尚未沖銷的欠款餘額"""
-        total = self.grand_total or Decimal("0.00")
+    def net_grand_total(self):
+        """
+        會計與進銷存核心計算邏輯：
+        1. 若為「未付款」狀態 (paid_amount <= 0) 且發生退貨/折讓 (return_type 存在)，
+           該筆銷貨單金額直接不納入考慮，淨額視為 0。
+        2. 若為「已付款過」狀態 (paid_amount > 0) 且發生退貨/折讓，
+           則以原始總額 (grand_total) 扣除前端輸入的應退/折讓金額 (return_amount)。
+        3. 若無任何異動，則回傳原始總額 (grand_total)。
+        """
+        base_total = self.grand_total or Decimal("0.00")
         paid = self.paid_amount or Decimal("0.00")
-        return max(total - paid, Decimal("0.00"))
+
+        # 規則 1：未付款且有異動，金額直接歸零（不納入應收）
+        if paid <= 0 and self.return_type:
+            return Decimal("0.00")
+
+        # 規則 2：已付款過且有異動，扣除應退/折讓金額
+        ret_amt = self.return_amount or Decimal("0.00")
+        return max(base_total - ret_amt, Decimal("0.00"))
+
+    @property
+    def unpaid_amount(self):
+        """計算該銷貨單尚未沖銷的欠款餘額（直接連動 net_grand_total）"""
+        total = self.net_grand_total
+        paid = self.paid_amount or Decimal("0.00")
+        return total - paid
 
     @property
     def is_fully_paid(self):

@@ -1526,6 +1526,9 @@ class PurchaseRequisitionSerializer(serializers.ModelSerializer):
 
 
 class DeliveryNoteSerializer(serializers.ModelSerializer):
+    net_grand_total = serializers.DecimalField(
+        max_digits=15, decimal_places=2, read_only=True
+    )
     unpaid_amount = serializers.DecimalField(
         max_digits=15, decimal_places=2, read_only=True
     )
@@ -1542,6 +1545,16 @@ class DeliveryNoteSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
+    def validate_return_amount(self, value):
+        if value is not None and value < 0:
+            raise serializers.ValidationError("應退金額不得為負數。")
+        return value
+
+    def validate_return_qty(self, value):
+        if value is not None and value < 0:
+            raise serializers.ValidationError("退回庫存量不得為負數。")
+        return value
 
     def to_representation(self, instance):
         response = super().to_representation(instance)
@@ -1990,6 +2003,9 @@ class PaymentCheckSerializer(serializers.ModelSerializer):
 
 class PaymentWriteOffSerializer(serializers.ModelSerializer):
     id = serializers.IntegerField(required=False, allow_null=True)
+    delivery_note_return_type = serializers.CharField(
+        source="delivery_note.return_type", read_only=True
+    )
     delivery_note_number = serializers.CharField(
         source="delivery_note.note_number", read_only=True
     )
@@ -2018,6 +2034,7 @@ class PaymentWriteOffSerializer(serializers.ModelSerializer):
             "id",
             "delivery_note",
             "delivery_note_number",
+            "delivery_note_return_type",
             "delivery_note_date",
             "delivery_note_grand_total",
             "purchase_requisition",
