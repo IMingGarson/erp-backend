@@ -864,6 +864,8 @@ class ProductionOrder(models.Model):
         blank=True,
         verbose_name="實際生產量",
     )
+    is_completed = models.BooleanField(default=False, verbose_name="是否完工")
+    completed_date = models.DateField(null=True, blank=True, verbose_name="完工日期")
     qc_metrics = models.JSONField(
         blank=True,
         null=True,

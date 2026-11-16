@@ -409,6 +409,50 @@ class ProductionOrderViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
             .prefetch_related(active_snapshots_prefetch)
         )
 
+    @action(detail=False, methods=["get"], url_path="progress_report")
+    def progress_report(self, request):
+        """
+        產出生產單進度報表（對應每月報表與截圖格式）
+        預設抓取過去一個月
+        """
+        start_date = request.query_params.get("start_date")
+        end_date = request.query_params.get("end_date")
+
+        queryset = self.get_queryset()
+
+        if not start_date and not end_date:
+            today = timezone.now().date()
+            start_date = (today - timedelta(days=30)).strftime("%Y-%m-%d")
+            end_date = today.strftime("%Y-%m-%d")
+
+        if start_date:
+            queryset = queryset.filter(created_at__date__gte=start_date)
+        if end_date:
+            queryset = queryset.filter(created_at__date__lte=end_date)
+
+        queryset = queryset.filter(parent_id__isnull=True)
+        report_data = []
+        for po in queryset.order_by("created_at"):
+            report_data.append(
+                {
+                    "created_at": po.created_at.strftime("%Y/%m/%d")
+                    if po.created_at
+                    else "",
+                    "order_number": po.order_number or "",
+                    "material_code": po.product.code if po.product else "",
+                    "material_name": po.product.name if po.product else "",
+                    "target_qty": float(po.target_qty) if po.target_qty else 0.0,
+                    "actual_qty": float(po.actual_qty)
+                    if po.actual_qty is not None
+                    else 0.0,
+                    "completed_date": po.completed_date.strftime("%Y/%m/%d")
+                    if po.completed_date
+                    else "",
+                }
+            )
+
+        return Response(report_data, status=status.HTTP_200_OK)
+
     @action(detail=True, methods=["post"], url_path="replace_batch")
     @transaction.atomic
     def replace_batch(self, request, pk=None):

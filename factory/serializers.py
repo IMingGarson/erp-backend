@@ -1195,7 +1195,6 @@ class ProductionOrderSerializer(serializers.ModelSerializer):
     remaining_qty = serializers.DecimalField(
         max_digits=15, decimal_places=4, read_only=True
     )
-    # 🌟 移除原本直接關聯的 serializer，改用 method
     active_nutrition_snapshot = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
@@ -1209,6 +1208,8 @@ class ProductionOrderSerializer(serializers.ModelSerializer):
             "product_profile",
             "target_qty",
             "actual_qty",
+            "is_completed",
+            "completed_date",
             "materials_info",
             "vendor_info",
             "is_fully_delivered",
@@ -1221,7 +1222,7 @@ class ProductionOrderSerializer(serializers.ModelSerializer):
             "is_active",
             "qc_metrics",
             "qc_passed",
-            "active_nutrition_snapshot",  # 🌟 替換成這個欄位
+            "active_nutrition_snapshot",
         ]
 
     def get_creator_name(self, obj):
