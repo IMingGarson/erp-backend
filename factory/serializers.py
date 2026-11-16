@@ -1315,28 +1315,11 @@ class PurchaseRequisitionItemSerializer(serializers.ModelSerializer):
     material_name = serializers.ReadOnlyField()
     provider_name = serializers.SerializerMethodField()
 
-    actual_in_stock_spec = serializers.CharField(
-        source="generated_batch.in_stock_spec", read_only=True
+    generated_batches = BatchInventorySerializer(many=True, read_only=True)
+    total_received_qty = serializers.DecimalField(
+        max_digits=15, decimal_places=4, read_only=True
     )
-    actual_package_qty = serializers.DecimalField(
-        source="generated_batch.package_qty",
-        max_digits=10,
-        decimal_places=2,
-        read_only=True,
-    )
-    actual_aux_unit = serializers.CharField(
-        source="generated_batch.aux_unit", read_only=True
-    )
-    actual_quantity = serializers.DecimalField(
-        source="generated_batch.original_qty",
-        max_digits=15,
-        decimal_places=4,
-        read_only=True,
-    )
-    batch_number = serializers.CharField(
-        source="generated_batch.batch_number", read_only=True
-    )
-    batch_note = serializers.CharField(source="generated_batch.note", read_only=True)
+    is_fully_received = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = PurchaseRequisitionItem
@@ -1355,12 +1338,9 @@ class PurchaseRequisitionItemSerializer(serializers.ModelSerializer):
             "package_qty",
             "aux_unit",
             "aux_quantity",
-            "actual_in_stock_spec",
-            "actual_package_qty",
-            "actual_aux_unit",
-            "actual_quantity",
-            "batch_number",
-            "batch_note",
+            "generated_batches",
+            "total_received_qty",
+            "is_fully_received",
         ]
 
     def get_provider_name(self, obj):
@@ -1404,6 +1384,7 @@ class PurchaseInvoiceSerializer(serializers.ModelSerializer):
             "id",
             "invoice_number",
             "invoice_date",
+            "period",
             "buyer_title",
             "buyer_tax_id",
             "provider",

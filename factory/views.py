@@ -63,6 +63,7 @@ from .models import (
     ProductPackageOrderRelationLog,
     ProductProfile,
     PurchaseInvoice,
+    PurchaseInvoiceItem,
     PurchaseInvoiceLog,
     PurchaseRequisition,
     PurchaseRequisitionItem,
@@ -2392,10 +2393,12 @@ class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
     def get_queryset(self):
         active_items_prefetch = Prefetch(
-            "items", queryset=PurchaseRequisitionItem.objects.filter(is_active=True)
+            "items",
+            queryset=PurchaseRequisitionItem.objects.filter(
+                is_active=True
+            ).prefetch_related("generated_batches"),
         )
 
-        # 預載 items 以及綁定的 invoices，避免 N+1
         queryset = PurchaseRequisition.objects.filter(is_active=True).prefetch_related(
             active_items_prefetch, "invoices"
         )
@@ -2414,7 +2417,6 @@ class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 two_weeks_ago = today - timedelta(days=365)
                 queryset = queryset.filter(request_date__range=[two_weeks_ago, today])
 
-            # 給會計沖銷用的篩選：只列出尚未付清的單據 (利用 annotate 比較 grand_total 與 paid_amount)
             if unpaid_only == "true":
                 queryset = queryset.annotate(
                     calc_grand_total=Sum(
@@ -2432,7 +2434,9 @@ class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     @transaction.atomic
     def perform_create(self, serializer):
         user = self.get_valid_user()
+        full_username = f"{user.last_name}{user.first_name}"
         items_data = serializer.validated_data.pop("items", [])
+        invoices_payload = serializer.validated_data.pop("invoices_payload", [])
 
         super().perform_create(serializer)
         instance = serializer.instance
@@ -2440,9 +2444,28 @@ class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         for item_data in items_data:
             PurchaseRequisitionItem.objects.create(requisition=instance, **item_data)
 
+        for inv_data in invoices_payload:
+            inv_items = inv_data.pop("items", [])
+            inv_data.pop("requisitions", None)  # 避免直接傳入
+            invoice = PurchaseInvoice.objects.create(created_by=user, **inv_data)
+            invoice.requisitions.set(
+                [instance]
+            )  # 🌟 修正：必須使用 .set() 處理 Many-to-Many
+            for inv_item in inv_items:
+                PurchaseInvoiceItem.objects.create(invoice=invoice, **inv_item)
+
+            PurchaseInvoiceLog.objects.create(
+                invoice=invoice,
+                user=user,
+                action_detail=f"{full_username} 建立了進貨發票 {invoice.invoice_number} (透過請購單 #{instance.id})",
+            )
+
     @transaction.atomic
     def perform_update(self, serializer):
+        user = self.get_valid_user()
+        full_username = f"{user.last_name}{user.first_name}"
         items_data = serializer.validated_data.pop("items", None)
+        invoices_payload = serializer.validated_data.pop("invoices_payload", None)
 
         super().perform_update(serializer)
         instance = serializer.instance
@@ -2472,6 +2495,49 @@ class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 if item_id not in incoming_item_ids:
                     item_instance.is_active = False
                     item_instance.save(update_fields=["is_active"])
+
+        if invoices_payload is not None:
+            for inv_data in invoices_payload:
+                inv_id = inv_data.get("id")
+                inv_number = inv_data.get("invoice_number", "").strip()
+                inv_items = inv_data.pop("items", [])
+                inv_data.pop("requisitions", None)
+
+                invoice = None
+                if inv_id:
+                    invoice = PurchaseInvoice.objects.filter(
+                        id=inv_id, is_active=True
+                    ).first()
+                elif inv_number:
+                    invoice = PurchaseInvoice.objects.filter(
+                        invoice_number=inv_number, is_active=True
+                    ).first()
+
+                if invoice:
+                    for attr, value in inv_data.items():
+                        setattr(invoice, attr, value)
+                    invoice.save()
+                    invoice.requisitions.add(instance)
+
+                    PurchaseInvoiceLog.objects.create(
+                        invoice=invoice,
+                        user=user,
+                        action_detail=f"{full_username} 更新了進貨發票 {invoice.invoice_number} (透過請購單 #{instance.id})",
+                    )
+                else:
+                    inv_data.pop("id", None)
+                    invoice = PurchaseInvoice.objects.create(
+                        created_by=user, **inv_data
+                    )
+                    invoice.requisitions.add(instance)
+                    for inv_item in inv_items:
+                        PurchaseInvoiceItem.objects.create(invoice=invoice, **inv_item)
+
+                    PurchaseInvoiceLog.objects.create(
+                        invoice=invoice,
+                        user=user,
+                        action_detail=f"{full_username} 建立了進貨發票 {invoice.invoice_number} (透過請購單 #{instance.id})",
+                    )
 
 
 class DeliveryNoteFilter(filters.FilterSet):

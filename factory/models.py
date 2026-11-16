@@ -731,12 +731,13 @@ class BatchInventory(models.Model):
         verbose_name="單件基本重",
     )
     note = models.TextField(blank=True, null=True, verbose_name="進貨備註")
-    source_pr_item = models.OneToOneField(
+    source_pr_item = models.ForeignKey(
         "PurchaseRequisitionItem",
         on_delete=models.DO_NOTHING,
         null=True,
         blank=True,
-        related_name="generated_batch",
+        related_name="generated_batches",
+        verbose_name="關聯採購明細",
     )
 
     def __str__(self):
@@ -1131,6 +1132,18 @@ class PurchaseRequisitionItem(models.Model):
     def material_name(self):
         return self.material.name if self.material else ""
 
+    @property
+    def total_received_qty(self):
+        """計算此採購明細已累計入庫的總數量（支援多次分批入庫加總）"""
+        return self.generated_batches.filter(is_active=True).aggregate(
+            total=Sum("original_qty")
+        )["total"] or Decimal("0.00")
+
+    @property
+    def is_fully_received(self):
+        """檢查是否已全數交貨達標"""
+        return self.total_received_qty >= self.quantity
+
     def __str__(self):
         return f"{self.requisition.id} - {self.material_name}"
 
@@ -1150,6 +1163,9 @@ class PurchaseInvoice(models.Model):
         max_length=50, db_index=True, verbose_name="發票號碼"
     )
     invoice_date = models.DateField(verbose_name="發票日期")
+    period = models.CharField(
+        max_length=30, blank=True, null=True, verbose_name="發票期號"
+    )
     buyer_title = models.CharField(
         max_length=100, default="基香食品", verbose_name="買受人抬頭"
     )
