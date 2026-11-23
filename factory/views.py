@@ -1320,6 +1320,86 @@ class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         )
         return float(latest.purchased_price) if latest else 0.0
 
+    def _with_product_semi_prefetch(self, queryset):
+        return queryset.prefetch_related(
+            Prefetch(
+                "package_relations",
+                queryset=ProductPackageOrderRelation.objects.filter(
+                    is_active=True
+                ).select_related("semi_material"),
+            )
+        )
+
+    def _sync_ingredients_from_raw_materials(self, material, raw_material_ids, user):
+        if raw_material_ids is None:
+            return
+
+        target_ingredients = []
+        for raw_id in raw_material_ids:
+            raw_mat = Material.objects.filter(
+                id=raw_id, type="RAW", is_active=True
+            ).first()
+            if not raw_mat:
+                continue
+
+            ing = Ingredient.objects.filter(
+                source_material=raw_mat, is_active=True
+            ).first()
+            if not ing:
+                ing = Ingredient.objects.create(
+                    name=raw_mat.name,
+                    source_type="MANUAL",
+                    nutrition_fact=raw_mat.nutrition_fact or {},
+                    allergen_info=raw_mat.allergen_info or "",
+                    is_additive=getattr(raw_mat, "is_additive", False),
+                    legal_limit_percent=getattr(raw_mat, "legal_limit_percent", None),
+                    additive_license_no=getattr(raw_mat, "additive_license_no", "")
+                    or "",
+                    license_valid_date=getattr(raw_mat, "license_valid_date", None),
+                    source_material=raw_mat,
+                    created_by=user,
+                )
+            target_ingredients.append(ing)
+
+        target_ing_ids = {ing.id for ing in target_ingredients}
+
+        for assoc in material.material_ingredients.filter(is_active=True):
+            if assoc.ingredient_id not in target_ing_ids:
+                assoc.is_active = False
+                assoc.save(update_fields=["is_active"])
+
+        for ing in target_ingredients:
+            assoc, created = MaterialIngredient.objects.get_or_create(
+                material=material,
+                ingredient=ing,
+                defaults={"is_active": True},
+            )
+            if not created and not assoc.is_active:
+                assoc.is_active = True
+                assoc.save(update_fields=["is_active"])
+
+        material.recalculate_from_ingredients()
+
+    def _apply_raw_material_source(self, serializer):
+        source_mat = serializer.validated_data.get("source_material")
+        if source_mat and source_mat.type == "RAW":
+            if not serializer.validated_data.get("name"):
+                serializer.validated_data["name"] = source_mat.name
+            if (
+                not serializer.validated_data.get("nutrition_fact")
+                and source_mat.nutrition_fact
+            ):
+                serializer.validated_data["nutrition_fact"] = source_mat.nutrition_fact
+            if (
+                not serializer.validated_data.get("allergen_info")
+                and source_mat.allergen_info
+            ):
+                serializer.validated_data["allergen_info"] = source_mat.allergen_info
+            if "is_additive" not in serializer.validated_data and hasattr(
+                source_mat, "is_additive"
+            ):
+                serializer.validated_data["is_additive"] = source_mat.is_additive
+
     @action(detail=False, methods=["get"], url_path="active_alerts")
     def active_alerts(self, request):
         """主動預警：抓出有漲跌幅的原料，確保同原料的多家供應商都能獨立顯示"""

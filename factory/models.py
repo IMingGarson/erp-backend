@@ -242,6 +242,21 @@ class Material(models.Model):
         help_text="僅標籤(STICKER)適用，預期格式包含 manufacturer, tel, fax, address",
     )
 
+    is_additive = models.BooleanField(default=False, verbose_name="是否為法規添加物")
+    legal_limit_percent = models.DecimalField(
+        max_digits=6,
+        decimal_places=4,
+        null=True,
+        blank=True,
+        verbose_name="法規上限(%)",
+    )
+    additive_license_no = models.CharField(
+        max_length=100, blank=True, null=True, verbose_name="許可證號"
+    )
+    license_valid_date = models.DateField(
+        blank=True, null=True, verbose_name="許可證效期"
+    )
+
     created_by = models.ForeignKey(User, on_delete=models.DO_NOTHING)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

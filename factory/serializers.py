@@ -314,6 +314,27 @@ class IngredientSerializer(serializers.ModelSerializer):
         fields = "__all__"
         read_only_fields = ["id", "created_by", "created_at", "updated_at"]
 
+    def _resolve_raw_material_defaults(self, validated_data):
+        raw_mat = validated_data.get("source_material")
+        if raw_mat and raw_mat.type == "RAW":
+            if not validated_data.get("name"):
+                validated_data["name"] = raw_mat.name
+            if not validated_data.get("nutrition_fact") and raw_mat.nutrition_fact:
+                validated_data["nutrition_fact"] = raw_mat.nutrition_fact
+            if not validated_data.get("allergen_info") and raw_mat.allergen_info:
+                validated_data["allergen_info"] = raw_mat.allergen_info
+            if "is_additive" not in validated_data and hasattr(raw_mat, "is_additive"):
+                validated_data["is_additive"] = raw_mat.is_additive
+        return validated_data
+
+    def create(self, validated_data):
+        validated_data = self._resolve_raw_material_defaults(validated_data)
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        validated_data = self._resolve_raw_material_defaults(validated_data)
+        return super().update(instance, validated_data)
+
 
 class MaterialIngredientListSerializer(serializers.ListSerializer):
     def to_representation(self, data):
@@ -322,13 +343,55 @@ class MaterialIngredientListSerializer(serializers.ListSerializer):
         return super().to_representation(active_data)
 
 
+class RawMaterialAsIngredientField(serializers.Field):
+    def to_internal_value(self, data):
+        if data is None or data == "":
+            raise serializers.ValidationError("缺少成分對應的原物料 ID。")
+
+        raw_mat = Material.objects.filter(id=data, type="RAW", is_active=True).first()
+        if raw_mat:
+            existing_ing = Ingredient.objects.filter(
+                source_material=raw_mat, is_active=True
+            ).first()
+            if existing_ing:
+                return existing_ing
+
+            request = self.context.get("request") if hasattr(self, "context") else None
+            user = (
+                request.user
+                if request
+                and getattr(request, "user", None)
+                and request.user.is_authenticated
+                else raw_mat.created_by
+            )
+            return Ingredient.objects.create(
+                name=raw_mat.name,
+                source_type="MANUAL",
+                nutrition_fact=raw_mat.nutrition_fact or {},
+                allergen_info=raw_mat.allergen_info or "",
+                is_additive=getattr(raw_mat, "is_additive", False),
+                legal_limit_percent=getattr(raw_mat, "legal_limit_percent", None),
+                additive_license_no=getattr(raw_mat, "additive_license_no", "") or "",
+                license_valid_date=getattr(raw_mat, "license_valid_date", None),
+                source_material=raw_mat,
+                created_by=user,
+            )
+
+        ing = Ingredient.objects.filter(id=data, is_active=True).first()
+        if ing:
+            return ing
+
+        raise serializers.ValidationError(
+            f'無效的主鍵 "{data}" - 找不到對應的原物料或成分物件。'
+        )
+
+    def to_representation(self, value):
+        return value.source_material_id or value.id
+
+
 class MaterialIngredientSerializer(serializers.ModelSerializer):
     ingredient_detail = IngredientSerializer(source="ingredient", read_only=True)
-    ingredient_id = serializers.PrimaryKeyRelatedField(
-        source="ingredient",
-        queryset=Ingredient.objects.filter(is_active=True),
-        write_only=True,
-    )
+    ingredient_id = RawMaterialAsIngredientField(source="ingredient")
 
     class Meta:
         model = MaterialIngredient
@@ -486,6 +549,10 @@ class MaterialSerializer(serializers.ModelSerializer):
             "is_raw_material",  # 是否為原物料
             "pack_capacity",  # PACK 限定：包材容量（KG）
             "sticker_info",
+            "is_additive",
+            "legal_limit_percent",
+            "additive_license_no",
+            "license_valid_date",
             "created_by",  # 建立者
             "creator_name",  # 建立者姓名 (自訂方法)
             "created_at",  # 建立時間
@@ -502,6 +569,64 @@ class MaterialSerializer(serializers.ModelSerializer):
             "nutrition_snapshots",  # 營養內容歷史紀錄
         ]
         read_only_fields = ["id", "created_by", "created_at", "updated_at"]
+
+    def _get_or_create_ingredient_from_raw_material(self, raw_mat, creator=None):
+        existing = Ingredient.objects.filter(
+            source_material=raw_mat, is_active=True
+        ).first()
+        if existing:
+            return existing
+
+        user = creator or (
+            self.context["request"].user
+            if self.context.get("request")
+            and self.context["request"].user.is_authenticated
+            else raw_mat.created_by
+        )
+        return Ingredient.objects.create(
+            name=raw_mat.name,
+            source_type="MANUAL",
+            nutrition_fact=raw_mat.nutrition_fact or {},
+            allergen_info=raw_mat.allergen_info or "",
+            is_additive=getattr(raw_mat, "is_additive", False),
+            legal_limit_percent=getattr(raw_mat, "legal_limit_percent", None),
+            additive_license_no=getattr(raw_mat, "additive_license_no", "") or "",
+            license_valid_date=getattr(raw_mat, "license_valid_date", None),
+            source_material=raw_mat,
+            created_by=user,
+        )
+
+    def _normalize_ingredients_input(self, raw_items):
+        resolved = []
+        for item in raw_items or []:
+            if isinstance(item, dict) and item.get("ingredient"):
+                resolved.append(item["ingredient"])
+                continue
+
+            raw_id = (
+                item.get("source_material_id")
+                or item.get("raw_material_id")
+                or item.get("ingredient_id")
+                or item.get("id")
+                if isinstance(item, dict)
+                else item
+            )
+            if not raw_id:
+                continue
+
+            ing_obj = Ingredient.objects.filter(id=raw_id, is_active=True).first()
+            if ing_obj:
+                resolved.append(ing_obj)
+                continue
+
+            raw_mat = Material.objects.filter(
+                id=raw_id, type="RAW", is_active=True
+            ).first()
+            if raw_mat:
+                resolved.append(
+                    self._get_or_create_ingredient_from_raw_material(raw_mat)
+                )
+        return resolved
 
     def get_provider_quotes(self, obj):
         today = timezone.now().date()
@@ -576,7 +701,7 @@ class MaterialSerializer(serializers.ModelSerializer):
 
         for item in ingredients_data:
             MaterialIngredient.objects.create(
-                material=material, ingredient=item["ingredient"]
+                material=material, ingredient=item["ingredient"], is_active=True
             )
 
         if ingredients_data:
