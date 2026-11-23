@@ -256,6 +256,11 @@ class Material(models.Model):
     license_valid_date = models.DateField(
         blank=True, null=True, verbose_name="許可證效期"
     )
+    is_in_house = models.BooleanField(
+        default=False,
+        verbose_name="是否為廠內自製",
+        help_text="若為廠內預先製作庫存之成品，請勾選此項",
+    )
 
     created_by = models.ForeignKey(User, on_delete=models.DO_NOTHING)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -895,6 +900,11 @@ class ProductionOrder(models.Model):
         blank=True,
         verbose_name="營養標籤內容",
         help_text="用以決定此張生產單與最終出貨標籤要印哪一個版本的營養價值",
+    )
+    is_in_house = models.BooleanField(
+        default=False,
+        verbose_name="是否為廠內自製備庫單",
+        help_text="標記此生產單是否為廠內預存庫存生產單（非客戶客製訂單）",
     )
     qc_passed = models.BooleanField(null=True, blank=True, verbose_name="品管是否合格")
     is_active = models.BooleanField(default=True, verbose_name="是否啟用")

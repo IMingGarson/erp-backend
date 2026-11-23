@@ -553,6 +553,7 @@ class MaterialSerializer(serializers.ModelSerializer):
             "legal_limit_percent",
             "additive_license_no",
             "license_valid_date",
+            "is_in_house",
             "created_by",  # 建立者
             "creator_name",  # 建立者姓名 (自訂方法)
             "created_at",  # 建立時間
@@ -878,6 +879,7 @@ class BOMMaterialMinimalSerializer(serializers.ModelSerializer):
             "pack_capacity",
             "qc_standards",
             "sticker_info",
+            "is_in_house",
         ]
 
 
@@ -1278,6 +1280,7 @@ class SimpleProductSerializer(serializers.ModelSerializer):
             "storage_method",
             "nutrition_fact",
             "origin",
+            "is_in_house",
         ]
 
     def _get_po(self, obj):
@@ -1347,6 +1350,7 @@ class ProductionOrderSerializer(serializers.ModelSerializer):
             "is_active",
             "qc_metrics",
             "qc_passed",
+            "is_in_house",
             "active_nutrition_snapshot",
         ]
 
@@ -2005,6 +2009,7 @@ class BOMMaterialDropdownSerializer(serializers.ModelSerializer):
             "estimated_cost",
             "provider_quotes",
             "sticker_info",
+            "is_in_house",
             "ingredients",  # 添加物安全試算需要
             "nutrition_fact",  # 營養素加總需要
             "boms",  # 半成品遞迴計算需要

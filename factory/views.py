@@ -876,6 +876,7 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         sales_unit = request.data.get("sales_unit", "")
         sales_pack_unit = request.data.get("sales_pack_unit", "")
         quotation_id = request.data.get("quotation_id")
+        is_in_house = bool(request.data.get("is_in_house", False))
 
         if not mrp_id:
             return Response({"error": "Invalid ID"})
@@ -1002,6 +1003,7 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
             materials_info=other_materials,
             vendor_info=parent_vendor_info,
             qc_metrics=_generate_qc_metrics(parent_mrp.product),
+            is_in_house=is_in_house,
             created_by=user,
         )
         created_pos.append(parent_po)
@@ -1060,6 +1062,7 @@ class MaterialRequirementPlanViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                     materials_info=sorted_materials,
                     vendor_info=child_mrp.vendor_info,
                     qc_metrics=_generate_qc_metrics(child_mrp.product),
+                    is_in_house=is_in_house,
                     created_by=user,
                 )
                 mrp_to_po_map[child_mrp.mrp_id] = child_po
@@ -1132,7 +1135,7 @@ class MaterialFilter(filters.FilterSet):
 
     class Meta:
         model = Material
-        fields = ["code", "type", "phase", "is_active"]
+        fields = ["code", "type", "phase", "is_active", "is_in_house"]
 
 
 class MaterialViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
