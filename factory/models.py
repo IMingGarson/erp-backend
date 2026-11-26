@@ -1352,7 +1352,6 @@ class DeliveryNote(models.Model):
         default=Decimal("0.00"),
         verbose_name="已銷帳金額",
     )
-    # 貨品異動（退貨/折讓）相關欄位
     return_type = models.CharField(
         max_length=20, blank=True, null=True, verbose_name="異動類型"
     )
@@ -1367,6 +1366,22 @@ class DeliveryNote(models.Model):
         decimal_places=4,
         default=Decimal("0.00"),
         verbose_name="退回庫存量",
+    )
+    return_items = models.JSONField(
+        blank=True,
+        null=True,
+        default=list,
+        verbose_name="退貨品項",
+    )
+    return_detail = models.TextField(
+        blank=True,
+        null=True,
+        verbose_name="退貨細節",
+    )
+    return_date = models.DateField(
+        blank=True,
+        null=True,
+        verbose_name="異動日期",
     )
     document_note = models.TextField(blank=True, null=True, verbose_name="單據備註")
     created_by = models.ForeignKey(User, on_delete=models.DO_NOTHING)

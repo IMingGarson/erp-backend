@@ -1709,6 +1709,13 @@ class DeliveryNoteSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("退回庫存量不得為負數。")
         return value
 
+    def validate_return_items(self, value):
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise serializers.ValidationError("退貨品項必須為陣列格式。")
+        return value
+
     def to_representation(self, instance):
         response = super().to_representation(instance)
 

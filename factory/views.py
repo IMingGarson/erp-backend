@@ -2862,68 +2862,87 @@ class DeliveryNoteViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
     def goods_movement(self, request, pk=None):
         """
         處理銷貨單的貨品異動（退貨或折讓）
-        - 記錄異動類型、應退金額、退回庫存量
-        - 庫存端：自動將退回庫存量加回對應生產批號的 BatchInventory 庫存中
-        - 業務端：透過 ProductionOrder 的屬性連動，退回的數量會自動釋放剩餘可出貨量 (remaining_qty)
+        - 記錄異動類型、退貨品項、退貨細節、異動日期
+        - 退貨細節僅作紀錄使用，不強制依賴總重計算
         """
         note = self.get_object()
-        return_type = request.data.get("return_type")  # 'RETURN' 或 'ALLOWANCE'
-        return_amount = request.data.get("return_amount", 0)
-        return_qty = request.data.get("return_qty", 0)
+        return_type = request.data.get("return_type") or "RETURN"
+        return_items = request.data.get("return_items", [])
+        return_detail = (request.data.get("return_detail") or "").strip()
+        return_date_raw = request.data.get("return_date")
+        return_amount_raw = request.data.get("return_amount", 0)
+        return_qty_raw = request.data.get("return_qty", 0)
 
         if return_type not in ["RETURN", "ALLOWANCE"]:
             return Response(
                 {"error": "無效的異動類型"}, status=status.HTTP_400_BAD_REQUEST
             )
 
+        if return_items is not None and not isinstance(return_items, list):
+            return Response(
+                {"error": "退貨品項格式錯誤"}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if return_date_raw:
+            try:
+                parsed_return_date = datetime.strptime(
+                    str(return_date_raw), "%Y-%m-%d"
+                ).date()
+            except ValueError:
+                return Response(
+                    {"error": "異動日期格式錯誤，請使用 YYYY-MM-DD"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        else:
+            parsed_return_date = timezone.localtime(timezone.now()).date()
+
         try:
-            amt = Decimal(str(return_amount))
-            qty = Decimal(str(return_qty))
+            amt = Decimal(str(return_amount_raw if return_amount_raw != "" else 0))
+            qty = Decimal(str(return_qty_raw if return_qty_raw != "" else 0))
         except (InvalidOperation, ValueError, TypeError):
             return Response(
-                {"error": "金額或數量格式錯誤"}, status=status.HTTP_400_BAD_REQUEST
+                {"error": "金額格式錯誤"}, status=status.HTTP_400_BAD_REQUEST
             )
 
         if amt < 0 or qty < 0:
             return Response(
-                {"error": "金額與數量不得為負數"}, status=status.HTTP_400_BAD_REQUEST
+                {"error": "金額不得為負數"}, status=status.HTTP_400_BAD_REQUEST
             )
 
-        if not note.production_order:
-            return Response(
-                {"error": "找不到關聯的生產單資料"}, status=status.HTTP_400_BAD_REQUEST
-            )
-
-        batch_number = note.production_order.order_number
-        product = note.production_order.product
-
-        # 1. 庫存端聯動：若有輸入退回庫存量，將重量加回 BatchInventory
-        if qty > 0:
-            try:
-                batch_inv = BatchInventory.objects.select_for_update().get(
-                    batch_number=batch_number,
-                    material=product,
-                    is_active=True,
-                )
-                batch_inv.remaining_qty += qty
-                batch_inv.save(update_fields=["remaining_qty"])
-            except BatchInventory.DoesNotExist:
-                raise ValidationError(
-                    f"找不到對應的生產批號庫存: {batch_number} (物料: {product.name})，無法執行退回庫存重補。"
-                )
-
-        # 2. 更新銷貨單異動資料 (包含應退金額與退回庫存量)
         note.return_type = return_type
+        note.return_items = return_items or []
+        note.return_detail = return_detail
+        note.return_date = parsed_return_date
         note.return_amount = amt
         note.return_qty = qty
-        note.save(update_fields=["return_type", "return_amount", "return_qty"])
+        note.save(
+            update_fields=[
+                "return_type",
+                "return_items",
+                "return_detail",
+                "return_date",
+                "return_amount",
+                "return_qty",
+            ]
+        )
 
         user = self.get_valid_user()
         action_name = "退貨" if return_type == "RETURN" else "折讓"
+        items_summary = (
+            ", ".join(
+                [
+                    str(it.get("name") or it.get("product_name") or it)
+                    if isinstance(it, dict)
+                    else str(it)
+                    for it in (note.return_items or [])
+                ]
+            )
+            or "未指定品項"
+        )
         self._record_db_log(
             note,
             user,
-            f"{user.last_name}{user.first_name} 對銷貨單 {note.note_number} 執行了{action_name}異動，應退金額: ${amt}，退回庫存量: {qty} (批號: {batch_number})",
+            f"{user.last_name}{user.first_name} 對銷貨單 {note.note_number} 執行了{action_name}異動（日期: {parsed_return_date}，品項: {items_summary}，細節: {return_detail or '無'}）",
         )
 
         serializer = self.get_serializer(note)
