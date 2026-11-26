@@ -1498,6 +1498,7 @@ class PurchaseRequisitionItemSerializer(serializers.ModelSerializer):
             "generated_batches",
             "total_received_qty",
             "is_fully_received",
+            "is_done",
         ]
 
     def get_provider_name(self, obj):
@@ -1508,11 +1509,25 @@ class PurchaseRequisitionItemSerializer(serializers.ModelSerializer):
 
 class PurchaseInvoiceItemSerializer(serializers.ModelSerializer):
     id = serializers.IntegerField(required=False, allow_null=True)
+    pr_item = serializers.PrimaryKeyRelatedField(
+        queryset=PurchaseRequisitionItem.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+    pr_item_id = serializers.PrimaryKeyRelatedField(
+        queryset=PurchaseRequisitionItem.objects.all(),
+        source="pr_item",
+        required=False,
+        allow_null=True,
+        write_only=True,
+    )
 
     class Meta:
         model = PurchaseInvoiceItem
         fields = [
             "id",
+            "pr_item",
+            "pr_item_id",
             "item_name",
             "quantity",
             "unit",

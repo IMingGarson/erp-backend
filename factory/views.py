@@ -2558,6 +2558,35 @@ class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
 
         return queryset.order_by("-created_at")
 
+    @action(detail=False, methods=["get"], url_path="prev_purchase_price")
+    def prev_purchase_price(self, request):
+        material_id = request.query_params.get("material_id")
+        if not material_id:
+            return Response(
+                {"error": "缺少 material_id 參數"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        latest_item = (
+            PurchaseRequisitionItem.objects.filter(
+                material_id=material_id,
+                is_active=True,
+                requisition__is_active=True,
+            )
+            .select_related("requisition")
+            .order_by("-requisition__request_date", "-id")
+            .first()
+        )
+
+        return Response(
+            {
+                "latest_price": float(latest_item.purchased_price)
+                if latest_item and latest_item.purchased_price is not None
+                else None,
+            },
+            status=status.HTTP_200_OK,
+        )
+
     @transaction.atomic
     def perform_create(self, serializer):
         user = self.get_valid_user()
@@ -2568,17 +2597,33 @@ class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         super().perform_create(serializer)
         instance = serializer.instance
 
+        created_items = []
         for item_data in items_data:
-            PurchaseRequisitionItem.objects.create(requisition=instance, **item_data)
+            created_items.append(
+                PurchaseRequisitionItem.objects.create(
+                    requisition=instance, **item_data
+                )
+            )
+
+        item_by_id = {it.id: it for it in created_items}
+        item_by_name = {
+            it.material_name: it for it in created_items if it.material_name
+        }
+        done_item_ids = set()
 
         for inv_data in invoices_payload:
             inv_items = inv_data.pop("items", [])
-            inv_data.pop("requisitions", None)  # 避免直接傳入
+            inv_data.pop("requisitions", None)
             invoice = PurchaseInvoice.objects.create(created_by=user, **inv_data)
-            invoice.requisitions.set(
-                [instance]
-            )  # 🌟 修正：必須使用 .set() 處理 Many-to-Many
+            invoice.requisitions.set([instance])
+
             for inv_item in inv_items:
+                pr_item_obj = inv_item.get("pr_item")
+                if not pr_item_obj and inv_item.get("item_name"):
+                    pr_item_obj = item_by_name.get(inv_item.get("item_name"))
+                if pr_item_obj and pr_item_obj.id in item_by_id:
+                    inv_item["pr_item"] = item_by_id[pr_item_obj.id]
+                    done_item_ids.add(pr_item_obj.id)
                 PurchaseInvoiceItem.objects.create(invoice=invoice, **inv_item)
 
             PurchaseInvoiceLog.objects.create(
@@ -2586,6 +2631,11 @@ class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                 user=user,
                 action_detail=f"{full_username} 建立了進貨發票 {invoice.invoice_number} (透過請購單 #{instance.id})",
             )
+
+        if done_item_ids:
+            PurchaseRequisitionItem.objects.filter(
+                id__in=done_item_ids, requisition=instance
+            ).update(is_done=True)
 
     @transaction.atomic
     def perform_update(self, serializer):
@@ -2597,16 +2647,22 @@ class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
         super().perform_update(serializer)
         instance = serializer.instance
 
+        active_items_map = {
+            item.id: item for item in instance.items.filter(is_active=True)
+        }
+        item_by_name = {
+            item.material_name: item
+            for item in active_items_map.values()
+            if item.material_name
+        }
+
         if items_data is not None:
-            existing_items = {
-                item.id: item for item in instance.items.filter(is_active=True)
-            }
             incoming_item_ids = []
 
             for item_data in items_data:
                 item_id = item_data.get("id")
-                if item_id and item_id in existing_items:
-                    item_instance = existing_items[item_id]
+                if item_id and item_id in active_items_map:
+                    item_instance = active_items_map[item_id]
                     for attr, value in item_data.items():
                         setattr(item_instance, attr, value)
                     item_instance.save()
@@ -2616,14 +2672,20 @@ class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                     new_item = PurchaseRequisitionItem.objects.create(
                         requisition=instance, **item_data
                     )
+                    active_items_map[new_item.id] = new_item
+                    if new_item.material_name:
+                        item_by_name[new_item.material_name] = new_item
                     incoming_item_ids.append(new_item.id)
 
-            for item_id, item_instance in existing_items.items():
+            for item_id, item_instance in list(active_items_map.items()):
                 if item_id not in incoming_item_ids:
                     item_instance.is_active = False
                     item_instance.save(update_fields=["is_active"])
+                    active_items_map.pop(item_id, None)
 
         if invoices_payload is not None:
+            done_item_ids = set()
+
             for inv_data in invoices_payload:
                 inv_id = inv_data.get("id")
                 inv_number = inv_data.get("invoice_number", "").strip()
@@ -2646,6 +2708,39 @@ class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                     invoice.save()
                     invoice.requisitions.add(instance)
 
+                    existing_inv_items = {
+                        it.id: it for it in invoice.items.filter(is_active=True)
+                    }
+                    kept_inv_item_ids = set()
+
+                    for inv_item in inv_items:
+                        pr_item_obj = inv_item.get("pr_item")
+                        if not pr_item_obj and inv_item.get("item_name"):
+                            pr_item_obj = item_by_name.get(inv_item.get("item_name"))
+                        if pr_item_obj:
+                            inv_item["pr_item"] = pr_item_obj
+                            if pr_item_obj.requisition_id == instance.id:
+                                done_item_ids.add(pr_item_obj.id)
+
+                        sub_id = inv_item.get("id")
+                        if sub_id and sub_id in existing_inv_items:
+                            sub_obj = existing_inv_items[sub_id]
+                            for attr, value in inv_item.items():
+                                setattr(sub_obj, attr, value)
+                            sub_obj.save()
+                            kept_inv_item_ids.add(sub_obj.id)
+                        else:
+                            inv_item.pop("id", None)
+                            new_sub = PurchaseInvoiceItem.objects.create(
+                                invoice=invoice, **inv_item
+                            )
+                            kept_inv_item_ids.add(new_sub.id)
+
+                    for sub_id, sub_obj in existing_inv_items.items():
+                        if sub_id not in kept_inv_item_ids:
+                            sub_obj.is_active = False
+                            sub_obj.save(update_fields=["is_active"])
+
                     PurchaseInvoiceLog.objects.create(
                         invoice=invoice,
                         user=user,
@@ -2658,6 +2753,14 @@ class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                     )
                     invoice.requisitions.add(instance)
                     for inv_item in inv_items:
+                        pr_item_obj = inv_item.get("pr_item")
+                        if not pr_item_obj and inv_item.get("item_name"):
+                            pr_item_obj = item_by_name.get(inv_item.get("item_name"))
+                        if pr_item_obj:
+                            inv_item["pr_item"] = pr_item_obj
+                            if pr_item_obj.requisition_id == instance.id:
+                                done_item_ids.add(pr_item_obj.id)
+                        inv_item.pop("id", None)
                         PurchaseInvoiceItem.objects.create(invoice=invoice, **inv_item)
 
                     PurchaseInvoiceLog.objects.create(
@@ -2665,6 +2768,50 @@ class PurchaseRequisitionViewSet(CRUDAuditMixin, viewsets.ModelViewSet):
                         user=user,
                         action_detail=f"{full_username} 建立了進貨發票 {invoice.invoice_number} (透過請購單 #{instance.id})",
                     )
+
+            if done_item_ids:
+                PurchaseRequisitionItem.objects.filter(
+                    id__in=done_item_ids, requisition=instance
+                ).update(is_done=True)
+
+        removed_invoice_ids = self.request.data.get("removed_invoice_ids", [])
+        if removed_invoice_ids:
+            reset_pr_item_ids = set()
+            reset_item_names = set()
+
+            for rem_id in removed_invoice_ids:
+                invoice = PurchaseInvoice.objects.filter(
+                    id=rem_id, is_active=True
+                ).first()
+                if not invoice:
+                    continue
+
+                # 1. 收集該發票對應的請購明細 ID 與品名
+                active_inv_items = invoice.items.filter(is_active=True)
+                for inv_it in active_inv_items:
+                    if inv_it.pr_item_id:
+                        reset_pr_item_ids.add(inv_it.pr_item_id)
+                    elif inv_it.item_name:
+                        reset_item_names.add(inv_it.item_name)
+
+                # 2. 將發票明細與發票主檔全部設為 is_active=False，並移除關聯
+                active_inv_items.update(is_active=False)
+                invoice.requisitions.remove(instance)
+                invoice.is_active = False
+                invoice.save(update_fields=["is_active"])
+
+                PurchaseInvoiceLog.objects.create(
+                    invoice=invoice,
+                    user=user,
+                    action_detail=f"{full_username} 移除了進貨發票 {invoice.invoice_number} (從請購單 #{instance.id})，已停用發票並還原對應品項狀態",
+                )
+
+            target_reset_qs = PurchaseRequisitionItem.objects.filter(
+                requisition=instance, is_active=True
+            ).filter(
+                Q(id__in=reset_pr_item_ids) | Q(material__name__in=reset_item_names)
+            )
+            target_reset_qs.update(is_done=False)
 
 
 class DeliveryNoteFilter(filters.FilterSet):

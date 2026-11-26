@@ -1134,7 +1134,11 @@ class PurchaseRequisitionItem(models.Model):
     )
     remark = models.TextField(null=True, blank=True, verbose_name="備註")
     is_active = models.BooleanField(default=True, verbose_name="是否啟用")
-
+    is_done = models.BooleanField(
+        default=False,
+        verbose_name="是否完成",
+        help_text="標記此請購品項是否銷貨完畢",
+    )
     # ==========================
     # 請購包裝規格 (代表：採購預期)
     # ==========================
@@ -1260,6 +1264,14 @@ class PurchaseInvoiceItem(models.Model):
         on_delete=models.DO_NOTHING,
         related_name="items",
         verbose_name="所屬發票",
+    )
+    pr_item = models.ForeignKey(
+        PurchaseRequisitionItem,
+        on_delete=models.DO_NOTHING,
+        null=True,
+        blank=True,
+        related_name="invoice_items",
+        verbose_name="對應請購明細",
     )
     item_name = models.CharField(max_length=150, verbose_name="品名/摘要")
     quantity = models.DecimalField(
